@@ -1,0 +1,45 @@
+{
+  "name": "@minipod/host-android",
+  "version": "0.1.0",
+  "description": "MiniPod Android standalone host: Capacitor 8 shell around @minipod/ui with an in-WebView PlatformHost (IndexedDB storage, MiniPodPlugin.java for CORS-free HTTP / SAF / native Media3 MediaSessionService playback).",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "vite dev web",
+    "build": "pnpm run build:web",
+    "build:web": "vite build web",
+    "cap:add": "cap add android",
+    "cap:sync": "pnpm run build:web && cap sync android",
+    "cap:open": "cap open android",
+    "cap:run": "pnpm run cap:sync && cap run android",
+    "build:apk": "node ../../scripts/bump-version.mjs && pnpm run cap:sync && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/app": "^8.0.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/filesystem": "^8.1.0",
+    "@capacitor/preferences": "^8.0.1",
+    "@minipod/core": "workspace:*",
+    "@minipod/ui": "workspace:*",
+    "idb": "^8.0.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "~5.9.3",
+    "vite": "^7.0.6",
+    "vitest": "^4.1.0"
+  }
+}

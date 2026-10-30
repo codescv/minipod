@@ -1,0 +1,45 @@
+{
+  "name": "@minipod/ui",
+  "version": "0.1.0",
+  "description": "MiniPod shared Material Design 3 UI (React 19 + Vite). Exposes `mountMiniPodApp(el, host, engine)`; hosts supply a PlatformHost and a PlayerEngine. Includes MockPlatformHost/MockPlayerEngine dev harness and the HtmlAudioEngine used by the PC Web App.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": ["**/*.css"],
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./dev": "./src/host/mock-host.ts",
+    "./player": "./src/player/index.ts",
+    "./styles.css": "./src/theme/styles.css"
+  },
+  "files": ["src"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "vite dev",
+    "build:dev-harness": "vite build"
+  },
+  "dependencies": {
+    "@material/material-color-utilities": "^0.4.0",
+    "@minipod/core": "workspace:*",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.6"
+  },
+  "peerDependencies": {
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.0",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.0.6",
+    "vitest": "^4.1.0"
+  }
+}

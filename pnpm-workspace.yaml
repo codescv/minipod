@@ -1,0 +1,26 @@
+packages:
+  - packages/*
+
+# pnpm 10 refuses to run dependency lifecycle scripts (postinstall / node-gyp
+# rebuild) unless a package is explicitly allow-listed here. Keeping this list
+# EMPTY is the hard guarantee behind the "zero compiled native binaries" rule:
+# any dependency that *needs* a native build step simply cannot build, and
+# `pnpm run check:native` additionally scans the production tree for `.node`
+# addons / `binding.gyp` / `node-gyp-build` / `prebuild-install`.
+#
+# Dev-only toolchain downloads (esbuild / rollup platform packages used by Vite)
+# are prebuilt executables fetched as optionalDependencies and never compiled;
+# they are not part of the runtime tree of @minipod/host-node.
+onlyBuiltDependencies: []
+
+# Fail loudly instead of silently pulling a transitive native addon.
+overrides:
+  better-sqlite3: "-"
+  sqlite3: "-"
+  node-datachannel: "-"
+  canvas: "-"
+  sharp: "-"
+  utp-native: "-"
+  bufferutil: "-"
+  utf-8-validate: "-"
+  rollup: "4.64.0"

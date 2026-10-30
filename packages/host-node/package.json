@@ -1,0 +1,49 @@
+{
+  "name": "@minipod/host-node",
+  "version": "0.1.0",
+  "description": "MiniPod PC Web App runtime (macOS / Linux / Windows): pure Node.js loopback server (Hono, node:sqlite, HTTP 206 Range media proxy, feed fetcher, cloud-file SyncScheduler) + browser REST client implementing PlatformHost.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "minipod": "./bin/minipod.mjs"
+  },
+  "exports": {
+    ".": "./src/server/index.ts",
+    "./client": "./src/client/index.ts",
+    "./shared": "./src/shared/index.ts"
+  },
+  "files": ["bin", "dist", "src"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/server/main.ts --dev",
+    "dev:web": "vite dev web",
+    "build:server": "node build.mjs",
+    "build:web": "vite build web",
+    "build": "pnpm run build:web && pnpm run build:server",
+    "start": "node bin/minipod.mjs",
+    "start:app": "node bin/minipod.mjs --new-browser"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.4",
+    "@minipod/core": "workspace:*",
+    "hono": "^4.8.3"
+  },
+  "devDependencies": {
+    "@minipod/ui": "workspace:*",
+    "@types/node": "~22.20.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "esbuild": "^0.25.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.0.6",
+    "vitest": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
