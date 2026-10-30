@@ -82,7 +82,7 @@ import { MediaProxy, readLocalFileSliceSync } from '../net/range-proxy';
 import { SettingsStore } from '../settings/store';
 import { NodeSyncService } from '../sync/scheduler-host';
 
-export const MINIPOD_VERSION = '0.1.0';
+export const MINIPOD_VERSION = '0.1.1';
 
 const DESKTOP_CAPABILITIES: HostCapabilities = {
   nativeAudio: false,
@@ -267,9 +267,29 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
   ): ResolveResult => {
     if (res.kind === 'feed') {
       prunePreviewCache();
+      const inlineCreds = extractUrlCredentials(res.preview.url).credentials;
+      const effectiveCreds = credentials ?? inlineCreds;
+      if (effectiveCreds) {
+        settingsStore.setFeedCredentials(res.preview.feedKey, effectiveCreds);
+      }
+      // Materialise a hidden feed stub (`subscribed = 0`, `sync_dirty = 0`) so preview
+      // streaming (`▶` without subscribing) proxies `/media/:episodeKey`, queues at head,
+      // and tracks millisecond progress seamlessly (`DESIGN.md §4.3`, `ARCHITECTURE.md §6.3`).
+      feedsRepo.upsertParsedFeed({
+        feedKey: res.preview.feedKey,
+        kind: 'RSS',
+        url: res.preview.url,
+        subscribed: false,
+        parsed: res.preview.parsed,
+        hlc,
+        nowWallMs: Date.now(),
+        hasCredentials:
+          Boolean(effectiveCreds) || Boolean(settingsStore.getFeedCredentials(res.preview.feedKey)),
+        markSyncDirty: false,
+      });
       previewCache.set(res.preview.previewId, {
         preview: res.preview,
-        ...(credentials ? { credentials } : {}),
+        ...(effectiveCreds ? { credentials: effectiveCreds } : {}),
         expiresAt: Date.now() + PREVIEW_TTL_MS,
       });
     }

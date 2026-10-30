@@ -1021,10 +1021,16 @@ export class IdbSyncStore implements SyncStore {
           ? 1
           : (existingFeed?.syncDirty ?? 0);
 
+    const nextSubscribedNum = params.subscribed
+      ? 1
+      : existingFeed?.deletedAt == null
+        ? (existingFeed?.subscribedNum ?? 0)
+        : 0;
+
     const feedRec: IdbFeedRecord = {
       feedKey: params.feedKey,
       kind: params.kind,
-      subscribedNum: params.subscribed ? 1 : 0,
+      subscribedNum: nextSubscribedNum,
       url: params.url,
       movedTo: params.movedTo ?? existingFeed?.movedTo ?? null,
       hasCredentials: params.hasCredentials ?? existingFeed?.hasCredentials ?? false,

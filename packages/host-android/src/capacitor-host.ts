@@ -685,16 +685,32 @@ export async function createCapacitorPlatformHost(
     }
   };
 
-  const cachePreviewResult = (
+  const cachePreviewResult = async (
     res: ResolveResult,
     credentials?: HttpBasicCredentials,
-  ): ResolveResult => {
+  ): Promise<ResolveResult> => {
     if (res.kind === 'feed') {
       prunePreviewCache();
+      const inlineCreds = extractUrlCredentials(res.preview.url).credentials;
+      const effectiveCreds = credentials ?? inlineCreds;
+      if (effectiveCreds) {
+        await secretsStore.setFeedCredentials(res.preview.feedKey, effectiveCreds);
+      }
+      const storedCreds = await secretsStore.getFeedCredentials(res.preview.feedKey);
+      await syncStore.upsertParsedFeed({
+        feedKey: res.preview.feedKey,
+        kind: 'RSS',
+        url: res.preview.url,
+        subscribed: false,
+        parsed: res.preview.parsed,
+        nowWallMs: Date.now(),
+        hasCredentials: Boolean(effectiveCreds || storedCreds),
+        markSyncDirty: false,
+      });
       previewCache.set(res.preview.previewId, {
         preview: res.preview,
         expiresAt: Date.now() + PREVIEW_TTL_MS,
-        ...(credentials !== undefined ? { credentials } : {}),
+        ...(effectiveCreds !== undefined ? { credentials: effectiveCreds } : {}),
       });
     }
     return res;
