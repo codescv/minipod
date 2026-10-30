@@ -12,7 +12,7 @@
 | **Toolchain** | Node `>=22.5.0` (built-in `node:sqlite` `DatabaseSync`, global `fetch`, `crypto.subtle`), pnpm 10 (`packageManager: pnpm@10`), TypeScript 5.9 (`strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`), Vitest 4, Vite 7, React 19, Capacitor 8. |
 | **Zero native addons** | `pnpm-workspace.yaml`: `onlyBuiltDependencies: []` (pnpm refuses to run any dependency build script) + `overrides` deleting `better-sqlite3`, `sqlite3`, `sharp`, `canvas`, `bufferutil`, `utf-8-validate`, `node-datachannel`. `pnpm check:native` (`scripts/check-native-deps.mjs`) scans the production tree of `@minipod/host-node` + `@minipod/core` for `.node` / `binding.gyp` / `node-gyp-build` / `prebuild-install` and fails CI. No `fast-xml-parser` native variants, no `sqlite3`, no `ffmpeg`: feed parsing, chapter parsing and sync are pure TS. Dev-only prebuilt executables (esbuild / rollup platform packages) are acceptable; never shipped at runtime. |
 | **Imports** | Extensionless relative imports, `moduleResolution: Bundler`. Workspace packages are consumed **as TypeScript source** (`main: ./src/index.ts`); no build step is needed for typecheck/tests. |
-| **`core` is platform-neutral** | No `node:*`, no DOM globals (`window`, `document`, `localStorage`, `DOMParser`), no Capacitor. Allowed globals: `fetch` *type* only (always injected), `TextDecoder/TextEncoder`, `crypto.subtle`, `AbortController`, `URL`, `Uint8Array`. Everything I/O-ish is injected (`HttpClient`, `now()`, `Store`, `Scheduler`, `TokenProvider`). |
+| **`core` is platform-neutral** | No `node:*`, no DOM globals (`window`, `document`, `localStorage`, `DOMParser`), no Capacitor. Allowed globals: `fetch` *type* only (always injected), `TextDecoder/TextEncoder`, `crypto.subtle`, `CompressionStream`/`DecompressionStream` (gzip; Node ≥ 18, Android WebView ≥ 80), `AbortController`, `URL`, `Uint8Array`. Everything I/O-ish is injected (`HttpClient`, `now()`, `Store`, `Scheduler`, `TokenProvider`). |
 | **Errors** | `MiniPodError(code, message, { details })` from `@minipod/core`; codes: `invalid-url`, `unsupported-feed`, `feed-not-found`, `auth-required`, `network`, `not-found`, `invalid-argument`, `sync-conflict`, `sync-auth`, `sync-schema`, `unsupported`, `cancelled`. Hosts serialise with `toShape()`, the REST client rebuilds with `fromShape()`; the UI switches on `error.code`. |
 | **Tests** | Co-located `*.test.ts(x)`; `pnpm test` runs all projects; fixtures under `packages/<pkg>/test-fixtures/` (real-world feeds, Apple/PodcastIndex/fyyd/gpodder JSON, HTML pages, OPML, ID3/Ogg/MP4 chapter samples). Property tests for the CRDT merge. |
 | **Verify before handoff** | `pnpm install && pnpm typecheck && pnpm test && pnpm check:native` green. |
@@ -62,7 +62,7 @@ host-android → core, ui                        runtime deps: @capacitor/{core,
 | Chapter byte-range reads | server `fetch` with `Range` | `MiniPodPlugin.http` with `Range`, body returned as base64 (≤ 2 MiB slices) |
 | Local folder feeds | `node:fs` directory path | SAF tree URI (`ACTION_OPEN_DOCUMENT_TREE`) listed by `MiniPodPlugin.listTree`; media played natively from `content://` |
 | Cloud sync file (zero-OAuth path) | **Local synced folder**: the user picks a folder already synced by the Google Drive / Dropbox / Syncthing / iCloud / OneDrive desktop client; the server reads/writes `minipod-sync-v1.json` there with `node:fs` and `fs.watch`es it | **SAF document**: `ACTION_OPEN_DOCUMENT` / `ACTION_CREATE_DOCUMENT` through `MiniPodPlugin.saf` with persistable URI permission |
-| Background execution | Server process is always on while `minipod` runs; sync scheduler lives there | Foreground service keeps the process alive while playing; the WebView keeps running JS (Capacitor does not pause the WebView) but the native service additionally checkpoints position natively every 5 s as a safety net; when the app is killed the next launch reconciles |
+| Background execution | Server process is always on while `minipod` runs; sync scheduler lives there | Foreground service keeps the process alive while playing, but an invisible WebView gets its timers throttled by Chromium (≥ 1 min) and `MainActivity` can be destroyed under memory pressure. Therefore everything that must keep working with the screen off is **native**: playback, queue auto-advance, sleep timer, the 5 s position checkpoint and a completion journal (§3.3); JS reconciles whenever it is awake and the next launch reconciles the rest |
 
 ## 2. Repository layout & ownership
 
@@ -138,7 +138,7 @@ packages/host-android/
 │   ├── storage/                  idb.ts (stores mirroring §6) · IdbSyncStore.ts
 │   ├── net/                      plugin-http.ts (HttpClient over MiniPodPlugin.http)
 │   ├── player/                   NativeAudioEngine.ts (PlayerEngine over MiniPodPlugin media calls/events)
-│   ├── sync/                     SafFileProvider.ts (HostFileProvider over MiniPodPlugin.saf) · drive-auth.ts (Custom Tabs PKCE)
+│   ├── sync/                     SafFileProvider.ts (HostFileProvider over MiniPodPlugin.saf) · drive-auth.ts (TokenProvider over MiniPodPlugin.auth)
 │   └── feeds/                    local-folder.ts (SAF tree listing via plugin)
 └── android/app/src/main/java/dev/minipod/app/
     ├── MainActivity.java         edge-to-edge, --m-safe-* insets injection, back gesture → window.__minipodHandleBack
@@ -154,7 +154,8 @@ export interface PlatformHost {
   feeds: FeedsApi;                // list(), get(key), subscribe(url|previewId), unsubscribe(key), refresh(key?), setCredentials(key, creds),
                                   // addLocalFolder(ref), loadOlder(key), preview(url): FeedPreview, importOpml(xml): OpmlCandidate[], exportOpml(): string
   search: SearchApi;              // query(text, source?), topCharts(country), resolveUrl(input): ResolveResult, countries()
-  episodes: EpisodesApi;          // list(feedKey, filter, page), get(key), download(key), deleteDownload(key), chapters(key, force?)
+  episodes: EpisodesApi;          // list(feedKey, filter, page), get(key), download(key), deleteDownload(key), chapters(key, force?),
+                                  // chapterImage(key, index): ImageRef  (desktop: '/api/episodes/:key/chapters/:index/image'; android: data: URL from a Range read)
   queue: QueueApi;                // list(), add(key), playNext(key), move(key, beforeKey|null), remove(key), clear()
   progress: ProgressApi;          // get(key), save({ key, positionMs, durationMs, state }), markPlayed(key, played)
   playback: PlaybackApi;          // sourceFor(key): MediaSource  (desktop: '/media/..', android: direct URL + headers or file path)
@@ -195,6 +196,8 @@ Semantics every implementation must honour:
 - Typed route table `shared/routes.ts` keyed by `PlatformHost` method name (`'queue.move'` → `POST /api/queue/move`); a test asserts client and server cover every key.
 - `GET /api/events` — Server-Sent Events of `HostEvent`; client reconnects with backoff.
 - `GET /media/:episodeKey` — 206 Range proxy/file server (§5.2). `HEAD` supported.
+- `GET /api/episodes/:key/chapters/:index/image` — ID3 `APIC` slice (or remote chapter image) with `Cache-Control: immutable`.
+- `POST /api/progress/save` accepts `{ …, flush: true }`; the browser sends it with `fetch(..., { keepalive: true })` on `pagehide` so closing the window mid-playback still lands the final position and triggers an immediate push.
 - Binary uploads (OPML import from the browser file picker): `POST /api/feeds/opml` with `text/xml` body.
 
 ### 3.2 Android plugin surface (`MiniPodPlugin.java`)
@@ -204,16 +207,19 @@ Semantics every implementation must honour:
 | `http({ url, method, headers, body?, range?, auth?: {user, pass}, maxRedirects, maxBodyBytes })` → `{ status, headers, finalUrl, chain: [{status,url}], bodyText? , bodyBase64? }` | CORS-free fetch with manual redirect following and Basic Auth retry order ISO-8859-1 → UTF-8 (upstream `BasicAuthorizationInterceptor` port, lives in Java so the WebView never sees credentials). |
 | `httpToFile({ url, headers, auth, dest, resumeFrom })` + `download-progress` events | Episode downloads into `filesDir/downloads/`. |
 | `saf.pick({ mode: 'open'|'create'|'tree', mime, suggestedName })` → `{ uri }` ; `saf.read(uri)`, `saf.stat(uri)`, `saf.write(uri, bytes)` (via `openFileDescriptor("rw")` + `truncate` + `fsync`), `saf.listTree(uri)` | Sync file and Local Folder feeds; persistable permissions taken on pick. |
-| `media.load({ episodeKey, source, headers?, startMs, speed, title, artist, artworkUrl })`, `media.play()`, `media.pause()`, `media.seekTo(ms)`, `media.setSpeed(x)`, `media.stop()`, `media.getState()` | Drive the `PlaybackService`. |
-| events `media-state` (`{ playing, positionMs, durationMs, speed, buffering }` every 1 s while playing and on every change), `media-ended`, `media-error`, `media-checkpoint` (native 5 s save) | JS `NativeAudioEngine` turns these into `PlayerEngine` events. |
-| `auth.googleSignIn({ scopes })` → `{ accessToken, expiresAt }` | Credential Manager + `AuthorizationClient` for Drive; returns `unsupported` when Play Services are absent (UI hides Drive). |
+| `media.load({ episodeKey, source, headers?, startMs, speed, metadata })`, `media.setQueue(items: { episodeKey, source, headers?, startMs, metadata }[])`, `media.play()`, `media.pause()`, `media.seekTo(ms)`, `media.setSpeed(x)`, `media.setSleepTimer({ mode: 'off'|'minutes'|'endOfEpisode'|'endOfChapter', minutes?, chapterEndMs? })`, `media.stop()`, `media.getState()`, `media.readJournal()` / `media.clearJournal(upTo)`, `media.ackFlush()` | Drive the `PlaybackService`; `setQueue` is re-sent on every queue change so native auto-advance never depends on JS; the journal API reads the native checkpoint + completion log (§3.3). |
+| events `media-state` (`{ playing, positionMs, durationMs, speed, buffering, episodeKey }` every 1 s while playing and on every change), `media-ended { episodeKey }`, `media-error`, `media-checkpoint`, `sleep-timer-state { remainingMs, mode }` | JS `NativeAudioEngine` turns these into `PlayerEngine` events. |
+| `auth.googleSignIn({ scopes, forceRefresh? })` → `{ accessToken, expiresAt }` | Credential Manager + `AuthorizationClient` for Drive; silently refreshes when cached; returns `unsupported` when Play Services are absent (UI hides Drive). |
 
 ### 3.3 Android native playback & background behaviour
 
 - `PlaybackService : MediaSessionService` owns one `ExoPlayer` (`setHandleAudioBecomingNoisy(true)`, `setWakeMode(C.WAKE_MODE_NETWORK)`, audio attributes `CONTENT_TYPE_SPEECH` + `USAGE_MEDIA`, `handleAudioFocus = true`). Notification/lockscreen/Bluetooth/Auto actions: play-pause, −10 s, +30 s. `MediaItem.mediaId = episodeKey`.
-- Only the current item is loaded; auto-advance is decided in JS (`AutoAdvancePolicy` in core over the queue) when `media-ended` arrives. If the WebView is unresponsive for > 2 s after `media-ended`, the service falls back to the **next queue item it was told about** in the last `media.load` call (`nextSource` hint), so a podcast marathon does not stop because JS was throttled.
-- **Native 5 s checkpoint**: the service writes `{episodeKey, positionMs, durationMs, wallMs}` to `SharedPreferences` every 5 s while playing and on pause/stop/destroy. On every JS start and on `media-state`, `CapacitorPlatformHost` reconciles the native checkpoint into the progress store (stamped with a fresh HLC if newer than the stored row). This is what guarantees millisecond-accurate resume even if the process was killed with the screen off.
-- JS stays alive while the service is in the foreground (Capacitor does not call `webView.onPause()`), so `ProgressRecorder`'s 5 s store writes and the `SyncScheduler`'s 180 s checkpoint / immediate-on-pause pushes run normally with the screen off. There is no WorkManager: when the app process is gone, nothing syncs until the next launch, which immediately reconciles and pushes (`capabilities.backgroundSync = false` is surfaced in the sync settings copy).
+- **Assume JS is asleep whenever the screen is off.** Chromium throttles timers of an invisible WebView to ≥ 1 min wake-ups, and Android may destroy `MainActivity` (and the WebView) under memory pressure while the service keeps playing. Everything the listener relies on with the screen off is therefore implemented natively, and JS only *reconciles*:
+  - **Native queue / auto-advance**: `media.setQueue(items[])` hands the service the remaining playable queue (re-sent on every queue change, including sources/headers for streaming or file paths). On `STATE_ENDED` the service itself advances to the next item, records the completion (below) and keeps going for the whole marathon; JS is informed by `media-ended` / `media-state` when awake.
+  - **Native sleep timer**: `media.setSleepTimer(...)` runs in the service (countdown, *end of episode*, *end of chapter* with the chapter end passed from JS); the last 60 s volume fade is `ExoPlayer.setVolume` from a service `Handler`. Expiry pauses and suppresses auto-advance. `sleep-timer-state` events feed the UI when it is visible.
+  - **Native journal** (`SharedPreferences` → `minipod_playback.xml`): the active checkpoint `{ episodeKey, positionMs, durationMs, wallMs }` every 5 s while playing and on pause/stop/destroy, **plus** an append-only `completed: [{ episodeKey, durationMs, endedWallMs }]` list so finished episodes are not lost when several complete while JS sleeps. On every JS start, on `resume` and on every `media-state`/`media-ended`, `CapacitorPlatformHost.reconcileJournal()` applies completions (`PLAYED`, queue tombstone, delete-when-played) and the checkpoint (fresh HLC stamp when newer than the stored row), then `clearJournal(upTo)`.
+  - **Bounded wake lock for the flush**: on `pause`/`stop`/`ended` the service acquires a `PARTIAL_WAKE_LOCK` for at most 15 s (released early on `media.ackFlush()`), and `NativeAudioEngine` treats the `media-state(paused)` / `media-ended` callback as an **immediate** sync trigger when `document.visibilityState === 'hidden'` (no 2 s debounce) — so an earbud pause with the screen off still produces the progress upload.
+- Capacitor does not call `webView.onPause()`, so while the screen is on or shortly after it turns off, `ProgressRecorder`'s 5 s store writes and the scheduler's 180 s checkpoint run normally; the native journal makes correctness independent of that. There is no WorkManager/Java sync code: when the process is gone nothing syncs until the next launch, which reconciles the journal and pushes first thing (`capabilities.backgroundSync = false` is surfaced in the sync settings copy).
 
 ## 4. `@minipod/core`
 
@@ -362,12 +368,14 @@ Entry `mountMiniPodApp(container, host, engine)`. Everything reads the host thro
 ```ts
 export interface PlayerEngine {
   readonly capabilities: { video: boolean; background: boolean };
-  load(item: { episodeKey: string; source: MediaSource; startMs: number; speed: number; metadata: MediaMetadataLite; nextSource?: MediaSource }): Promise<void>;
+  load(item: { episodeKey: string; source: MediaSource; startMs: number; speed: number; metadata: MediaMetadataLite }): Promise<void>;
   play(): Promise<void>; pause(): void; stop(): void;
   seekTo(ms: number): void; skip(deltaMs: number): void;          // UI passes -10_000 / +30_000
   setSpeed(x: number): void;                                        // clamped 0.5..3.0
+  setSleepTimer(t: SleepTimer): void;                               // { mode: 'off'|'minutes'|'endOfEpisode'|'endOfChapter', minutes?, chapterEndMs? }
+  setQueue?(items: QueueItemSource[]): void;                        // native engines: remaining queue for autonomous auto-advance
   attachVideoSurface?(el: HTMLElement): void;
-  subscribe(l: (e: PlayerEvent) => void): Unsubscribe;              // state | position(1 s) | ended | error
+  subscribe(l: (e: PlayerEvent) => void): Unsubscribe;              // state | position(1 s) | ended | error | sleepTimer | nativeAdvanced
   dispose(): void;
 }
 ```
@@ -377,8 +385,10 @@ export interface PlayerEngine {
 | Backend | one `<audio>` (or `<video>` for video enclosures) element, `preservesPitch = true`, `playbackRate` | `MiniPodPlugin.media.*` → Media3 `PlaybackService` (§3.3) |
 | Source | `/media/{episodeKey}` (server proxy, 206 Range) | enclosure URL + headers, or downloaded file path, or `content://` for local folders |
 | OS integration | `navigator.mediaSession` metadata + action handlers (`play`, `pause`, `seekbackward` 10 s, `seekforward` 30 s, `seekto`, `nexttrack`) and `setPositionState` | notification / lockscreen / Bluetooth / Auto via `MediaSession` |
-| Background | tab in background: HTML audio keeps playing; position events keep flowing (media elements are exempt from timer throttling for `timeupdate`) | foreground service; native 5 s checkpoint |
-| Sleep timer | JS countdown, 60 s volume fade via `element.volume` | JS countdown; fade via `media.setVolume` |
+| Background | tab in background: HTML audio keeps playing; position events keep flowing (media elements are exempt from timer throttling for `timeupdate`); on `pagehide` the final position is sent with `keepalive: true` | foreground service; native queue, sleep timer, 5 s checkpoint and completion journal (§3.3) |
+| Sleep timer | JS countdown, 60 s volume fade via `element.volume` | **native** in `PlaybackService` (`media.setSleepTimer`) |
+| Auto-advance | JS `AutoAdvancePolicy` on `ended` | native from `media.setQueue`; JS reconciles via `nativeAdvanced` / journal |
+| Video | `capabilities.video = true`, `<video>` element | `capabilities.video = false` in v1: UI shows an *audio only* badge on video enclosures and offers *Open in video player* (`files.openExternal`); inline `SurfaceView` is P2 |
 
 `usePlayer()` wires the engine to `ProgressRecorder`, `AutoAdvancePolicy`, the queue store and the sync trigger (`host.progress.save` → host raises the push). The UI keeps `speed` in settings (local only).
 
@@ -555,7 +565,7 @@ Object stores mirror the tables: `feeds` (key `feedKey`, indexes `subscribed`, `
 }
 ```
 
-Hard limits: subscriptions ≤ 5 000, queue entries ≤ 1 000 (incl. tombstones), progress ≤ 50 000 entries (oldest `PLAYED` evicted first, raising `progress.floor`) → typical file 200 KB–3 MB, gzip-friendly. WebDAV stores it with `Content-Encoding: gzip`; local-folder/SAF and Drive store raw JSON so other tools can read it; Gist switches to gzip+base64 above 800 KB (§8.2).
+Hard limits: subscriptions ≤ 5 000, queue entries ≤ 1 000 (incl. tombstones), progress ≤ 50 000 entries (oldest `PLAYED` evicted first, raising `progress.floor`) → typical file 200 KB–3 MB, gzip-friendly. local-folder/SAF, Drive **and WebDAV** store raw UTF-8 JSON (WebDAV servers such as SabreDAV/Nextcloud, Apache `mod_dav` and Synology reject or mishandle request-entity `Content-Encoding: gzip`; TLS/HTTP transport compression is enough); only Gist switches to gzip+base64 above 800 KB (§8.2), using `CompressionStream('gzip')`.
 
 Secrets are never part of the document: `hasCredentials` only tells the other device to prompt once. (A plaintext credential field was considered and rejected — secret Gists are unlisted, not private.)
 
@@ -564,7 +574,7 @@ Secrets are never part of the document: `hasCredentials` only tells the other de
 ```
 feedKey    = "f_" + sha1Hex(schemeLessCanonical(feedUrl))              // RSS/Atom feeds, §4.1.3
            = "l_" + sha1Hex(treeUri)                                   // local folders (never leaves the device)
-identity   = item.guid?.trim().ifEmpty(null) ?: enclosureUrl ?: (title + "|" + pubDateEpochMs)
+identity   = (item.guid?.trim() || undefined) ?? enclosureUrl ?? (title + "|" + pubDateEpochMs)
 episodeKey = "e_" + sha1Hex(feedKey + "\n" + identity)
 deviceId   = "d_" + 16 random bytes hex, generated once per install (not ANDROID_ID)
 ```
@@ -577,13 +587,13 @@ All `updatedAt` values are HLC milliseconds. The clock is only ever advanced by 
 
 ```
 // local write
-fun now(): Long { val wall = System.currentTimeMillis(); hlc = max(wall, hlc + 1); return hlc }
+now(): number { const wall = Date.now(); this.hlc = Math.max(wall, this.hlc + 1); return this.hlc; }
 
 // after reading a remote document (in SyncEngine, not in merge)
-fun observe(remoteHlcMax: Long) { hlc = max(hlc, min(remoteHlcMax, System.currentTimeMillis() + 5 * 60_000)) }
+observe(remoteHlcMax: number) { this.hlc = Math.max(this.hlc, Math.min(remoteHlcMax, Date.now() + 5 * 60_000)); }
 
 // stamping a local mutation of entity e (subscribe, queue move, progress tick, …)
-e.updatedAt = max(hlc.now(), (previousLocalRecordOf(e)?.updatedAt ?: 0) + 1)
+e.updatedAt = Math.max(hlc.now(), (previousLocalRecordOf(e)?.updatedAt ?? 0) + 1)
 ```
 
 Effects:
@@ -654,7 +664,7 @@ Invariants (unit-tested with property-based tests over random edit histories on 
 | Subscription, `deleted=true`, present locally | Run the soft-delete routine from §6.3 (downloads, non-queued episodes, queue tombstones), keep `progress`. |
 | Subscription `movedTo` | Update `feeds.url`; alias to an existing key if `feedKey(movedTo)` already exists (§4.1.3). |
 | Queue entry, `removed=false`, episode unknown locally | Ensure a `feeds` stub exists for `feedKey` (`subscribed=0` unless subscribed), insert an `episodes` row from `stub` with `is_stub=1`, then upsert `queue`. The row is playable immediately; the next feed parse replaces the stub. |
-| Queue entry, other | Upsert `queue` row; UI reorders via Flow. If the **currently playing** episode is removed remotely, playback continues but the item is not re-added (it was the user's explicit action elsewhere). |
+| Queue entry, other | Upsert `queue` row; UI reorders from the `queue-changed` event. If the **currently playing** episode is removed remotely, playback continues but the item is not re-added (it was the user's explicit action elsewhere). |
 | Local clean (`sync_dirty=0`) row absent from `merged` | It fell under a floor on the other side → delete locally (subscription: soft-delete routine; queue: hard delete; progress: delete). |
 | Progress, episode currently loaded in the player | If remote is newer: host emits `progress-changed { fromSync }`; the UI seeks the `PlayerEngine` to `positionMs` and shows "Resumed from <device> — Undo" (undo writes a new local record with `previous.updatedAt + 1`, which then wins). If remote `state=PLAYED`: do not stop playback; mark played, remove from queue, suppress auto-advance for this item. |
 | Progress, other episodes | Upsert. |
@@ -697,7 +707,7 @@ export interface CloudFileProvider {
 export interface HostFileAccess { stat(): Promise<{ size: number; mtimeMs: number } | null>; read(): Promise<Uint8Array>; write(bytes: Uint8Array): Promise<void>; watch?(cb: () => void): Unsubscribe }
 ```
 
-Providers that talk HTTP (`GoogleDriveProvider`, `WebDavProvider`, `GitHubGistProvider`) are implemented **once in core** over the injected `HttpClient` and a `TokenProvider` (`() => Promise<string>`), so desktop and Android share them byte for byte; only token acquisition and the file primitive are host code.
+Providers that talk HTTP (`GoogleDriveProvider`, `WebDavProvider`, `GitHubGistProvider`) are implemented **once in core** over the injected `HttpClient` and a `TokenProvider = (opts?: { forceRefresh?: boolean }) => Promise<string>`, so desktop and Android share them byte for byte; only token acquisition and the file primitive are host code. `GoogleDriveProvider` asks for a token before every cycle (hosts refresh silently before `expiresAt`), and on `401` retries exactly once with `{ forceRefresh: true }` before reporting `sync-auth` ("Sync needs attention").
 
 Conflict detection contract: providers with a native precondition (WebDAV `If-Match`) rely on it; all others perform a **pre-write** `head()` and refuse to upload when the remote changed. A residual race window (another writer between `head()` and the upload) remains for SAF/Drive/Gist; it cannot lose data because every device keeps its own rows and the next cycle re-merges (§7.5 invariant 1) — it can only delay convergence by one cycle.
 
@@ -705,7 +715,7 @@ Conflict detection contract: providers with a native precondition (WebDAV `If-Ma
 
 | Provider | Locate | `head` | `read` | `write` | Conflict detection | Setup cost |
 |---|---|---|---|---|---|---|
-| **`HostFileProvider`** (core) over **`HostFileAccess`** — desktop `local-folder` (node:fs file inside a folder synced by the Google Drive / Dropbox / Syncthing / iCloud / OneDrive desktop client) · Android `saf` (`content://` URI from `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT` with persistable R/W permission via `MiniPodPlugin.saf`) | desktop: path chosen with the server-side folder browser; Android: picker | `stat()` → synthetic etag `"${mtimeMs}-${size}"` (node `fs.stat` / `DocumentsContract` `COLUMN_LAST_MODIFIED`+`COLUMN_SIZE`) | `read()` | desktop: write to `minipod-sync-v1.json.tmp` + `fsync` + atomic `rename`; Android: `openFileDescriptor(uri, "rw")` → write from offset 0 → `truncate(size)` → `fsync` (several `DocumentsProvider`s ignore the `t` in `"wt"`) | Emulated: pre-write `head()`; `watch()` (`fs.watch` / periodic `stat` on Android) wakes the scheduler when the sync client changes the file; `SecurityException`/`ENOENT` → `failed(retryable=false)` → "needs attention" (§9.3) | Zero — no developer credentials, works with any sync client. Google Drive's Android SAF provider caches aggressively and uploads lazily; the UI recommends the native Drive provider for Google Drive on Android. |
+| **`HostFileProvider`** (core) over **`HostFileAccess`** — desktop `local-folder` (node:fs file inside a folder synced by the Google Drive / Dropbox / Syncthing / iCloud / OneDrive desktop client) · Android `saf` (`content://` URI from `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT` with persistable R/W permission via `MiniPodPlugin.saf`) | desktop: path chosen with the server-side folder browser; Android: picker | `stat()` → synthetic etag `"${mtimeMs}-${size}"` (node `fs.stat` / `DocumentsContract` `COLUMN_LAST_MODIFIED`+`COLUMN_SIZE`) | `read()` | desktop: write to `minipod-sync-v1.json.tmp` + `fsync` + atomic `rename`; Android: `openFileDescriptor(uri, "rw")` → write from offset 0 → `truncate(size)` → `fsync` (several `DocumentsProvider`s ignore the `t` in `"wt"`) | Emulated: pre-write `head()`; `watch()` wakes the scheduler when the sync client changes the file — desktop watches the **parent directory** with `fs.watch(dir)` filtered to the file name (sync clients and MiniPod itself replace the file by `rename`, which would orphan a watch on the old inode) and ignores events while a write is in progress or when `stat()` equals the last-written `mtimeMs-size` etag; Android polls `stat()` every 60 s while visible; `SecurityException`/`ENOENT` → `failed(retryable=false)` → "needs attention" (§9.3) | Zero — no developer credentials, works with any sync client. Google Drive's Android SAF provider caches aggressively and uploads lazily; the UI recommends the native Drive provider for Google Drive on Android. |
 | **`GoogleDriveProvider` (appData mode)** | `files.list?spaces=appDataFolder&q=name='minipod-sync-v1.json'&fields=files(id,md5Checksum,modifiedTime)`; if **more than one** file matches (two devices bootstrapped concurrently) → download all, merge all, write to the lexicographically smallest `fileId`, delete the others; create with `files.create` multipart, `parents:["appDataFolder"]` | `files.get?fields=md5Checksum` → etag = `md5Checksum` (content hash; `version` is an account-wide counter that jumps arbitrarily and is **not** used for equality) | `files.get?alt=media` | `files.update` (media upload) | Emulated: pre-write `head()`; after upload, store the returned `md5Checksum` as the new etag | Scope `https://www.googleapis.com/auth/drive.appdata`. Desktop: OAuth "Desktop app" client, PKCE + loopback redirect on `127.0.0.1:{port}/oauth/callback` handled by the Node server, refresh token in `secrets.json` (0600). Android: `MiniPodPlugin.auth.googleSignIn` (Credential Manager + `AuthorizationClient`, Android client bound to the signing SHA-1). The option is **hidden** when Play Services are unavailable or the build has no OAuth client configured. googleapis.com sends CORS headers, but all calls still go through the injected `HttpClient` for uniformity. |
 | **`GoogleDriveProvider` (visible-file mode)** | Same API, scope `drive.file`; visible folder `MiniPod/` + file `minipod-sync.json` created by the app (only app-created files are visible under `drive.file`); same duplicate-file resolution | as above | as above | as above | as above | Same OAuth client. User can inspect/delete the file in Drive; useful for debugging and manual backup. |
 | **`WebDavProvider`** | Absolute file URL (Nextcloud/ownCloud/Apache/Synology…) | `HEAD` → `ETag` | `GET` with `If-None-Match` → 304/200 | `PUT` with `If-Match: <etag>` (or `If-None-Match: *` when creating) | Native: `412 Precondition Failed` → `Conflict` | URL + username + app-password (Basic; Digest via a small pure-TS challenge/response helper in core). Many WebDAV servers send no CORS headers — irrelevant here because requests never originate from the WebView's `fetch`. |
@@ -760,7 +770,7 @@ The cycle is serialised by a promise-chain mutex; a request arriving mid-cycle s
 |---|---|---|---|
 | Subscribe / unsubscribe / OPML import | 2 s debounce | push (after pull) | Import of 200 feeds results in one upload. |
 | Queue add / remove / reorder / clear | 5 s debounce | push | Drag sessions emit one event at drop. |
-| Pause, stop, headset disconnect, audio-focus loss (persistent) — raised by the `PlayerEngine` (`HtmlAudioEngine` events on desktop; native `media-state` events on Android, which arrive even with the screen off) | 2 s debounce | push | The most important progress write. |
+| Pause, stop, headset disconnect, audio-focus loss (persistent) — raised by the `PlayerEngine` (`HtmlAudioEngine` events on desktop; native `media-state` events on Android) | 2 s debounce when visible; **immediate when `document.visibilityState === 'hidden'`** (Android: inside the service's 15 s wake-lock window) | push | The most important progress write. |
 | Episode completed | 2 s debounce | push | Carries `PLAYED` + queue tombstone together. |
 | Manual mark played/unplayed, seek while paused | 2 s debounce | push | |
 | **Playing checkpoint** | every **180 s** while `isPlaying`, only if `positionMs` changed and no other push happened in the window | push | Caps cloud writes at 20/h during continuous playback (local DB still records every 5 s, so a crash loses ≤ 5 s locally and ≤ 3 min on other devices). Keeps the radio out of permanent tail state and avoids thrashing SAF cloud watchers / creating a Gist commit every 30 s. |
@@ -770,9 +780,9 @@ The cycle is serialised by a promise-chain mutex; a request arriving mid-cycle s
 | "Sync now" | immediate | pull+push | Bypasses backoff. |
 | Provider configured / changed | immediate | pull+push | First sync merges existing remote data rather than overwriting. |
 
-Debouncing rule: all push triggers feed one `MutableSharedFlow<Reason>`; the scheduler applies `debounce(reason.delay)` per class and then `conflate()`s into a single engine run, so a pause followed by a queue edit yields exactly one upload.
+Debouncing rule: all push triggers feed one `SyncScheduler.request(reason)` call; the scheduler keeps one pending timer per reason class (`setTimeout(reason.delay)`, `0` when hidden) and coalesces every expiry into a single engine run, so a pause followed by a queue edit yields exactly one upload.
 
-No WorkManager / JobScheduler: there is no Java sync code. Android background guarantees are therefore: (1) while playing, the foreground service keeps the process (and the WebView's JS) alive, so all triggers above fire; (2) when not playing and the app is backgrounded, the last push happened on `visibilitychange`; (3) if the OS kills the process, the native checkpoint + next-launch sync cover the gap. The sync settings screen states this plainly (`capabilities.backgroundSync = false`).
+No WorkManager / JobScheduler: there is no Java sync code. Android background guarantees are therefore: (1) while playing, the foreground service keeps the process (and the WebView's JS) alive, so all triggers above fire; (2) when not playing and the app is backgrounded, the last push happened on `visibilitychange`; (3) if the OS kills the process or throttles the WebView, the native journal (checkpoint + completions) + next-launch reconciliation cover the gap. The sync settings screen states this plainly (`capabilities.backgroundSync = false`).
 
 ### 9.3 Failure handling
 

@@ -244,7 +244,7 @@ Controls and their fixed behaviour:
 |---|---|
 | ⟲10 / 30⟳ | Seek −10 000 ms / +30 000 ms (fixed; no preference) |
 | Speed | Tap cycles presets 1.0 → 1.25 → 1.5 → 1.75 → 2.0 → 1.0; long-press opens a slider 0.5×–3.0× in 0.05 steps. Global, persisted locally (not synced). |
-| ⏾ Sleep timer | Sheet with 15 / 30 / 45 / 60 min, *End of episode*, *End of chapter*, *Off*. Last-minute fade-out. Shake-to-extend is **not** included. |
+| ⏾ Sleep timer | Sheet with 15 / 30 / 45 / 60 min, *End of episode*, *End of chapter*, *Off*. Last-minute fade-out. On Android the timer runs inside the native playback service, so it works with the screen off. Shake-to-extend is **not** included. |
 | Chapters | All sources are merged (feed PSC + embedded ID3/Vorbis/MP4 + Podcasting 2.0 JSON, same 1-second alignment rule as AntennaPod's `ChapterMerger`). Current chapter highlighted; chapter image replaces cover while active. |
 | Media notification / lockscreen / Bluetooth / Android Auto / desktop media keys | Android: Media3 `MediaSession`; PC: `navigator.mediaSession` (OS media overlay, keyboard media keys). Same play/pause/−10/+30 actions. |
 
@@ -420,7 +420,7 @@ Nothing, in the common case. Merge is per entity (see [ARCHITECTURE.md §7](ARCH
 | Phone unsubscribes from X; tablet (offline for a week) still has X | X stays unsubscribed everywhere (tombstone wins while it is newer than the tablet's last *change* to X). Re-subscribing later on either device wins over the old tombstone. |
 | Tablet is switched on after a year | Its untouched copies of long-deleted subscriptions are *not* resurrected (they fall under the sync file's tombstone floor); anything it changed while offline is kept and pushed. |
 | Tablet queued an episode of a podcast the phone never fetched (or that already dropped off the feed) | Phone shows and can stream it immediately: queue entries carry a small title/enclosure stub. |
-| Both devices listened to the same episode | Newest timestamp wins; if the same second, the farther position wins, then "played" wins. |
+| Both devices listened to the same episode | Newest timestamp wins; on an identical timestamp "played" wins, then the farther position. |
 | Phone finished the episode; tablet paused it earlier at 20 min | Played wins (it is the newer write); the tablet shows ✓ and drops it from the queue. |
 
 The only user-facing conflict UI is the *Resumed from <device> — Undo* snackbar when the position of the episode currently on screen jumps because of a pull.
@@ -428,7 +428,7 @@ The only user-facing conflict UI is the *Resumed from <device> — Undo* snackba
 ### 6.7 Battery & quota budget
 
 - Playing for 1 h with the default policy = **≤ 20 uploads** (one checkpoint per 180 s window, only if the position moved and nothing else was pushed in that window). Each pause/stop adds one immediate upload; local progress is still saved every 5 s. The 3-minute cadence keeps the mobile radio out of permanent tail state, avoids a Gist commit every half minute, and gives SAF-backed cloud apps (Dropbox/Nextcloud watchers) time to upload between writes instead of producing conflicted copies.
-- Idle device: a 15-min `WorkManager` periodic pull with network constraint; skipped when the remote ETag is unchanged (HEAD/`If-None-Match`, or Drive `files.get?fields=md5Checksum`). A pull that changes nothing locally never triggers an upload, so idle devices do not ping-pong.
+- Idle device: a 15-min periodic pull (PC: in the always-on local server; Android: while the app is open or playing) plus a file watcher for folder-based providers; skipped when the remote ETag is unchanged (HEAD/`If-None-Match`, or Drive `files.get?fields=md5Checksum`). A pull that changes nothing locally never triggers an upload, so idle devices do not ping-pong.
 - Drive free quota is 20 000 queries/100 s per project — a single user is three orders of magnitude below.
 
 ## 7. Accessibility & platform notes
@@ -448,4 +448,5 @@ The only user-facing conflict UI is the *Resumed from <device> — Undo* snackba
 4. **Credentials** — never synced; `hasCredentials` only makes other devices prompt once.
 5. **Cloud checkpoint while playing** — 180 s (local DB every 5 s; immediate on pause/stop/complete/queue edit).
 6. **Platforms** — Android (Capacitor APK with native Media3 playback) and PC Web App (Node loopback server + browser) from one TypeScript monorepo; no iOS in v1; no Electron (the browser `--app` window is enough and keeps the install at "have Node").
-7. **Video on Android** — v1 plays the audio track natively; an inline video surface is a P2 follow-up (PC plays video inline from day one).
+7. **Video on Android** — v1 plays the audio track natively, shows an *audio only* badge on video episodes and offers *Open in video player*; an inline video surface is a P2 follow-up (PC plays video inline from day one).
+8. **Screen-off correctness on Android** — queue auto-advance, sleep timer, 5 s position checkpoint and a completion journal all live in the native playback service; the UI only reconciles. Pausing with the screen off still uploads progress immediately (bounded 15 s wake lock).
