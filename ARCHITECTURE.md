@@ -131,7 +131,7 @@ packages/host-node/
     └── settings/                 store.ts (JSON column; secrets file 0600)
 
 packages/host-android/
-├── capacitor.config.ts           appId dev.minipod.app · webDir www · androidScheme https · SystemBars insetsHandling: 'disable'
+├── capacitor.config.ts           appId dev.minipod.app · webDir www · androidScheme https · android.allowMixedContent: true (http:// cover art in legacy feeds; Kotori sets false) · SystemBars insetsHandling: 'disable'
 ├── web/                          index.html · main.tsx (mountMiniPodApp(el, createCapacitorPlatformHost(), new NativeAudioEngine()))
 ├── src/
 │   ├── capacitor-host.ts         CapacitorPlatformHost (in-WebView)
