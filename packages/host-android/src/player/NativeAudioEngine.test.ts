@@ -1,0 +1,142 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { PlayerEvent } from '@minipod/core';
+import { NativeAudioEngine } from './NativeAudioEngine';
+import type { MiniPodEventMap, MiniPodPlugin } from '../plugin-types';
+
+function createMockMediaHarness() {
+  const listeners = new Map<string, Set<(payload: unknown) => void>>();
+  const emitNative = <K extends keyof MiniPodEventMap>(event: K, payload: MiniPodEventMap[K]) => {
+    for (const cb of listeners.get(event) ?? []) {
+      cb(payload);
+    }
+  };
+
+  const media: MiniPodPlugin['media'] = {
+    load: vi.fn(async (p) => ({
+      episodeKey: p.episodeKey,
+      playing: false,
+      buffering: false,
+      positionMs: p.startMs,
+      durationMs: p.metadata.durationMs ?? 60_000,
+      speed: p.speed,
+    })),
+    setQueue: vi.fn(async () => undefined),
+    play: vi.fn(async () => undefined),
+    pause: vi.fn(async () => undefined),
+    seekTo: vi.fn(async () => undefined),
+    setSpeed: vi.fn(async () => undefined),
+    setSleepTimer: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
+    getState: vi.fn(async () => ({
+      playing: false,
+      buffering: false,
+      positionMs: 0,
+      speed: 1,
+    })),
+    readJournal: vi.fn(async () => ({ completed: [] })),
+    clearJournal: vi.fn(async () => undefined),
+    ackFlush: vi.fn(async () => undefined),
+  };
+
+  const addListener: MiniPodPlugin['addListener'] = vi.fn(async (eventName, cb) => {
+    let set = listeners.get(eventName);
+    if (!set) {
+      set = new Set();
+      listeners.set(eventName, set);
+    }
+    const fn = cb as (payload: unknown) => void;
+    set.add(fn);
+    return {
+      remove: async () => {
+        set?.delete(fn);
+      },
+    };
+  });
+
+  return { plugin: { media, addListener }, emitNative, media };
+}
+
+describe('NativeAudioEngine', () => {
+  it('maps native playback state, emits nativeAdvanced on autonomous track transition, and triggers hidden flush', async () => {
+    const { plugin, emitNative, media } = createMockMediaHarness();
+    let visible = true;
+    const hiddenFlushes: Array<'paused' | 'ended'> = [];
+
+    const engine = new NativeAudioEngine({
+      plugin,
+      isVisible: () => visible,
+      onHiddenFlushNeeded: (reason) => hiddenFlushes.push(reason),
+    });
+
+    // Wait for async listener registration
+    await new Promise((r) => setTimeout(r, 0));
+
+    const events: PlayerEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    await engine.load({
+      episodeKey: 'e_track1',
+      source: { kind: 'url', url: 'https://example.com/1.mp3' },
+      startMs: 5_000,
+      speed: 1.25,
+      metadata: { title: 'Track 1', durationMs: 120_000 },
+      mediaType: 'AUDIO',
+    });
+    expect(media.load).toHaveBeenCalledOnce();
+
+    await engine.play();
+    emitNative('media-state', {
+      episodeKey: 'e_track1',
+      playing: true,
+      buffering: false,
+      positionMs: 6_000,
+      durationMs: 120_000,
+      speed: 1.25,
+    });
+
+    // Autonomous native transition from `e_track1` -> `e_track2` while screen is off
+    visible = false;
+    emitNative('media-state', {
+      episodeKey: 'e_track2',
+      playing: true,
+      buffering: false,
+      positionMs: 0,
+      durationMs: 90_000,
+      speed: 1.25,
+    });
+
+    expect(events).toContainEqual({
+      type: 'nativeAdvanced',
+      from: 'e_track1',
+      to: 'e_track2',
+    });
+
+    // Earbud pause while hidden -> triggers immediate hidden flush!
+    emitNative('media-state', {
+      episodeKey: 'e_track2',
+      playing: false,
+      buffering: false,
+      positionMs: 14_000,
+      durationMs: 90_000,
+      speed: 1.25,
+    });
+
+    expect(hiddenFlushes).toEqual(['paused']);
+
+    // Sleep timer state event mapping
+    emitNative('sleep-timer-state', {
+      mode: 'minutes',
+      minutes: 15,
+      remainingMs: 42_000,
+    });
+    expect(events).toContainEqual({
+      type: 'sleepTimer',
+      state: {
+        timer: { mode: 'minutes', minutes: 15 },
+        remainingMs: 42_000,
+      },
+    });
+
+    engine.dispose();
+  });
+});

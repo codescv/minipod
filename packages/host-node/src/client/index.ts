@@ -1,2 +1,7 @@
-/** createRestPlatformHost() — implemented by coder-hosts (ARCHITECTURE.md §3.1). */
-export {};
+export {
+  createRestPlatformHost,
+  connectRestPlatformHost,
+  type CreateRestPlatformHostOptions,
+} from './rest-host';
+export { RestJsonClient, type RestClientConfig, type RequestCallOptions } from './http';
+export { HostEventStream, SseParser, type HostEventStreamOptions } from './events';
