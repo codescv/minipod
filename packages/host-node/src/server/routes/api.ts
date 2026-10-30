@@ -437,5 +437,32 @@ export function createApiRoutes(host: PlatformHost, mediaProxy: MediaProxy): Hon
     }),
   );
 
+  // In-App Auto-Updater (`codescv/minipod` GitHub Releases)
+  api.post('/update/check', (c) =>
+    handleApi(c, async () => {
+      if (!host.updater) {
+        throw new MiniPodError('unsupported', 'Updater is not configured on this host');
+      }
+      const body = await readJsonBody<{ currentVersion?: string }>(c).catch(
+        (): { currentVersion?: string } => ({}),
+      );
+      return host.updater.check(
+        body.currentVersion ? { currentVersion: body.currentVersion } : undefined,
+      );
+    }),
+  );
+
+  api.post('/update/apply', (c) =>
+    handleApi(c, async () => {
+      if (!host.updater) {
+        throw new MiniPodError('unsupported', 'Updater is not configured on this host');
+      }
+      const body = await readJsonBody<{ force?: boolean }>(c).catch(
+        (): { force?: boolean } => ({}),
+      );
+      return host.updater.apply(body.force !== undefined ? { force: body.force } : undefined);
+    }),
+  );
+
   return api;
 }

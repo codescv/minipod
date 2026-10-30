@@ -3,10 +3,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { decodeBase64, encodeBase64, episodeKey as deriveEpisodeKey } from '@minipod/core';
 import { createCapacitorPlatformHost, extractActionSendInput } from './capacitor-host';
 import { createMemoryPreferences } from './storage/idb';
-import type {
-  MiniPodEventMap,
-  MiniPodPlugin,
-  NativeJournalSnapshot,
+import {
+  wrapNativeBridge,
+  type MiniPodEventMap,
+  type MiniPodNativeBridge,
+  type MiniPodPlugin,
+  type NativeJournalSnapshot,
 } from './plugin-types';
 
 const SAMPLE_RSS = `<?xml version="1.0" encoding="UTF-8"?>
@@ -371,6 +373,85 @@ describe('CapacitorPlatformHost', () => {
     expect(
       extractActionSendInput('Listen to this show! https://feeds.example.com/show.xml.'),
     ).toBe('https://feeds.example.com/show.xml');
+
+    await host.dispose();
+  });
+
+  it('checks GitHub releases via native HTTP and downloads/installs signed APKs via MiniPod bridge', async () => {
+    const harness = createTestPluginHarness();
+    const downloadSpy = vi.fn(async ({ version }: { url: string; version: string }) => ({
+      filePath: `/data/user/0/dev.minipod.app/cache/updates/minipod-${version}.apk`,
+      sizeBytes: 4_123_456,
+      installerLaunched: true,
+      installed: true,
+      needsPermission: false,
+    }));
+    const installSpy = vi.fn(async ({ filePath }: { filePath: string }) => ({
+      filePath,
+      installerLaunched: true,
+      installed: true,
+      needsPermission: false,
+    }));
+
+    const wrapped = wrapNativeBridge({
+      downloadAndInstallApk: downloadSpy,
+      installApkFile: installSpy,
+    } as unknown as MiniPodNativeBridge);
+    expect(await wrapped.installApkFile!({ filePath: '/cache/updates/minipod-0.1.2.apk' })).toMatchObject({
+      installerLaunched: true,
+      needsPermission: false,
+    });
+
+    const pluginWithUpdater: MiniPodPlugin = {
+      ...harness.plugin,
+      http: vi.fn(async (req) => ({
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        finalUrl: req.url,
+        chain: [],
+        bodyBase64: encodeBase64(
+          new TextEncoder().encode(
+            JSON.stringify({
+              tag_name: 'v0.1.2',
+              name: 'MiniPod v0.1.2',
+              body: 'Android auto-updater',
+              published_at: '2026-10-30T15:00:00Z',
+              html_url: 'https://github.com/codescv/minipod/releases/tag/v0.1.2',
+              assets: [
+                {
+                  name: 'minipod-v0.1.2.apk',
+                  browser_download_url:
+                    'https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2.apk',
+                  size: 4_123_456,
+                },
+              ],
+            }),
+          ),
+        ),
+      })),
+      downloadAndInstallApk: downloadSpy,
+      installApkFile: installSpy,
+    };
+
+    const { host } = await createCapacitorPlatformHost({
+      plugin: pluginWithUpdater,
+      appVersion: '0.1.0',
+      idbFactory: new IDBFactory(),
+      dbName: 'host-updater-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    const checkRes = await host.updater!.check();
+    expect(checkRes.updateAvailable).toBe(true);
+    expect(checkRes.release?.version).toBe('0.1.2');
+
+    const applyRes = await host.updater!.apply();
+    expect(applyRes.method).toBe('android-apk');
+    expect(applyRes.targetVersion).toBe('0.1.2');
+    expect(downloadSpy).toHaveBeenCalledWith({
+      url: 'https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2.apk',
+      version: '0.1.2',
+    });
 
     await host.dispose();
   });

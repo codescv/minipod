@@ -9,6 +9,7 @@ import {
   buildQueueStub,
   buildUserAgent,
   ChapterLoader,
+  compareSemver,
   computeResumePositionMs,
   createFeedUrlResolver,
   createItunesTopListLoader,
@@ -18,6 +19,7 @@ import {
   detectFeedType,
   encodeBase64,
   extractUrlCredentials,
+  fetchLatestRelease,
   fetchWithBasicAuth,
   filterOutSubscribed,
   GitHubGistProvider,
@@ -1896,6 +1898,72 @@ export async function createCapacitorPlatformHost(
         }
         emit({ type: 'settings-changed', settings: updated });
         return updated;
+      },
+    },
+
+    updater: {
+      async check(opts) {
+        const currentVersion = opts?.currentVersion ?? deps.appVersion;
+        const release = await fetchLatestRelease(async (url, init) => {
+          const res = await http({
+            url,
+            method: 'GET',
+            ...(init?.headers ? { headers: init.headers } : {}),
+            ...(init?.signal ? { signal: init.signal } : {}),
+          });
+          const text = await res.text();
+          return {
+            ok: res.status >= 200 && res.status < 300,
+            status: res.status,
+            json: async () => JSON.parse(text) as unknown,
+            text: async () => text,
+          };
+        });
+        return {
+          currentVersion,
+          updateAvailable: compareSemver(release.version, currentVersion) > 0,
+          release,
+          checkedAt: Date.now(),
+        };
+      },
+
+      async apply(opts) {
+        const checkRes = await this.check();
+        const release = checkRes.release;
+        if (!release || (!checkRes.updateAvailable && !opts?.force)) {
+          return {
+            ok: true,
+            method: 'up-to-date',
+            previousVersion: deps.appVersion,
+            targetVersion: deps.appVersion,
+            message: `MiniPod v${deps.appVersion} is already up to date.`,
+          };
+        }
+        if (deps.plugin.downloadAndInstallApk && release.apkUrl) {
+          const res = await deps.plugin.downloadAndInstallApk({
+            url: release.apkUrl,
+            version: release.version,
+          });
+          return {
+            ok: true,
+            method: 'android-apk',
+            previousVersion: deps.appVersion,
+            targetVersion: release.version,
+            bundlePath: res.filePath,
+            ...(res.needsPermission !== undefined ? { needsPermission: res.needsPermission } : {}),
+            message: res.needsPermission
+              ? 'Allow installing unknown apps in Android Settings to finish updating.'
+              : `Launching Android package installer for v${release.version}.`,
+          };
+        }
+        await deps.plugin.openExternal({ url: release.apkUrl ?? release.htmlUrl });
+        return {
+          ok: true,
+          method: 'external',
+          previousVersion: deps.appVersion,
+          targetVersion: release.version,
+          message: `Opened v${release.version} release page.`,
+        };
       },
     },
 

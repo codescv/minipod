@@ -11,9 +11,10 @@ import { useIsDesktop } from '../../hooks/useMediaQuery';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
-import { formatRelativeMinutes } from '../../lib/format';
+import { formatBytes, formatRelativeMinutes } from '../../lib/format';
 import { useSettingsStore } from '../../stores/settings';
 import { showSnackbar } from '../../stores/snackbar';
+import { useUpdateStore } from '../updater/updater';
 
 const REFRESH_OPTIONS: readonly AppSettings['backgroundRefreshHours'][] = [0, 1, 3, 6, 12, 24];
 
@@ -33,6 +34,18 @@ export function SettingsPage() {
   const [deviceDialogOpen, setDeviceDialogOpen] = useState(false);
   const [deviceDraft, setDeviceDraft] = useState(settings.sync.deviceName);
   const [aboutOpen, setAboutOpen] = useState(false);
+
+  const updateStatus = useUpdateStore((s) => s.status);
+  const updateRelease = useUpdateStore((s) => s.release);
+  const updateProgress = useUpdateStore((s) => s.progressPercent);
+  const updateDownloadedBytes = useUpdateStore((s) => s.downloadedBytes);
+  const updateTotalBytes = useUpdateStore((s) => s.totalBytes);
+  const updateNeedsPermission = useUpdateStore((s) => s.needsPermission);
+  const updateAppliedMessage = useUpdateStore((s) => s.appliedMessage);
+  const updateError = useUpdateStore((s) => s.error);
+  const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
+  const downloadUpdate = useUpdateStore((s) => s.downloadUpdate);
+  const installDownloadedApk = useUpdateStore((s) => s.installDownloadedApk);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -286,21 +299,114 @@ export function SettingsPage() {
       <section className="m-settings-section">
         <h2 className="m-settings-heading">{t('settings.sectionAbout')}</h2>
 
-        <button
-          type="button"
+        <div
           className="m-settings-row m-settings-row--clickable"
           data-settings-row="9"
           data-testid="settings-row-about"
           onClick={() => setAboutOpen(true)}
         >
           <div className="m-settings-row__text">
-            <span className="m-settings-row__title">{t('settings.aboutRow')}</span>
+            <span
+              className="m-settings-row__title"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
+            >
+              <span>{t('settings.aboutRow')}</span>
+              <span className="m-pill-badge" data-testid="settings-version-badge">
+                v{host.info.appVersion}
+              </span>
+            </span>
             <span className="m-settings-row__subtitle">
               {t('settings.aboutSummary', { version: host.info.appVersion })}
             </span>
+            {updateStatus !== 'idle' && (
+              <span className="m-settings-row__subtitle" data-testid="settings-update-status">
+                {updateStatus === 'checking'
+                  ? t('update.checking')
+                  : updateStatus === 'up-to-date'
+                    ? t('update.upToDate', { version: host.info.appVersion })
+                    : updateStatus === 'available' && updateRelease
+                      ? t('update.availableStatus', { version: updateRelease.version })
+                      : updateStatus === 'downloading'
+                        ? updateProgress >= 0
+                          ? `${t('update.downloadingProgress', { percent: Math.round(updateProgress) })}${
+                              updateDownloadedBytes > 0
+                                ? ` (${formatBytes(updateDownloadedBytes)}${
+                                    updateTotalBytes > 0 ? ` / ${formatBytes(updateTotalBytes)}` : ''
+                                  })`
+                                : ''
+                            }`
+                          : t('update.applyingUpdate')
+                        : updateStatus === 'ready-to-install' && updateRelease
+                          ? updateNeedsPermission
+                            ? t('update.needsPermissionStatus', { version: updateRelease.version })
+                            : t('update.readyStatus', { version: updateRelease.version })
+                          : updateStatus === 'applied' && updateAppliedMessage
+                            ? t('update.appliedStatus', { message: updateAppliedMessage })
+                            : updateStatus === 'error' && updateError
+                              ? t('update.errorStatus', { error: updateError })
+                              : null}
+              </span>
+            )}
+            {updateStatus === 'downloading' && (
+              <div className="m-update-banner__progress-track" data-testid="settings-update-progress">
+                <div
+                  className={`m-update-banner__progress-fill${updateProgress < 0 ? ' is-indeterminate' : ''}`}
+                  style={
+                    updateProgress >= 0
+                      ? { width: `${Math.min(100, Math.round(updateProgress))}%` }
+                      : undefined
+                  }
+                />
+              </div>
+            )}
           </div>
-          <span aria-hidden="true">›</span>
-        </button>
+
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 'none' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {updateStatus === 'available' && updateRelease ? (
+              <Button
+                variant="filled"
+                icon="download"
+                data-testid="settings-update-btn"
+                onClick={() => {
+                  void downloadUpdate(host);
+                }}
+              >
+                {t('update.updateTo', { version: updateRelease.version })}
+              </Button>
+            ) : updateStatus === 'ready-to-install' ? (
+              <Button
+                variant="filled"
+                icon="download"
+                data-testid="settings-update-btn"
+                onClick={() => {
+                  void installDownloadedApk(host);
+                }}
+              >
+                {updateNeedsPermission ? t('update.grantAndInstall') : t('update.installApk')}
+              </Button>
+            ) : (
+              <Button
+                variant="tonal"
+                disabled={updateStatus === 'checking' || updateStatus === 'downloading'}
+                data-testid="settings-update-btn"
+                onClick={() => {
+                  void checkForUpdate(host, { silent: false });
+                }}
+              >
+                {updateStatus === 'checking'
+                  ? t('update.checkingShort')
+                  : updateStatus === 'downloading'
+                    ? updateProgress >= 0
+                      ? `${Math.round(updateProgress)}%`
+                      : t('update.checkingShort')
+                    : t('update.checkForUpdates')}
+              </Button>
+            )}
+          </div>
+        </div>
       </section>
 
       {/* Device Name Dialog */}
@@ -347,7 +453,7 @@ export function SettingsPage() {
               variant="text"
               icon="openExternal"
               onClick={() => {
-                void host.files.openExternal('https://github.com/AntennaPod/AntennaPod');
+                void host.files.openExternal('https://github.com/codescv/minipod');
               }}
             >
               {t('settings.sourceCode')}

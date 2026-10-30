@@ -1,0 +1,108 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Typecheck, Test, Native-Dep Check & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck monorepo
+        run: pnpm typecheck
+
+      - name: Verify zero native Node addons
+        run: pnpm check:native
+
+      - name: Run unit & integration tests
+        run: pnpm test
+
+      - name: Build production packages
+        run: pnpm build
+
+  android-apk:
+    name: Build Android APK
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build production web & Android release APK
+        run: |
+          pnpm build
+          pnpm build:apk:ci
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minipod-android-apk
+          path: packages/host-android/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Publish Release Assets on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          APK_SRC="packages/host-android/android/app/build/outputs/apk/release/app-release.apk"
+          cp "$APK_SRC" "minipod-${TAG}.apk"
+          tar -czf "minipod-${TAG}-pc.tar.gz" \
+            package.json README.md LICENSE \
+            packages/host-node/package.json \
+            packages/host-node/bin \
+            packages/host-node/dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; skipping asset overwrite to preserve release signatures."
+          else
+            gh release create "$TAG" "minipod-${TAG}.apk" "$APK_SRC" "minipod-${TAG}-pc.tar.gz" \
+              --title "MiniPod ${TAG}" \
+              --generate-notes
+          fi

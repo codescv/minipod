@@ -459,6 +459,20 @@ export function createRestPlatformHost(options?: CreateRestPlatformHostOptions):
       },
     },
 
+    updater: {
+      check(opts) {
+        return client.request(ROUTES.updateCheck.method, ROUTES.updateCheck.path, {
+          body: opts?.currentVersion ? { currentVersion: opts.currentVersion } : {},
+        });
+      },
+
+      apply(opts) {
+        return client.request(ROUTES.updateApply.method, ROUTES.updateApply.path, {
+          body: opts?.force !== undefined ? { force: opts.force } : {},
+        });
+      },
+    },
+
     subscribe(listener: (event: HostEvent) => void): Unsubscribe {
       if (options?.enableSse === false) {
         return () => undefined;

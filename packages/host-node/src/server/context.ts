@@ -81,8 +81,9 @@ import { createNodeHttpClient } from '../net/fetcher';
 import { MediaProxy, readLocalFileSliceSync } from '../net/range-proxy';
 import { SettingsStore } from '../settings/store';
 import { NodeSyncService } from '../sync/scheduler-host';
+import { applyNodeUpdate, checkNodeUpdate } from '../updater/self-updater';
 
-export const MINIPOD_VERSION = '0.1.1';
+export const MINIPOD_VERSION = '0.1.2';
 
 const DESKTOP_CAPABILITIES: HostCapabilities = {
   nativeAudio: false,
@@ -109,6 +110,8 @@ export interface NodeHostOptions {
   /** Directory storing `minipod.sqlite`, `secrets.json`, and `downloads/`. Use `':memory:'` for unit tests. */
   readonly dataDir?: string;
   readonly dbPath?: string;
+  readonly appVersion?: string;
+  readonly repoDir?: string;
   readonly http?: HttpClient;
   readonly fetchImpl?: typeof fetch;
   readonly podcastIndexKeys?: PodcastIndexKeys;
@@ -186,7 +189,9 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
   const db = openDatabase(dbPath);
   const hlc = new HybridLogicalClock();
   const osLabel = `${osPlatform()} ${osRelease()}`;
-  const userAgent = buildUserAgent(MINIPOD_VERSION, osPlatform());
+  const effectiveVersion =
+    options?.appVersion ?? (process.env['MINIPOD_APP_VERSION']?.trim() || MINIPOD_VERSION);
+  const userAgent = buildUserAgent(effectiveVersion, osPlatform());
 
   const http =
     options?.http ??
@@ -211,7 +216,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
   const syncStore = new SqliteSyncStore({
     db,
     hlc,
-    appVersion: MINIPOD_VERSION,
+    appVersion: effectiveVersion,
     ...(options?.deviceName ? { defaultDeviceName: options.deviceName } : {}),
     onDeleteDownloads: (paths) => {
       downloaderRef?.deleteFilesByPaths(paths);
@@ -502,7 +507,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
     return {
       platform: 'desktop',
       os: osLabel,
-      appVersion: MINIPOD_VERSION,
+      appVersion: effectiveVersion,
       capabilities: DESKTOP_CAPABILITIES,
       deviceId: st.deviceId,
       deviceName: st.deviceName,
@@ -1183,6 +1188,30 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
         }
         emit({ type: 'settings-changed', settings: next });
         return next;
+      },
+    },
+
+    updater: {
+      async check(checkOpts) {
+        return checkNodeUpdate({
+          currentVersion: effectiveVersion,
+          overrideCurrentVersion: checkOpts?.currentVersion,
+          dataDir,
+          repoDir: options?.repoDir,
+          fetchImpl: options?.fetchImpl,
+          userAgent,
+        });
+      },
+
+      async apply(applyOpts) {
+        return applyNodeUpdate({
+          currentVersion: effectiveVersion,
+          dataDir,
+          repoDir: options?.repoDir,
+          fetchImpl: options?.fetchImpl,
+          userAgent,
+          force: applyOpts?.force,
+        });
       },
     },
 

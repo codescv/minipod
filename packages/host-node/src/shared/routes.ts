@@ -11,6 +11,8 @@ import type {
   Feed,
   FeedKey,
   HostInfo,
+  HostUpdateApplyResult,
+  HostUpdateCheckResult,
   HttpBasicCredentials,
   LocalFolderRef,
   MediaSource,
@@ -183,6 +185,15 @@ export const ROUTES = {
 
   settingsGet: route<void, AppSettings>('GET', '/api/settings'),
   settingsUpdate: route<Partial<AppSettings>, AppSettings>('PATCH', '/api/settings'),
+
+  updateCheck: route<{ readonly currentVersion?: string }, HostUpdateCheckResult>(
+    'POST',
+    '/api/update/check',
+  ),
+  updateApply: route<{ readonly force?: boolean }, HostUpdateApplyResult>(
+    'POST',
+    '/api/update/apply',
+  ),
 } as const;
 
 export type RouteName = keyof typeof ROUTES;

@@ -12,29 +12,42 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { platform as osPlatform } from 'node:os';
-import { defaultOpenExternal } from './context';
+import { MINIPOD_VERSION, defaultDataDir, defaultOpenExternal } from './context';
 import { startServer } from './start';
+import { applyNodeUpdate, checkNodeUpdate } from '../updater/self-updater';
 
 export interface ParsedCliArgs {
+  readonly command: 'serve' | 'update';
   readonly port: number;
   readonly dataDir?: string;
   readonly openBrowser: boolean;
   readonly appWindow: boolean;
   readonly dev: boolean;
+  readonly checkOnly: boolean;
+  readonly forceUpdate: boolean;
   readonly addInput?: string;
 }
 
 export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
+  let command: 'serve' | 'update' = 'serve';
   let port: number | undefined;
   let dataDir: string | undefined;
   let openBrowser = true;
   let appWindow = false;
   let dev = false;
+  let checkOnly = false;
+  let forceUpdate = false;
   let addInput: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (arg === '--dev') {
+    if (arg === 'update' && i === 0) {
+      command = 'update';
+    } else if (arg === '--check') {
+      checkOnly = true;
+    } else if (arg === '--force') {
+      forceUpdate = true;
+    } else if (arg === '--dev') {
       dev = true;
     } else if (arg === '--no-open') {
       openBrowser = false;
@@ -48,7 +61,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
       dataDir = argv[++i]!;
     } else if (arg.startsWith('--data-dir=')) {
       dataDir = arg.slice('--data-dir='.length);
-    } else if (!arg.startsWith('-') && !addInput) {
+    } else if (!arg.startsWith('-') && !addInput && command === 'serve') {
       addInput = arg;
     }
   }
@@ -61,10 +74,13 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
         : 0;
 
   return {
+    command,
     port: resolvedPort,
     openBrowser: dev ? false : openBrowser,
     appWindow,
     dev,
+    checkOnly,
+    forceUpdate,
     ...(dataDir ? { dataDir } : {}),
     ...(addInput ? { addInput } : {}),
   };
@@ -117,6 +133,29 @@ async function launchBrowserWindow(targetUrl: string, preferAppMode: boolean): P
 
 export async function runCli(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const args = parseCliArgs(argv);
+  if (args.command === 'update') {
+    const currentVersion = process.env['MINIPOD_APP_VERSION']?.trim() || MINIPOD_VERSION;
+    const resolvedDataDir = args.dataDir ?? defaultDataDir();
+    if (args.checkOnly) {
+      const check = await checkNodeUpdate({ currentVersion, dataDir: resolvedDataDir });
+      if (check.updateAvailable && check.release) {
+        process.stdout.write(
+          `Update available: MiniPod v${check.release.version} (current: v${check.currentVersion}) — ${check.release.htmlUrl}\n`,
+        );
+      } else {
+        process.stdout.write(`MiniPod v${check.currentVersion} is up to date.\n`);
+      }
+      return;
+    }
+    const applied = await applyNodeUpdate({
+      currentVersion,
+      dataDir: resolvedDataDir,
+      force: args.forceUpdate,
+    });
+    process.stdout.write(`${applied.message}\n`);
+    return;
+  }
+
   const running = await startServer({
     port: args.port,
     ...(args.dataDir ? { dataDir: args.dataDir } : {}),

@@ -35,3 +35,9 @@ export {
 export { DesktopDriveAuthManager, generatePkcePair, type DesktopDriveAuthDeps } from '../sync/drive-oauth';
 export { NodeSyncService, createNodeSyncSchedulerHost, type NodeSyncServiceDeps } from '../sync/scheduler-host';
 export { SettingsStore, defaultAppSettings, type SecretsFile } from '../settings/store';
+export {
+  checkNodeUpdate,
+  applyNodeUpdate,
+  defaultRepoDir,
+  type SelfUpdaterOptions,
+} from '../updater/self-updater';

@@ -70,6 +70,19 @@ export function formatSpeed(speed: number): string {
   return `${Number(rounded.toFixed(2))}×`;
 }
 
+/** Formats byte counts (`0 B`, `840.0 KB`, `4.1 MB`). */
+export function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return idx === 0 ? `${Math.round(val)} B` : `${val.toFixed(1)} ${units[idx]}`;
+}
+
 const ALLOWED_TAGS = new Set([
   'p',
   'br',

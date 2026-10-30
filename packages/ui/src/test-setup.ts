@@ -2,14 +2,21 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach } from 'vitest';
 import { useRouteStore } from './app/routes';
+import { DISMISSED_UPDATE_TAG_KEY, useUpdateStore } from './features/updater/updater';
 import { useSettingsStore } from './stores/settings';
 import { useSnackbarStore } from './stores/snackbar';
 
 afterEach(() => {
   cleanup();
+  try {
+    localStorage.removeItem(DISMISSED_UPDATE_TAG_KEY);
+  } catch {
+    // ignore
+  }
   useRouteStore.getState().reset();
   useSettingsStore.getState().reset();
   useSnackbarStore.getState().clear();
+  useUpdateStore.getState().reset();
 });
 
 // jsdom has no media playback pipeline; make play()/pause()/load() inert

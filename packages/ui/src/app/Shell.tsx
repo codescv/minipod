@@ -23,6 +23,7 @@ import { CloudSyncSetup } from '../features/settings/CloudSyncSetup';
 import { SettingsPage } from '../features/settings/SettingsPage';
 import { PodcastDetail } from '../features/subscriptions/PodcastDetail';
 import { SubscriptionsGrid } from '../features/subscriptions/SubscriptionsGrid';
+import { UpdateBanner } from '../features/updater/UpdateBanner';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useT } from '../i18n';
 import { usePlayer } from '../player/usePlayer';
@@ -216,7 +217,10 @@ export function Shell() {
           </nav>
         )}
 
-        <main className="m-shell__stage">{renderMainStage()}</main>
+        <main className="m-shell__stage">
+          <UpdateBanner />
+          {renderMainStage()}
+        </main>
 
         {isDesktop && (
           <SideSheet

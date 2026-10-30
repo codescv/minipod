@@ -53,6 +53,7 @@ import {
   type SyncSettings,
   type SyncStatus,
   type Unsubscribe,
+  type UpdaterApi,
 } from '@minipod/core';
 import { deriveEpisodeKey, deriveFeedKey, prepareFeedUrl } from '../lib/identity';
 import { clampSpeed } from '../player/PlayerEngine';
@@ -66,8 +67,10 @@ function svgCover(bg1: string, bg2: string, label: string): string {
 
 export interface MockHostOptions {
   readonly platform?: HostPlatform | undefined;
+  readonly appVersion?: string | undefined;
   readonly capabilities?: Partial<HostCapabilities> | undefined;
   readonly initialSettings?: Partial<AppSettings> | undefined;
+  readonly updater?: UpdaterApi | undefined;
   readonly empty?: boolean | undefined;
   readonly now?: (() => number) | undefined;
 }
@@ -143,6 +146,7 @@ const CATALOG_SEARCH_RESULTS: readonly SearchResult[] = [
 
 export class MockPlatformHost implements PlatformHost {
   readonly info: HostInfo;
+  readonly updater?: UpdaterApi;
 
   private readonly listeners = new Set<(event: HostEvent) => void>();
   private readonly feedsMap = new Map<FeedKey, Feed>();
@@ -182,12 +186,15 @@ export class MockPlatformHost implements PlatformHost {
     this.info = {
       platform,
       os: platform === 'android' ? 'Android 15' : 'Linux x86_64',
-      appVersion: '0.1.0',
+      appVersion: options?.appVersion ?? '0.1.0',
       capabilities,
       deviceId: 'd_0123456789abcdef0123456789abcdef',
       deviceName,
       ...(platform === 'desktop' ? { dataDir: '~/.local/share/minipod' } : {}),
     };
+    if (options?.updater) {
+      this.updater = options.updater;
+    }
 
     this.settingsState = {
       ...DEFAULT_APP_SETTINGS,

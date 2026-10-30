@@ -964,8 +964,125 @@ button:disabled {
   text-align: left;
 }
 
+.m-settings-row--clickable {
+  cursor: pointer;
+}
+
 .m-settings-row--clickable:hover {
   background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+}
+
+/* ---- In-App Auto-Updater Banner & Settings Inline Controls --------------- */
+.m-update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 16px 0;
+  padding: 12px 14px;
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: color-mix(
+    in srgb,
+    var(--md-sys-color-primary-container) 55%,
+    var(--md-sys-color-surface-container-low)
+  );
+  border: 1px solid color-mix(in srgb, var(--md-sys-color-primary) 28%, transparent);
+}
+
+.m-update-banner__icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+  flex: none;
+}
+
+.m-update-banner__content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.m-update-banner__headline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.m-update-banner__title {
+  font: var(--md-sys-typescale-title-small);
+  color: var(--md-sys-color-on-surface);
+}
+
+.m-update-banner__notes {
+  font: var(--md-sys-typescale-body-small);
+  color: var(--md-sys-color-on-surface-variant);
+  overflow-wrap: anywhere;
+}
+
+.m-update-banner__progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.m-update-banner__progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font: var(--md-sys-typescale-label-small);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.m-update-banner__progress-track {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--md-sys-color-surface-container-highest);
+  overflow: hidden;
+}
+
+.m-update-banner__progress-fill {
+  height: 100%;
+  background: var(--md-sys-color-primary);
+  transition: width 150ms ease;
+}
+
+.m-update-banner__progress-fill.is-indeterminate {
+  width: 45%;
+  animation: m-update-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes m-update-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(240%);
+  }
+}
+
+.m-update-banner__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+@media (max-width: 600px) {
+  .m-update-banner {
+    flex-wrap: wrap;
+  }
+  .m-update-banner__actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 
 .m-settings-row__text {

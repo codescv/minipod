@@ -43,6 +43,7 @@ export function renderMiniPod(options?: {
   readonly width?: number | undefined;
   readonly hostOptions?: MockHostOptions | undefined;
   readonly videoCapable?: boolean | undefined;
+  readonly autoCheckUpdates?: boolean | undefined;
 }): {
   readonly host: MockPlatformHost;
   readonly engine: MockPlayerEngine;
@@ -59,6 +60,6 @@ export function renderMiniPod(options?: {
   const engine = createMockPlayerEngine({
     capabilities: { video: options?.videoCapable ?? true },
   });
-  const view = render(<App host={host} engine={engine} />);
+  const view = render(<App host={host} engine={engine} autoCheckUpdates={options?.autoCheckUpdates} />);
   return { host, engine, unmount: view.unmount };
 }

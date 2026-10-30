@@ -847,6 +847,48 @@ export interface SettingsApi {
   update(patch: Partial<AppSettings>): Promise<AppSettings>;
 }
 
+// ---------------------------------------------------------------------------
+// §K.1 In-App Auto-Updater (`codescv/minipod` GitHub Releases)
+// ---------------------------------------------------------------------------
+
+export interface ReleaseInfo {
+  readonly tagName: string;
+  readonly version: string;
+  readonly title: string;
+  readonly notes: string;
+  readonly publishedAt: string;
+  readonly htmlUrl: string;
+  readonly apkUrl?: string;
+  readonly apkName?: string;
+  readonly apkSizeBytes?: number;
+  readonly tarballUrl?: string;
+  readonly tarballName?: string;
+  readonly tarballSizeBytes?: number;
+}
+
+export interface HostUpdateCheckResult {
+  readonly currentVersion: string;
+  readonly updateAvailable: boolean;
+  readonly release?: ReleaseInfo;
+  readonly checkedAt: EpochMs;
+}
+
+export interface HostUpdateApplyResult {
+  readonly ok: boolean;
+  readonly method: 'git-pull' | 'release-bundle' | 'android-apk' | 'up-to-date' | 'external';
+  readonly previousVersion: string;
+  readonly targetVersion: string;
+  readonly restartRequired?: boolean;
+  readonly bundlePath?: string;
+  readonly needsPermission?: boolean;
+  readonly message: string;
+}
+
+export interface UpdaterApi {
+  check(options?: { readonly currentVersion?: string }): Promise<HostUpdateCheckResult>;
+  apply(options?: { readonly force?: boolean }): Promise<HostUpdateApplyResult>;
+}
+
 export type HostEvent =
   | { readonly type: 'feeds-changed' }
   | { readonly type: 'feed-refreshed'; readonly feedKey: FeedKey; readonly error?: MiniPodErrorShape }
@@ -871,6 +913,7 @@ export interface PlatformHost {
   readonly sync: SyncApi;
   readonly files: FilesApi;
   readonly settings: SettingsApi;
+  readonly updater?: UpdaterApi;
   subscribe(listener: (event: HostEvent) => void): Unsubscribe;
   dispose(): Promise<void>;
 }

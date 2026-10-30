@@ -21,6 +21,8 @@ It preserves **100% of AntennaPod's podcast discovery, feed parsing, authenticat
   - Conflict-free Hybrid Logical Clock (HLC) CRDT merge: Last-Write-Wins subscriptions with unsubscribe tombstones (never resurrecting deleted feeds), LexoRank-style base-62 fractional-index queue ordering (with embedded episode stubs so synced queue items stream immediately before RSS refresh), and monotonic/HLC episode progress with live `"Resumed from <device> at MM:SS — Undo"` snackbar.
 - **100% Pure TypeScript / Built-in Node 22+ Runtime**:
   - Uses Node's built-in `node:sqlite` (WAL mode) and Web Crypto (`crypto.subtle`) — `onlyBuiltDependencies: []` in `pnpm-workspace.yaml` and enforced in CI via `pnpm check:native` (**0 `.node` binaries, 0 `node-gyp`, 0 Electron/Tauri**).
+- **In-App Cross-Platform Auto-Updater**:
+  - Checks `codescv/minipod` GitHub Releases (`api.github.com` with `/releases?per_page=5` and `releases.atom` fallbacks). On Android, streams and verifies the signed `.apk` into cache with live progress and launches the system package installer via `FileProvider`. On PC, updates in-place via `git pull --ff-only` or downloads the release tarball (`POST /api/update/apply` or `node packages/host-node/bin/minipod.mjs update`).
 
 ---
 
@@ -88,6 +90,10 @@ node packages/host-node/bin/minipod.mjs --port 47821 --data-dir ~/.minipod --no-
 
 # Open directly to a podcast deep-link preview
 node packages/host-node/bin/minipod.mjs "itpc://atp.fm/rss"
+
+# Check for or apply updates from GitHub Releases (codescv/minipod)
+node packages/host-node/bin/minipod.mjs update --check
+node packages/host-node/bin/minipod.mjs update
 ```
 
 ### Desktop Data Directory (`~/.minipod/`)

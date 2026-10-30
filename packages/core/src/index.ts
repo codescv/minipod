@@ -21,3 +21,4 @@ export * from './chapters';
 export * from './sync';
 export * from './queue';
 export * from './progress';
+export * from './updater';

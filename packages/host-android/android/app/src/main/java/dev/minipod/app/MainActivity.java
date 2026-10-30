@@ -142,6 +142,7 @@ public class MainActivity extends BridgeActivity {
             ViewCompat.requestApplyInsets(getWindow().getDecorView());
         }
         syncSafeAreaCssVars();
+        MiniPodPlugin.resumePendingApkInstall(this);
     }
 
     private void syncSafeAreaCssVars() {

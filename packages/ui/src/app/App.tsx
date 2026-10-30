@@ -10,18 +10,37 @@ import { Shell } from './Shell';
 import { SnackbarHost } from '../components/m3';
 import { HostProvider, useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
+import { STARTUP_UPDATE_THROTTLE_MS, useUpdateStore } from '../features/updater/updater';
 import { PlayerProvider } from '../player/usePlayer';
 import { useSettingsStore } from '../stores/settings';
 import { showSnackbar } from '../stores/snackbar';
 import { useTheme } from '../theme/useTheme';
 
-function AppRuntime() {
+function shouldAutoCheckByDefault(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return !/jsdom/i.test(navigator.userAgent || '');
+}
+
+function AppRuntime({ autoCheckUpdates }: { readonly autoCheckUpdates?: boolean | undefined }) {
   const host = useHost();
   useTheme();
 
   useEffect(() => {
     void useSettingsStore.getState().load(host).catch(() => undefined);
   }, [host]);
+
+  // Automatic, throttled, non-blocking startup update check against GitHub Releases
+  useEffect(() => {
+    const enabled = autoCheckUpdates ?? shouldAutoCheckByDefault();
+    if (!enabled) return;
+    const timer = setTimeout(() => {
+      void useUpdateStore
+        .getState()
+        .checkForUpdate(host, { silent: true, throttleMs: STARTUP_UPDATE_THROTTLE_MS })
+        .catch(() => undefined);
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [autoCheckUpdates, host]);
 
   useEffect(() => {
     return installGlobalBackHandler();
@@ -72,13 +91,14 @@ function AppRuntime() {
 export interface AppProps {
   readonly host: PlatformHost;
   readonly engine: PlayerEngine;
+  readonly autoCheckUpdates?: boolean | undefined;
 }
 
-export function App({ host, engine }: AppProps) {
+export function App({ host, engine, autoCheckUpdates }: AppProps) {
   return (
     <HostProvider host={host}>
       <PlayerProvider engine={engine}>
-        <AppRuntime />
+        <AppRuntime autoCheckUpdates={autoCheckUpdates} />
       </PlayerProvider>
     </HostProvider>
   );

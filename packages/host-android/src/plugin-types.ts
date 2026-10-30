@@ -169,6 +169,20 @@ export interface GoogleSignInResult {
   readonly accountEmail?: string;
 }
 
+export interface ApkDownloadProgressPayload {
+  readonly downloadedBytes: number;
+  readonly totalBytes: number;
+  readonly percent: number;
+}
+
+export interface ApkInstallResult {
+  readonly filePath: string;
+  readonly sizeBytes?: number;
+  readonly installerLaunched: boolean;
+  readonly installed?: boolean;
+  readonly needsPermission?: boolean;
+}
+
 export interface MiniPodEventMap {
   readonly 'media-state': NativeMediaStatePayload;
   readonly 'media-ended': NativeMediaEndedPayload;
@@ -176,6 +190,7 @@ export interface MiniPodEventMap {
   readonly 'sleep-timer-state': NativeSleepTimerPayload;
   readonly 'download-progress': DownloadProgressPayload;
   readonly 'deep-link': DeepLinkPayload;
+  readonly apkDownloadProgress: ApkDownloadProgressPayload;
 }
 
 /**
@@ -228,6 +243,12 @@ export interface MiniPodPlugin {
   openExternal(opts: { readonly url: string }): Promise<void>;
   getLaunchIntent(): Promise<DeepLinkPayload | null>;
 
+  downloadAndInstallApk?(opts: {
+    readonly url: string;
+    readonly version: string;
+  }): Promise<ApkInstallResult>;
+  installApkFile?(opts: { readonly filePath: string }): Promise<ApkInstallResult>;
+
   addListener<K extends keyof MiniPodEventMap>(
     eventName: K,
     listener: (payload: MiniPodEventMap[K]) => void,
@@ -273,6 +294,8 @@ export interface MiniPodNativeBridge {
 
   openExternal(opts: { url: string }): Promise<void>;
   getLaunchIntent(): Promise<{ hasIntent: boolean; action?: 'view' | 'send'; uri?: string; mimeType?: string; text?: string }>;
+  downloadAndInstallApk(opts: { url: string; version: string }): Promise<ApkInstallResult>;
+  installApkFile(opts: { filePath: string }): Promise<ApkInstallResult>;
 
   addListener<K extends keyof MiniPodEventMap>(
     eventName: K,
@@ -337,6 +360,8 @@ export function wrapNativeBridge(bridge: MiniPodNativeBridge): MiniPodPlugin {
     },
 
     openExternal: (opts) => bridge.openExternal(opts),
+    downloadAndInstallApk: (opts) => bridge.downloadAndInstallApk(opts),
+    installApkFile: (opts) => bridge.installApkFile(opts),
     async getLaunchIntent() {
       const res = await bridge.getLaunchIntent();
       if (!res.hasIntent || !res.action) return null;

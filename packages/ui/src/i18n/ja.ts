@@ -18,4 +18,7 @@ export const ja: Messages = {
   'player.chapters': 'チャプター',
   'player.shownotes': '概要',
   'sleep.title': 'スリープタイマー',
+  'update.newBadge': '新着',
+  'update.updateNow': '今すぐ更新',
+  'update.checkForUpdates': 'アップデートを確認',
 };
