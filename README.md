@@ -4,6 +4,11 @@
 
 It preserves **100% of AntennaPod's podcast discovery, feed parsing, authentication, local folder, OPML, and 5-format chapter capabilities**, strips away every non-essential screen and setting, and syncs subscriptions, playback queue, and millisecond episode progress across all your devices through a **single JSON file (`minipod-sync.v1.json`) in your own cloud storage** — with **zero backend servers**, **zero accounts**, and **zero native `.node` C++/Rust addons**.
 
+- **GitHub Repository**: <https://github.com/codescv/minipod>
+- **Latest Release (`v0.1.2`)**: <https://github.com/codescv/minipod/releases/tag/v0.1.2>
+  - **Android APK (`dev.minipod.app`, `versionCode 3`)**: [`minipod-v0.1.2.apk`](https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2.apk) (`6.67 MiB`, APK Signature v2)
+  - **PC Web App Bundle**: [`minipod-v0.1.2-pc.tar.gz`](https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2-pc.tar.gz) (`521.86 KiB`, Node.js `>= 22.5.0`)
+
 ---
 
 ## Highlights
@@ -22,7 +27,10 @@ It preserves **100% of AntennaPod's podcast discovery, feed parsing, authenticat
 - **100% Pure TypeScript / Built-in Node 22+ Runtime**:
   - Uses Node's built-in `node:sqlite` (WAL mode) and Web Crypto (`crypto.subtle`) — `onlyBuiltDependencies: []` in `pnpm-workspace.yaml` and enforced in CI via `pnpm check:native` (**0 `.node` binaries, 0 `node-gyp`, 0 Electron/Tauri**).
 - **In-App Cross-Platform Auto-Updater**:
-  - Checks `codescv/minipod` GitHub Releases (`api.github.com` with `/releases?per_page=5` and `releases.atom` fallbacks). On Android, streams and verifies the signed `.apk` into cache with live progress and launches the system package installer via `FileProvider`. On PC, updates in-place via `git pull --ff-only` or downloads the release tarball (`POST /api/update/apply` or `node packages/host-node/bin/minipod.mjs update`).
+  - Automatically checks `codescv/minipod` GitHub Releases (`api.github.com/repos/codescv/minipod/releases/latest` with `/releases?per_page=5` and rate-limit-free `releases.atom` XML fallbacks) on startup (5-minute throttle) and via **Settings → About** (`Check for updates` / `Update to vX.Y.Z`, keeping the strict 9-row Settings invariant).
+  - Surfaces a dismissible Material 3 `<UpdateBanner />` when a newer version is published.
+  - **Android Native Auto-Installer**: `MiniPodPlugin.downloadAndInstallApk` follows cross-host HTTPS redirects (`github.com` → `release-assets.githubusercontent.com`, blocking `https → http` downgrades), streams into `<cacheDir>/updates/minipod-<version>.apk` via atomic `.tmp` rename with live `apkDownloadProgress` events, verifies ZIP magic (`PK\x03\x04`) and `PackageManager.getPackageArchiveInfo` (`dev.minipod.app` + non-downgrade `versionCode`), and launches the system package installer via `FileProvider` (`dev.minipod.app.fileprovider`), automatically resuming from `MainActivity.onResume()` if Android 8+ unknown-sources permission is newly granted.
+  - **PC Web App Self-Updater**: Updates in-place via `git fetch origin --tags && git pull --ff-only` when running from a git checkout, or atomically downloads `minipod-v<version>-pc.tar.gz` into `<dataDir>/updates/` (`POST /api/update/apply` or `node packages/host-node/bin/minipod.mjs update [--check] [--force]`).
 
 ---
 
@@ -30,21 +38,22 @@ It preserves **100% of AntennaPod's podcast discovery, feed parsing, authenticat
 
 ```text
 minipod/
+├── .github/workflows/ci.yml # GitHub Actions CI (typecheck, test, check:native, build, APK & Release)
 ├── ARCHITECTURE.md          # Complete system & CRDT specification
 ├── DESIGN.md                # Material Design 3 UI/UX & anti-bloat specification
-├── TEST_REPORT.md           # Full unit, property, Playwright E2E, sync & APK test report
+├── TEST_REPORT.md           # Full unit, property, Playwright E2E, sync, auto-update & APK test report
 ├── scripts/
 │   ├── check-native-deps.mjs # Verifies 0 native .node/gyp addons in runtime tree
 │   └── bump-version.mjs      # Syncs package.json + Android versionCode/versionName
 └── packages/
     ├── core/                # @minipod/core — 0 external deps; searchers, XML/HTML/OPML parsers,
-    │                        #   5-format chapters, HLC + CRDT sync engine & cloud providers
+    │                        #   5-format chapters, HLC + CRDT sync engine, providers & release updater
     ├── ui/                  # @minipod/ui — Shared React 19 + M3 adaptive UI, Zustand stores,
-    │                        #   HtmlAudioEngine, MockPlatformHost dev harness, EN + zh-CN i18n
+    │                        #   UpdateBanner, HtmlAudioEngine, MockPlatformHost, EN + zh-CN i18n
     ├── host-node/           # @minipod/host-node — Loopback Hono server (127.0.0.1), node:sqlite,
-    │                        #   HTTP 206 Range media proxy, SSE events, LocalFolderFileProvider
+    │                        #   HTTP 206 Range media proxy, SSE events, sync & PC self-updater
     └── host-android/        # @minipod/host-android — Capacitor 8 Android app, IndexedDB store,
-                             #   MiniPodPlugin.java (OkHttp/SAF) & Media3 PlaybackService.java
+                             #   MiniPodPlugin.java (OkHttp/SAF/APK installer) & Media3 PlaybackService
 ```
 
 ---
@@ -73,6 +82,7 @@ pnpm start:app
 
 ```bash
 node packages/host-node/bin/minipod.mjs [options] [podcast-url-or-deeplink]
+node packages/host-node/bin/minipod.mjs update [--check] [--force] [--data-dir <dir>]
 
 Options:
   --port <n>          Loopback port on 127.0.0.1 (default: 0 ephemeral, or 47821 with --dev)
@@ -80,6 +90,8 @@ Options:
   --no-open           Start server without opening a browser tab
   --new-browser       Open in standalone chromeless --app=<url> window (alias: --app)
   --dev               Development mode on 127.0.0.1:47821
+  --check             (with `update`) Check GitHub Releases without applying
+  --force             (with `update`) Force re-apply / re-download latest release
 ```
 
 Examples:
@@ -131,8 +143,8 @@ cd packages/host-android/android && ./gradlew assembleDebug
 ```
 
 **Native Android Components (`dev.minipod.app`)**:
-- `MainActivity.java` — Registers `MiniPodPlugin`, handles hardware back navigation (`window.__minipodHandleBack()`), and forwards `itpc://` / `pcast://` / `feed://` / `antennapod-subscribe://` intents.
-- `MiniPodPlugin.java` — Native CORS-free HTTP/Range client (`redirect: manual` hop recorder), Android SAF directory picker (`pickFolder`, `listFolder`, `statFile`, `readFileRange`, `writeFileAtomic`), and playback bridge.
+- `MainActivity.java` — Registers `MiniPodPlugin`, handles hardware back navigation (`window.__minipodHandleBack()`), forwards `itpc://` / `pcast://` / `feed://` / `antennapod-subscribe://` intents, and resumes pending APK updates (`MiniPodPlugin.resumePendingApkInstall`) when returning from Android's unknown-sources settings screen.
+- `MiniPodPlugin.java` — Native CORS-free HTTP/Range client (`redirect: manual` hop recorder), Android SAF directory picker (`pickFolder`, `listFolder`, `statFile`, `readFileRange`, `writeFileAtomic`), signed APK auto-downloader/installer (`downloadAndInstallApk`, `installApkFile` via `FileProvider` `dev.minipod.app.fileprovider`), and playback bridge.
 - `PlaybackService.java` — Foreground `MediaSessionService` backed by `androidx.media3:media3-exoplayer` (`1.5.1`) with lock-screen/Bluetooth media controls, audio focus, becoming-noisy pause, gapless queue auto-advance, and native sleep timer.
 
 ---

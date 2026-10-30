@@ -1,7 +1,11 @@
-# MiniPod — Integration, E2E, Cloud Sync & Android APK Test Report
+# MiniPod — Integration, E2E, Cloud Sync, Auto-Updater & Android APK Test Report
 
-- **Date**: 2026-10-30
-- **Version Verified**: `0.1.1` (`dev.minipod.app`, `versionCode 2`)
+- **Date**: 2026-10-31
+- **Version Verified**: `0.1.2` (`dev.minipod.app`, `versionCode 3`)
+- **Live Repository & Release**:
+  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.2`)
+  - Release `v0.1.2`: <https://github.com/codescv/minipod/releases/tag/v0.1.2>
+  - Release API: `https://api.github.com/repos/codescv/minipod/releases/latest` (`200 OK`)
 - **Environment**:
   - OS: Linux (`x86_64`)
   - Node.js: `v22.22.1` (built-in `node:sqlite`, Web Crypto, `CompressionStream`)
@@ -16,17 +20,18 @@
 | Verification Gate | Result | Summary |
 | :--- | :---: | :--- |
 | **1. Static Typecheck (`pnpm typecheck`)** | **PASS** | `0` errors across `@minipod/core`, `@minipod/ui`, `@minipod/host-node`, `@minipod/host-android` (`strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`) |
-| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **25 / 25 test files**, **90 / 90 tests passed** in `4.65s` (incl. randomized multi-device CRDT property tests) |
+| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **28 / 28 test files**, **103 / 103 tests passed** in `4.79s` (incl. randomized multi-device CRDT property tests & cross-platform auto-updater suites) |
 | **3. Zero-Native-Addon Gate (`pnpm check:native`)** | **PASS** | **0** `.node` binaries, **0** `binding.gyp`, **0** native build scripts across runtime tree |
-| **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` `186.1 KB` + `dist/web`) & `@minipod/host-android` (`www`) |
-| **5. Live Server & Playwright Browser E2E** | **PASS** | **28 / 28 end-to-end checks passed** across CLI startup, all AntennaPod sources, Desktop (`1280x800`), Mobile (`390x844`), HTTP `206` Range streaming, and 2-device Cloud Sync |
-| **6. Standalone Android APK Build (`pnpm build:apk`)** | **PASS** | Built `app-release.apk` (`6,985,443` bytes) & `app-debug.apk` (`8,893,905` bytes); both verified via `apksigner verify` (APK Signature Scheme v2) |
+| **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` `530 KB` + `dist/web`) & `@minipod/host-android` (`www`) |
+| **5. Live Server & Playwright Browser E2E** | **PASS** | **39 / 39 end-to-end checks passed** (`28` core/UI/sync E2E + `11` live GitHub Releases & Cross-Platform Auto-Updater E2E checks; `[data-settings-row]` strictly `9`) |
+| **6. Standalone Android APK (`v0.1.2`) & Native Auto-Installer** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.2.apk` (`6,994,455` bytes, `versionCode='3'`, APK Signature v2, `REQUEST_INSTALL_PACKAGES`, `FileProvider` `dev.minipod.app.fileprovider`, compiled DEX updater methods) |
+| **7. Live Public GitHub Repository & Release (`v0.1.2`)** | **PASS** | Verified public `200 OK` on repo, release page, `/releases/latest` JSON API, `releases.atom` XML fallback, `gh release view v0.1.2`, and byte-identical SHA-256 on published APK & PC tarball assets |
 
 ---
 
 ## 1. Unit, Property-Based CRDT & Package Integration Suite (`pnpm test`)
 
-All **25 test suites (90 tests)** execute cleanly under Vitest `4.1.12`:
+All **28 test suites (103 tests)** execute cleanly under Vitest `4.1.12`:
 
 | Package | Test File | Tests | Key Coverage |
 | :--- | :--- | :---: | :--- |
@@ -37,6 +42,7 @@ All **25 test suites (90 tests)** execute cleanly under Vitest `4.1.12`:
 | `@minipod/core` | `src/queue/queue.test.ts` | 2 | Base-62 LexoRank fractional indexing (`between`, `insertAtHead`, `insertAtTail`, midpoint non-collision over thousands of moves) |
 | `@minipod/core` | `src/progress/progress.test.ts` | 4 | 3-second resume rewind (`Math.max(0, pos - 3000)`), `< 30s` / `>= 97%` completion detection, playback speed clamping |
 | `@minipod/core` | `src/sync/sync.test.ts` | 12 | `HybridLogicalClock` monotonicity & clock-skew clamping, `SyncEngine` subscription LWW + tombstone non-resurrection, permanent redirect aliasing, queue CRDT merge + tombstone GC (`90d`), progress monotonic/HLC rules, **randomized 3-device property-based commutativity/associativity/idempotence tests**, `WebDavProvider` (Basic + Digest + `412`), `GitHubGistProvider` (`ETag` + `>800KB` gzip/Base64 + truncated `raw_url`), `GoogleDriveProvider` (`appDataFolder` + duplicate self-healing), `SyncScheduler` |
+| `@minipod/core` | `src/updater/updater.test.ts` | 6 | `parseSemver` / `compareSemver`, `parseGithubReleaseJson` (`minipod-*.apk` / `app-release.apk` + PC tarball asset extraction, draft filtering), `parseGithubReleasesAtom` XML parser, `fetchLatestRelease` (`/releases/latest` -> `/releases?per_page=5` -> `releases.atom` 403/429 fallback) |
 | `@minipod/core` | `src/util/util.test.ts` | 9 | Pure-TS SHA-1, gzip/gunzip streams, Base64, URL credential stripping, allowlist HTML sanitizer (XSS `<script>`/`onerror`/`javascript:` stripping) |
 | `@minipod/host-node` | `src/db/SqliteSyncStore.test.ts` | 2 | `node:sqlite` WAL migrations, `SqliteSyncStore` transactional snapshot/apply, synced queue stub materialization, permanent feed move re-keying |
 | `@minipod/host-node` | `src/feeds/local-folder.test.ts` | 1 | Desktop `local-folder:` scanning, natural episode sort, embedded ID3/MP4 tag extraction, `folder.jpg` cover detection |
@@ -44,21 +50,23 @@ All **25 test suites (90 tests)** execute cleanly under Vitest `4.1.12`:
 | `@minipod/host-node` | `src/net/range-proxy.test.ts` | 3 | `/media/:episodeKey` local & remote HTTP `206 Partial Content`, `416 Range Not Satisfiable`, `HEAD`, Basic Auth header forwarding, ID3 `APIC` chapter image byte-slice streaming |
 | `@minipod/host-node` | `src/sync/LocalFolderFileProvider.test.ts` | 2 | Atomic `.tmp` + `fsync` + `rename` writes, SHA-256 `ETag` conditional checks, concurrent `conflict` detection |
 | `@minipod/host-node` | `src/server/server.test.ts` | 2 | Loopback `Host` DNS-rebinding (`403`), `Origin` CSRF (`403`), JSON `Content-Type` (`415`) guards, XML OPML import, single-fetch preview->subscribe, `/media` `206`, auto-delete download when played, SSE events, `flush: true` sync |
+| `@minipod/host-node` | `src/updater/self-updater.test.ts` | 3 | `parseCliArgs` (`update`, `--check`, `--force`), `POST /api/update/check` & `POST /api/update/apply` via `git pull --ff-only` in git worktrees, and atomic release tarball download outside git |
 | `@minipod/host-android` | `src/storage/IdbSyncStore.test.ts` | 2 | IndexedDB schema & `IdbSyncStore` CRDT merge parity (`fake-indexeddb`) |
 | `@minipod/host-android` | `src/net/plugin-http.test.ts` | 2 | Capacitor `MiniPodPlugin.httpRequest` Base64 body & redirect hop adapter |
 | `@minipod/host-android` | `src/player/NativeAudioEngine.test.ts` | 1 | Media3 native service bridge (`nativeLoad`, `nativeSetQueue`, `nativeSetSleepTimer`, `nativeAdvanced` events) |
 | `@minipod/host-android` | `src/sync/SafFileProvider.test.ts` | 1 | Android SAF `content://` tree atomic sync file read/write & ETag probing |
-| `@minipod/host-android` | `src/capacitor-host.test.ts` | 2 | End-to-end `createCapacitorPlatformHost` preview, subscribe, queue, SAF local-folder virtual feed, and sync |
+| `@minipod/host-android` | `src/capacitor-host.test.ts` | 3 | End-to-end `createCapacitorPlatformHost` native journal reconciliation, SAF local-folder + `APIC` chapter `data:` URLs + `ACTION_SEND` extraction, and native GitHub release check + `downloadAndInstallApk` / `installApkFile` bridge |
 | `@minipod/ui` | `src/__tests__/subscriptions-and-back.test.tsx` | 3 | Adaptive `NavRail` vs `NavBar`, cover grid/list toggle, empty state, LIFO back navigation stack (`__minipodHandleBack`) |
 | `@minipod/ui` | `src/__tests__/add-search-preview.test.tsx` | 5 | Top Charts country selector, federated source chips, HTML multi-feed radio disambiguation, 401 Basic Auth inline form, unsubscribed preview streaming |
 | `@minipod/ui` | `src/__tests__/podcast-detail.test.tsx` | 1 | `All` / `Unplayed` / `Downloaded` filter chips, 3s rewind resume, download toggle, mark played, `loadOlder` pagination |
 | `@minipod/ui` | `src/__tests__/queue.test.tsx` | 1 | Fractional-index reorder, remove + `Undo` snackbar, synced stub display, Clear Queue |
 | `@minipod/ui` | `src/__tests__/player-and-engine.test.tsx` | 3 | Desktop transport, speed cycle & slider (`0.5x–3.0x`), keyboard shortcuts, active chapter highlight & seek, XSS-safe shownotes, `SleepTimer` 60s fade-out |
 | `@minipod/ui` | `src/__tests__/settings-and-sync.test.tsx` | 3 | Strict 9-row Settings invariant, Cloud Sync provider setup flows, EN / `zh-CN` runtime switching |
+| `@minipod/ui` | `src/__tests__/updater.test.tsx` | 3 | Throttled startup check + `<UpdateBanner />` per-version dismiss, Android `apkDownloadProgress` + unknown-sources permission (`Grant & install` -> `installApkFile`), PC `host.updater.apply()`, and strict 9-row Settings invariant |
 
 ---
 
-## 2. Live End-to-End & Playwright Browser Verification (28 / 28 Passed)
+## 2. Live End-to-End & Playwright Browser Verification (39 / 39 Passed)
 
 Executed against live `@minipod/host-node` loopback servers (`node:sqlite` WAL DB + real HTTP sockets + playable 90-second PCM WAV, ID3v2+APIC MP3, Ogg Opus, and MP4 Nero media fixtures) driven by **Playwright Headless Chromium**:
 
@@ -114,24 +122,49 @@ Executed against live `@minipod/host-node` loopback servers (`node:sqlite` WAL D
 4. **Live WebDAV & GitHub Gist Providers**:
    - Reconfigured both servers against live mock **WebDAV** (`HEAD`/`GET`/`PUT` with `ETag` + `If-Match`) and **GitHub Secret Gist** (`Bearer` PAT + `ETag` + `minipod-sync.v1.json`) endpoints; verified initial upload, attach, and two-device sync convergence (`200 OK`).
 
+### 2.5 Requirement 4 — Live GitHub Release (`v0.1.2`) & Cross-Platform Auto-Updater E2E (11 / 11 Passed)
+
+Executed with zero mocks against the **live public GitHub repository (`codescv/minipod`)** and **`https://api.github.com/repos/codescv/minipod/releases/latest`** in Playwright Headless Chromium:
+
+| # | Live E2E Check | Verification Result | Status |
+| :---: | :--- | :--- | :---: |
+| 1 | **Public Repo & Release HTTP Probes** | Unauthenticated `curl -sI` returned `HTTP/2 200` on `https://github.com/codescv/minipod`, `https://github.com/codescv/minipod/releases/tag/v0.1.2`, `https://api.github.com/repos/codescv/minipod/releases/latest` (`tag_name: "v0.1.2"`), and `gh release view v0.1.2` | **PASS** |
+| 2 | **Live `releases.atom` Fallback** | `GET https://github.com/codescv/minipod/releases.atom` returned `200 OK` (`4,195` chars, `v0.1.2` `<entry>`) for GitHub API rate-limit resilience | **PASS** |
+| 3 | **CLI `minipod update --check` (`0.1.0` simulated)** | `MINIPOD_APP_VERSION=0.1.0 node packages/host-node/bin/minipod.mjs update --check` reported `Update available: MiniPod v0.1.2 (current: v0.1.0) — https://github.com/codescv/minipod/releases/tag/v0.1.2` | **PASS** |
+| 4 | **CLI `minipod update --check` (`0.1.2` current)** | Default `node packages/host-node/bin/minipod.mjs update --check` reported `MiniPod v0.1.2 is up to date.` | **PASS** |
+| 5 | **`POST /api/update/check` (`0.1.0` -> live GitHub)** | Returned `updateAvailable: true`, `release.version = "0.1.2"`, `apkUrl = ".../minipod-v0.1.2.apk"` (`6,994,455` bytes), `tarballUrl = ".../minipod-v0.1.2-pc.tar.gz"` (`534,387` bytes) | **PASS** |
+| 6 | **Playwright Startup Check & `<UpdateBanner />` (`0.1.0`)** | Browser issued live `GET https://api.github.com/repos/codescv/minipod/releases/latest` (`200 OK`) and automatically rendered `[data-testid="update-banner"]` (`"MiniPod v0.1.2 available"`) | **PASS** |
+| 7 | **Playwright Settings 9-Row Invariant & Row 9 About** | Navigated to Settings (`1280x800`): verified `[data-settings-row]` count is **strictly `9`**, badge shows `v0.1.0`, status shows `"Update available: v0.1.2"`, and inline button shows `"Update to v0.1.2"` | **PASS** |
+| 8 | **Playwright `<UpdateBanner />` Dismiss Persistence** | Clicked `[data-testid="update-banner-dismiss-btn"]` -> banner hid, `localStorage["minipod:update:dismissedTag"] === "v0.1.2"`, and `[data-settings-row]` remained `9` | **PASS** |
+| 9 | **Playwright 1-Click Live PC Self-Update Download** | Clicked `"Update to v0.1.2"` -> `POST /api/update/apply` downloaded the live `minipod-v0.1.2-pc.tar.gz` (`534,387` bytes, SHA-256 `fd7d67191759a86e40f24b93d28344c83d75f970203d1319ad2d02887fd7b7ef`) into `<dataDir>/updates/minipod-v0.1.2.tar.gz`; `[data-settings-row]` remained `9` | **PASS** |
+| 10 | **Playwright About Dialog & `0.1.2` Up-to-Date Check** | Verified Row 9 opens `settings-about-dialog` (`Source code` -> `https://github.com/codescv/minipod`); on a `0.1.2` server, clicking `"Check for updates"` against live GitHub API reported `"Up to date (v0.1.2)"` with `0` banners and `[data-settings-row] === 9` across both `1280x800` and `390x844` | **PASS** |
+| 11 | **Playwright Capacitor Android Native Bridge Flow** | Simulated `0.1.0` mobile (`390x844`) with `window.Capacitor.Plugins.MiniPod` against live GitHub API -> verified `downloadAndInstallApk({ url: ".../minipod-v0.1.2.apk", version: "0.1.2" })`, `apkDownloadProgress` (`50%`), unknown-sources `"Grant & install"`, and `installApkFile` handoff | **PASS** |
+
 ---
 
-## 3. Standalone Android APK Build & Verification
+## 3. Standalone Android APK (`v0.1.2`) & Native Auto-Installer Verification
 
-Built via `pnpm build:apk` (`cap sync android && ./gradlew assembleRelease`) and `./gradlew assembleDebug`:
+Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.2`:
 
-- **Release Artifact**: `packages/host-android/android/app/build/outputs/apk/release/app-release.apk`
-  - Size: `6,985,443` bytes (`6.7 MB`)
-  - SHA-256: `23142bd4370be612c77b0476247deef6072fd63d8be950592996f2440e135cee`
-- **Debug Artifact**: `packages/host-android/android/app/build/outputs/apk/debug/app-debug.apk`
-  - Size: `8,893,905` bytes (`8.5 MB`)
-  - SHA-256: `1ac9e26b1185910978ce3d8b41631b73c538df301e5f8b93deed587533d8dffd`
-- **Manifest & DEX Verification (`aapt2 dump badging` & `dexdump`)**:
-  - Package: `dev.minipod.app` (`versionCode='2'`, `versionName='0.1.1'`, `minSdkVersion='26'`, `targetSdkVersion='36'`)
-  - Permissions: `INTERNET`, `WAKE_LOCK`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `POST_NOTIFICATIONS`, `ACCESS_NETWORK_STATE`
-  - Compiled Native Classes Verified in `classes.dex`: `Ldev/minipod/app/MainActivity;`, `Ldev/minipod/app/MiniPodPlugin;`, `Ldev/minipod/app/PlaybackService;`
+- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.2.apk`)**:
+  - Local Path: `packages/host-android/android/app/build/outputs/apk/release/app-release.apk`
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2.apk` (verified `302` redirect to `https://release-assets.githubusercontent.com/...`)
+  - Size: `6,994,455` bytes (`6.67 MiB`)
+  - SHA-256 (verified byte-identical between local build and live GitHub Release asset): `fb3fb64b124a0c514b6a57c32af6daf161fb06ad1c78b0d81ed051459727f68a`
+- **PC Standalone Release Bundle (`minipod-v0.1.2-pc.tar.gz`)**:
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.2/minipod-v0.1.2-pc.tar.gz`
+  - Size: `534,387` bytes (`521.86 KiB`)
+  - SHA-256: `fd7d67191759a86e40f24b93d28344c83d75f970203d1319ad2d02887fd7b7ef`
+- **Manifest, `FileProvider` & DEX Verification (`aapt2 dump badging`, `aapt2 dump xmltree`, `dexdump`)**:
+  - Package: `dev.minipod.app` (`versionCode='3'`, `versionName='0.1.2'`, `minSdkVersion='26'`, `targetSdkVersion='36'`)
+  - Permissions: `INTERNET`, `WAKE_LOCK`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `POST_NOTIFICATIONS`, **`REQUEST_INSTALL_PACKAGES`**, `ACCESS_NETWORK_STATE`
+  - `FileProvider` Manifest Entry: `androidx.core.content.FileProvider` (`android:authorities="dev.minipod.app.fileprovider"`, `android:exported="false"`, `android:grantUriPermissions="true"`) backed by `@xml/file_paths` (`<cache-path name="apk_updates" path="updates/" />` verified in compiled APK resource `0x7f100001` / `res/8K.xml`)
+  - Compiled Native Classes & Updater Methods Verified in `classes.dex`:
+    - `Ldev/minipod/app/MainActivity;` (`onResume` invoking `MiniPodPlugin.resumePendingApkInstall`)
+    - `Ldev/minipod/app/MiniPodPlugin;` (`downloadAndInstallApk`, `installApkFile`, `resumePendingApkInstall`, `verifyApkArchive`, `launchApkInstaller`, `startPackageInstallViewIntent`)
+    - `Ldev/minipod/app/PlaybackService;`
 - **Signature Verification (`apksigner verify --verbose`)**:
-  - `Verifies` — `Verified using v2 scheme (APK Signature Scheme v2): true`, `Number of signers: 1` (both `app-release.apk` and `app-debug.apk`)
+  - `Verifies` — `Verified using v2 scheme (APK Signature Scheme v2): true`, `Number of signers: 1`
 
 ---
 
@@ -139,3 +172,5 @@ Built via `pnpm build:apk` (`cap sync android && ./gradlew assembleRelease`) and
 
 1. **Unsubscribed Preview Stub Materialization (`@minipod/host-node` & `@minipod/host-android`)**:
    - Updated `cachePreviewResult` in `packages/host-node/src/server/context.ts`, `packages/host-android/src/capacitor-host.ts`, and `packages/host-android/src/storage/IdbSyncStore.ts` so previewing an unsubscribed feed (`feeds.preview` / `search.resolveUrl`, including `401` Basic Auth retries) materializes a hidden `subscribed: false` (`markSyncDirty: false`) feed + episode stub in SQLite/IndexedDB. This guarantees unsubscribed preview playback routes through `/media/:episodeKey` HTTP `206` Range proxy (preserving Basic Auth), inserts at the head of Queue, loads merged 5-format chapters, and persists millisecond progress without polluting Subscriptions or Cloud Sync.
+2. **GitHub Actions Android SDK Package Configuration (`.github/workflows/ci.yml`)**:
+   - Configured `android-actions/setup-android@v3` with explicit `packages: 'platform-tools platforms;android-36 build-tools;35.0.0'` so `sdkmanager` on `ubuntu-latest` (`cmdline-tools/16.0`) does not request the deprecated `tools` package during CI APK builds.
