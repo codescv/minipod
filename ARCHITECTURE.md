@@ -551,7 +551,7 @@ Invariants (unit-tested with property-based tests over random edit histories on 
 **Before merge** (`prepareLocalDoc`):
 
 - Build the local document from Room: all non-GC'd rows, each with its `updatedAt`; `floor`s from `sync_state`.
-- Any **dirty** local row whose `updatedAt <= remote[map].floor` (possible after a very long offline period) is a genuinely new local intent that the remote has never seen → re-stamp it with `hlc.now()` so the floor rule cannot drop it.
+- After `read()` has returned `remote`: any **dirty** local row whose `updatedAt <= remote[map].floor` (possible after a very long offline period) is a genuinely new local intent that the remote has never seen → re-stamp it with `max(hlc.now(), remote[map].floor + 1)` so the floor rule cannot drop it even when the local wall clock lags behind the floor.
 
 **After merge** (`apply(merged)`, one Room transaction), for every entity whose winner differs from the local row:
 
@@ -572,7 +572,7 @@ Invariants (unit-tested with property-based tests over random edit histories on 
 
 GC runs on the **writer** immediately before serialising an upload (never inside `merge`):
 
-- Subscription tombstones are kept **180 days** after `updatedAt`; queue tombstones **30 days**; progress entries beyond the 50 000 cap are evicted oldest-`PLAYED`-first.
+- Subscription tombstones are kept **180 days** after `updatedAt`; queue tombstones **30 days**; progress entries beyond the 50 000 cap are evicted oldest-`PLAYED`-first, and `progress.floor` is raised only to `min(max updatedAt of evicted rows, oldest retained IN_PROGRESS/NEW updatedAt − 1)` so no retained entry ever sits below the floor.
 - A tombstone is GC'd only when every device in `devices` has `lastSeenAt > tombstone.updatedAt`, **or** has itself been unseen for > 180 days (then the device record is dropped too).
 - Whenever anything is GC'd/evicted from a map, that map's `floor` is raised to `max(floor, max updatedAt of the removed entries)`. Floors are monotone and merge by `max`.
 
