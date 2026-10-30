@@ -782,7 +782,7 @@ The cycle is serialised by a promise-chain mutex; a request arriving mid-cycle s
 
 Debouncing rule: all push triggers feed one `SyncScheduler.request(reason)` call; the scheduler keeps one pending timer per reason class (`setTimeout(reason.delay)`, `0` when hidden) and coalesces every expiry into a single engine run, so a pause followed by a queue edit yields exactly one upload.
 
-No WorkManager / JobScheduler: there is no Java sync code. Android background guarantees are therefore: (1) while playing, the foreground service keeps the process (and the WebView's JS) alive, so all triggers above fire; (2) when not playing and the app is backgrounded, the last push happened on `visibilitychange`; (3) if the OS kills the process or throttles the WebView, the native journal (checkpoint + completions) + next-launch reconciliation cover the gap. The sync settings screen states this plainly (`capabilities.backgroundSync = false`).
+No WorkManager / JobScheduler: there is no Java sync code. Android background guarantees are therefore: (1) while playing, the foreground service keeps the process alive and the native service owns queue/sleep-timer/journal, so correctness does not depend on throttled WebView timers; (2) when not playing and the app is backgrounded, the last push happened on `visibilitychange`; (3) if the OS kills the process or throttles the WebView, the native journal (checkpoint + completions) + next-launch reconciliation cover the gap. The sync settings screen states this plainly (`capabilities.backgroundSync = false`).
 
 ### 9.3 Failure handling
 
