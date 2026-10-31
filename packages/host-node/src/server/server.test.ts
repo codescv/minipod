@@ -208,4 +208,73 @@ describe('MiniPod Hono server + REST client integration', () => {
     unsubSse();
     await clientHost.dispose();
   });
+
+  it('proxies episode/feed artwork via GET /api/image-proxy without Referer and with caching & MIME sniffing', async () => {
+    // 1x1 PNG magic bytes + payload
+    const pngBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    ]);
+    let capturedHeaders: Record<string, string | string[] | undefined> = {};
+
+    const upstream = createServer((req, res) => {
+      capturedHeaders = req.headers;
+      if (req.url === '/hotlink-protected.png') {
+        if (req.headers.referer) {
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end('Hotlink forbidden');
+          return;
+        }
+        // Intentionally return generic octet-stream to verify magic-byte MIME resolution
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+        res.end(pngBytes);
+        return;
+      }
+      if (req.url === '/captive-error') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<html><body>Blocked</body></html>');
+        return;
+      }
+      res.writeHead(404);
+      res.end('Not found');
+    });
+    upstreamServers.push(upstream);
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()));
+    const upstreamPort = (upstream.address() as AddressInfo).port;
+
+    const dataDir = mkdtempSync(join(tmpdir(), 'minipod-img-proxy-'));
+    tempDirs.push(dataDir);
+    const srv = await startServer({ dataDir });
+    runningServers.push(srv);
+
+    // 1. Missing or invalid URL -> 400
+    const missingRes = await fetch(`${srv.url}/api/image-proxy`);
+    expect(missingRes.status).toBe(400);
+
+    const badSchemeRes = await fetch(
+      `${srv.url}/api/image-proxy?url=${encodeURIComponent('file:///etc/passwd')}`,
+    );
+    expect(badSchemeRes.status).toBe(400);
+
+    // 2. Valid hotlink-protected image -> 200 with no Referer, MiniPod User-Agent, sniffed image/png, Cache-Control
+    const targetImgUrl = `http://127.0.0.1:${upstreamPort}/hotlink-protected.png`;
+    const okRes = await fetch(
+      `${srv.url}/api/image-proxy?url=${encodeURIComponent(targetImgUrl)}`,
+      { headers: { Referer: `${srv.url}/` } },
+    );
+    expect(okRes.status).toBe(200);
+    expect(okRes.headers.get('content-type')).toBe('image/png');
+    expect(okRes.headers.get('cache-control')).toBe('public, max-age=86400');
+    expect(capturedHeaders['referer']).toBeUndefined();
+    expect(String(capturedHeaders['user-agent'] ?? '')).toContain('MiniPod/');
+    const bodyBuf = Buffer.from(await okRes.arrayBuffer());
+    expect(bodyBuf.equals(pngBytes)).toBe(true);
+
+    // 3. HTML captive error page disguised as 200 -> rejected as 502 so UI falls back cleanly
+    const htmlErrUrl = `http://127.0.0.1:${upstreamPort}/captive-error`;
+    const htmlRes = await fetch(
+      `${srv.url}/api/image-proxy?url=${encodeURIComponent(htmlErrUrl)}`,
+    );
+    expect(htmlRes.status).toBe(502);
+  });
 });

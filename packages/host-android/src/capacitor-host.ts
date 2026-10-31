@@ -627,7 +627,7 @@ export async function createCapacitorPlatformHost(
         const source = await resolveMediaSourceForEpisode(row.episode.episodeKey);
         const feedRec = await syncStore.getFeedRecord(row.episode.feedKey);
         const startMs = computeResumePositionMs(row.progress);
-        const artworkUrl = row.episode.imageUrl ?? feedRec?.imageUrl;
+        const artworkUrl = row.episode.imageUrl?.trim() || feedRec?.imageUrl?.trim() || undefined;
         items.push({
           episodeKey: row.episode.episodeKey,
           source,

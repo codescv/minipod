@@ -170,6 +170,7 @@ export function parseFeed(xmlText: string, options?: ParseFeedOptions): ParsedFe
         : undefined;
 
     const effectiveLink = ep.link ?? ep.socialInteractUrl;
+    const normalizedEpImage = ep.imageUrl?.trim() || undefined;
 
     return {
       identity,
@@ -178,7 +179,7 @@ export function parseFeed(xmlText: string, options?: ParseFeedOptions): ParsedFe
       ...(ep.guid !== undefined ? { guid: ep.guid } : {}),
       ...(ep.description !== undefined ? { description: ep.description } : {}),
       ...(effectiveLink !== undefined ? { link: effectiveLink } : {}),
-      ...(ep.imageUrl !== undefined ? { imageUrl: ep.imageUrl } : {}),
+      ...(normalizedEpImage !== undefined ? { imageUrl: normalizedEpImage } : {}),
       ...(ep.pubDate !== undefined ? { pubDate: ep.pubDate } : {}),
       ...(ep.durationMs !== undefined ? { durationMs: ep.durationMs } : {}),
       ...(ep.enclosureUrl !== undefined ? { enclosureUrl: ep.enclosureUrl } : {}),
@@ -193,6 +194,7 @@ export function parseFeed(xmlText: string, options?: ParseFeedOptions): ParsedFe
   });
 
   const altKeys = Object.keys(state.feed.alternateFeedUrls);
+  const normalizedFeedImage = state.feed.imageUrl?.trim() || undefined;
 
   return {
     type: state.feed.type,
@@ -201,7 +203,7 @@ export function parseFeed(xmlText: string, options?: ParseFeedOptions): ParsedFe
     ...(state.feed.author !== undefined ? { author: state.feed.author } : {}),
     ...(state.feed.description !== undefined ? { description: state.feed.description } : {}),
     ...(state.feed.link !== undefined ? { link: state.feed.link } : {}),
-    ...(state.feed.imageUrl !== undefined ? { imageUrl: state.feed.imageUrl } : {}),
+    ...(normalizedFeedImage !== undefined ? { imageUrl: normalizedFeedImage } : {}),
     ...(state.feed.language !== undefined ? { language: state.feed.language } : {}),
     ...(state.feed.fundingUrl !== undefined ? { fundingUrl: state.feed.fundingUrl } : {}),
     ...(state.feed.redirectUrl !== undefined ? { redirectUrl: state.feed.redirectUrl } : {}),

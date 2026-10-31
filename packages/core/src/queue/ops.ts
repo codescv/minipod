@@ -44,7 +44,7 @@ export function buildQueueStub(
   >,
   feed: Pick<Feed, 'url' | 'title' | 'imageUrl'>,
 ): QueueStub {
-  const imageUrl = episode.imageUrl ?? feed.imageUrl;
+  const imageUrl = episode.imageUrl?.trim() || feed.imageUrl?.trim() || undefined;
   return {
     identity: episode.identity,
     title: episode.title,

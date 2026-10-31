@@ -455,4 +455,70 @@ describe('CapacitorPlatformHost', () => {
 
     await host.dispose();
   });
+
+  it('normalizes blank episode imageUrl to feed imageUrl in native marathon queue sources', async () => {
+    const rssWithFeedCover = `<?xml version="1.0" encoding="UTF-8"?>
+      <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+        <channel>
+          <title>Cover Pod</title>
+          <itunes:image href="https://pod.example.com/feed-cover.jpg" />
+          <item>
+            <guid>ep-playing</guid>
+            <title>Playing Ep</title>
+            <enclosure url="https://pod.example.com/1.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-queued</guid>
+            <title>Queued Ep</title>
+            <itunes:image href="   " />
+            <enclosure url="https://pod.example.com/2.mp3" type="audio/mpeg" />
+          </item>
+        </channel>
+      </rss>`;
+
+    const harness = createTestPluginHarness();
+    harness.plugin.http = vi.fn(async (req) => ({
+      status: 200,
+      headers: { 'content-type': 'application/rss+xml' },
+      finalUrl: req.url,
+      chain: [],
+      bodyBase64: encodeBase64(new TextEncoder().encode(rssWithFeedCover)),
+    }));
+
+    const { host, db } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      appVersion: '0.1.2',
+      idbFactory: new IDBFactory(),
+      dbName: 'host-artwork-fallback-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+    const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-playing');
+    const ep2Key = deriveEpisodeKey(feed.feedKey, 'ep-queued');
+
+    // Simulate legacy empty-string imageUrl in IndexedDB record
+    const existingEp2 = await db.get('episodes', ep2Key);
+    expect(existingEp2?.imageUrl).toBe('https://pod.example.com/feed-cover.jpg');
+    await db.put('episodes', { ...existingEp2!, imageUrl: '   ' });
+
+    await host.queue.add(ep1Key);
+    await host.queue.add(ep2Key);
+
+    harness.emitNative('media-state', {
+      episodeKey: ep1Key,
+      playing: true,
+      buffering: false,
+      positionMs: 1_000,
+      durationMs: 60_000,
+      speed: 1,
+    });
+
+    const queueSources = await host.playback.queueSources();
+    expect(queueSources).toHaveLength(1);
+    expect(queueSources[0]?.episodeKey).toBe(ep2Key);
+    expect(queueSources[0]?.metadata.artworkUrl).toBe('https://pod.example.com/feed-cover.jpg');
+
+    await host.dispose();
+  });
 });

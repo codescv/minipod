@@ -31,6 +31,22 @@ export const Rss20Namespace: NamespaceHandler = {
       return;
     }
 
+    if (entry.localName === 'image') {
+      const rawHref = getAttr(entry.attributes, 'href') ?? getAttr(entry.attributes, 'url');
+      const resolvedHref = resolveFeedUrlMaybe(rawHref, state.baseUrl);
+      if (resolvedHref) {
+        if (state.currentItem && parent?.localName === 'item') {
+          if (!state.currentItem.itunesImageSet && !state.currentItem.imageUrl) {
+            state.currentItem.imageUrl = resolvedHref;
+          }
+        } else if (!state.currentItem && parent?.localName === 'channel') {
+          if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
+            state.feed.imageUrl = resolvedHref;
+          }
+        }
+      }
+    }
+
     if (entry.localName === 'enclosure' && state.currentItem && parent?.localName === 'item') {
       const rawUrl = getAttr(entry.attributes, 'url');
       const resolvedUrl = resolveFeedUrlMaybe(rawUrl, state.baseUrl);
@@ -111,14 +127,24 @@ export const Rss20Namespace: NamespaceHandler = {
         state.currentItem.pubDate = ms;
         state.currentItem.pubDateExplicit = true;
       }
-    } else if (
-      entry.localName === 'url' &&
-      parent.localName === 'image' &&
-      grandparent?.localName === 'channel'
-    ) {
-      if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
+    } else if (entry.localName === 'url' && parent.localName === 'image') {
+      if (grandparent?.localName === 'channel') {
+        if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
+          const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
+          if (resolved) state.feed.imageUrl = resolved;
+        }
+      } else if (grandparent?.localName === 'item' && state.currentItem) {
+        if (!state.currentItem.itunesImageSet && !state.currentItem.imageUrl) {
+          const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
+          if (resolved) state.currentItem.imageUrl = resolved;
+        }
+      }
+    } else if (entry.localName === 'image' && parent.localName === 'item' && state.currentItem) {
+      if (!state.currentItem.itunesImageSet && !state.currentItem.imageUrl) {
         const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
-        if (resolved) state.feed.imageUrl = resolved;
+        if (resolved && /^https?:\/\//i.test(resolved)) {
+          state.currentItem.imageUrl = resolved;
+        }
       }
     } else if (entry.localName === 'description') {
       if (parent.localName === 'channel') {

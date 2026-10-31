@@ -264,4 +264,85 @@ describe('feed/identity, HtmlFeedDiscoverer & Opml', () => {
       { title: 'Fallback Text', xmlUrl: 'https://nested.example/feed.xml' },
     ]);
   });
+
+  it('extracts episode & channel artwork from podcast:images srcset, podcast:image, RSS item image/url, and Atom entry logo/icon while normalizing blank imageUrl', () => {
+    const rssArtworkXml = `<?xml version="1.0" encoding="UTF-8"?>
+      <rss version="2.0"
+        xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+        xmlns:podcast="https://podcastindex.org/namespace/1.0">
+        <channel>
+          <title>Artwork Variants</title>
+          <podcast:images srcset="https://cdn.example.com/show-1500.jpg 1500w, https://cdn.example.com/show-600.jpg 600w" />
+          <item>
+            <guid>ep-srcset</guid>
+            <title>Podcast Images Srcset</title>
+            <podcast:images srcset="/art/ep-large.webp 1200w, /art/ep-small.webp 400w" />
+            <enclosure url="https://cdn.example.com/1.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-podcast-image</guid>
+            <title>Podcast Image Href</title>
+            <podcast:image href="/art/ep-pod-img.png" />
+            <enclosure url="https://cdn.example.com/2.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-rss-image-url</guid>
+            <title>RSS Item Image Url</title>
+            <image><url>https://cdn.example.com/ep-rss-url.jpg</url></image>
+            <enclosure url="https://cdn.example.com/3.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-rss-image-href</guid>
+            <title>RSS Item Image Href</title>
+            <image href="/art/ep-rss-href.jpg" />
+            <enclosure url="https://cdn.example.com/4.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-itunes-wins</guid>
+            <title>iTunes Overrides Podcast Images</title>
+            <podcast:images srcset="https://cdn.example.com/fallback.jpg 800w" />
+            <itunes:image href="https://cdn.example.com/itunes-official.jpg" />
+            <enclosure url="https://cdn.example.com/5.mp3" type="audio/mpeg" />
+          </item>
+          <item>
+            <guid>ep-blank-image</guid>
+            <title>Blank Image Tag</title>
+            <itunes:image href="   " />
+            <enclosure url="https://cdn.example.com/6.mp3" type="audio/mpeg" />
+          </item>
+        </channel>
+      </rss>`;
+
+    const parsedRss = parseFeed(rssArtworkXml, { baseUrl: 'https://show.example.com/feed.xml' });
+    expect(parsedRss.imageUrl).toBe('https://cdn.example.com/show-1500.jpg');
+    expect(parsedRss.episodes[0]?.imageUrl).toBe('https://show.example.com/art/ep-large.webp');
+    expect(parsedRss.episodes[1]?.imageUrl).toBe('https://show.example.com/art/ep-pod-img.png');
+    expect(parsedRss.episodes[2]?.imageUrl).toBe('https://cdn.example.com/ep-rss-url.jpg');
+    expect(parsedRss.episodes[3]?.imageUrl).toBe('https://show.example.com/art/ep-rss-href.jpg');
+    expect(parsedRss.episodes[4]?.imageUrl).toBe('https://cdn.example.com/itunes-official.jpg');
+    expect(parsedRss.episodes[5]?.imageUrl).toBeUndefined();
+
+    const atomArtworkXml = `<?xml version="1.0" encoding="utf-8"?>
+      <feed xmlns="http://www.w3.org/2005/Atom">
+        <title>Atom Artwork</title>
+        <icon>/feed-icon.png</icon>
+        <entry>
+          <id>atom-ep-logo</id>
+          <title>Entry With Logo</title>
+          <logo>/entry-logo.jpg</logo>
+          <link rel="enclosure" href="/ep1.mp3" type="audio/mpeg" />
+        </entry>
+        <entry>
+          <id>atom-ep-icon</id>
+          <title>Entry With Icon</title>
+          <icon>https://atom.example/entry-icon.png</icon>
+          <link rel="enclosure" href="/ep2.mp3" type="audio/mpeg" />
+        </entry>
+      </feed>`;
+
+    const parsedAtom = parseFeed(atomArtworkXml, { baseUrl: 'https://atom.example/feed.xml' });
+    expect(parsedAtom.imageUrl).toBe('https://atom.example/feed-icon.png');
+    expect(parsedAtom.episodes[0]?.imageUrl).toBe('https://atom.example/entry-logo.jpg');
+    expect(parsedAtom.episodes[1]?.imageUrl).toBe('https://atom.example/entry-icon.png');
+  });
 });

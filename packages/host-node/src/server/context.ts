@@ -1038,6 +1038,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
         const feedByKey = new Map(feedsRepo.listAllRaw().map((f) => [f.feed_key, f]));
         return rows.map((r) => {
           const feed = feedByKey.get(r.episode.feedKey);
+          const artworkUrl = r.episode.imageUrl?.trim() || feed?.image_url?.trim() || undefined;
           return {
             episodeKey: r.episode.episodeKey,
             source: {
@@ -1049,9 +1050,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
             metadata: {
               title: r.episode.title,
               ...(feed?.title ? { artist: feed.title, album: feed.title } : {}),
-              ...(r.episode.imageUrl ?? feed?.image_url
-                ? { artworkUrl: (r.episode.imageUrl ?? feed?.image_url)! }
-                : {}),
+              ...(artworkUrl !== undefined ? { artworkUrl } : {}),
               ...(r.episode.durationMs !== undefined ? { durationMs: r.episode.durationMs } : {}),
             },
           };

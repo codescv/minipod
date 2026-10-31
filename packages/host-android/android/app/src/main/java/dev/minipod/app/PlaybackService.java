@@ -1,15 +1,22 @@
 package dev.minipod.app;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
+import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
@@ -25,8 +32,10 @@ import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.datasource.ResolvingDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.session.DefaultMediaNotificationProvider;
 import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
+import androidx.media3.session.MediaStyleNotificationHelper;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import java.io.File;
@@ -54,6 +63,8 @@ import org.json.JSONObject;
 @OptIn(markerClass = UnstableApi.class)
 public class PlaybackService extends MediaSessionService {
     public static final String PREFS_NAME = "minipod_playback";
+    public static final String NOTIFICATION_CHANNEL_ID = "minipod_playback";
+    public static final int NOTIFICATION_ID = 1001;
     private static final String KEY_CURRENT = "current";
     private static final String KEY_COMPLETED = "completed";
 
@@ -136,6 +147,7 @@ public class PlaybackService extends MediaSessionService {
     private ExoPlayer player;
     private MediaSession mediaSession;
     private PowerManager.WakeLock flushWakeLock;
+    private boolean foregroundStarted = false;
 
     @Nullable private String activeEpisodeKey;
     private long lastKnownDurationMs = 0L;
@@ -330,6 +342,16 @@ public class PlaybackService extends MediaSessionService {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        foregroundStarted = false;
+
+        ensureNotificationChannel();
+
+        DefaultMediaNotificationProvider notificationProvider =
+            new DefaultMediaNotificationProvider.Builder(this)
+                .setChannelId(NOTIFICATION_CHANNEL_ID)
+                .setNotificationId(NOTIFICATION_ID)
+                .build();
+        setMediaNotificationProvider(notificationProvider);
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
@@ -373,7 +395,11 @@ public class PlaybackService extends MediaSessionService {
 
         player.addListener(playerListener);
 
-        mediaSession = new MediaSession.Builder(this, player).build();
+        PendingIntent sessionActivityPendingIntent = createSessionActivityPendingIntent();
+        mediaSession = new MediaSession.Builder(this, player)
+            .setSessionActivity(sessionActivityPendingIntent)
+            .build();
+        addSession(mediaSession);
 
         if (!PENDING_ACTIONS.isEmpty()) {
             List<ServiceAction> drained = new ArrayList<>(PENDING_ACTIONS);
@@ -384,6 +410,29 @@ public class PlaybackService extends MediaSessionService {
         }
     }
 
+    @Override
+    public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
+        if (!foregroundStarted || player == null || !player.isPlaying()) {
+            try {
+                Notification notification = buildBootstrapForegroundNotification();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                    );
+                } else {
+                    startForeground(NOTIFICATION_ID, notification);
+                }
+                foregroundStarted = true;
+            } catch (Exception ignored) {
+                // Guard against background foreground-service restrictions if any
+            }
+        }
+        super.onStartCommand(intent, flags, startId);
+        return START_STICKY;
+    }
+
     @Nullable
     @Override
     public MediaSession onGetSession(MediaSession.ControllerInfo controllerInfo) {
@@ -392,10 +441,16 @@ public class PlaybackService extends MediaSessionService {
 
     @Override
     public void onTaskRemoved(@Nullable Intent rootIntent) {
-        if (player == null || !player.getPlayWhenReady() || player.getMediaItemCount() == 0) {
-            writeCurrentCheckpoint();
-            stopSelf();
+        writeCurrentCheckpoint();
+        if (player != null
+            && player.getMediaItemCount() > 0
+            && (player.isPlaying() || player.getPlayWhenReady())
+            && player.getPlaybackState() != Player.STATE_ENDED
+            && player.getPlaybackState() != Player.STATE_IDLE) {
+            // Keep playing in the background when the user exits or swipes away the Activity.
+            return;
         }
+        stopSelf();
     }
 
     @Override
@@ -404,8 +459,10 @@ public class PlaybackService extends MediaSessionService {
         MAIN_HANDLER.removeCallbacks(sleepTimerRunnable);
         writeCurrentCheckpoint();
         releaseFlushWakeLockInternal();
+        foregroundStarted = false;
 
         if (mediaSession != null) {
+            removeSession(mediaSession);
             mediaSession.release();
             mediaSession = null;
         }
@@ -418,6 +475,68 @@ public class PlaybackService extends MediaSessionService {
             instance = null;
         }
         super.onDestroy();
+    }
+
+    private PendingIntent createSessionActivityPendingIntent() {
+        Intent launchIntent = new Intent(this, MainActivity.class);
+        launchIntent.setAction(Intent.ACTION_MAIN);
+        launchIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+        return PendingIntent.getActivity(this, 0, launchIntent, flags);
+    }
+
+    private void ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm =
+                (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                NotificationChannel channel = new NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    getString(R.string.app_name),
+                    NotificationManager.IMPORTANCE_LOW
+                );
+                channel.setShowBadge(false);
+                channel.setDescription("Podcast background playback");
+                nm.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    private Notification buildBootstrapForegroundNotification() {
+        ensureNotificationChannel();
+        CharSequence title = getString(R.string.app_name);
+        CharSequence subtitle = null;
+        if (player != null && player.getCurrentMediaItem() != null) {
+            MediaMetadata meta = player.getCurrentMediaItem().mediaMetadata;
+            if (meta.title != null && meta.title.length() > 0) {
+                title = meta.title;
+            }
+            if (meta.artist != null && meta.artist.length() > 0) {
+                subtitle = meta.artist;
+            } else if (meta.albumTitle != null && meta.albumTitle.length() > 0) {
+                subtitle = meta.albumTitle;
+            }
+        }
+        int smallIcon = getApplicationInfo().icon != 0
+            ? getApplicationInfo().icon
+            : android.R.drawable.ic_media_play;
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(smallIcon)
+            .setContentTitle(title)
+            .setContentIntent(createSessionActivityPendingIntent())
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setOngoing(player != null && (player.isPlaying() || player.getPlayWhenReady()));
+        if (subtitle != null) {
+            builder.setContentText(subtitle);
+        }
+        if (mediaSession != null) {
+            builder.setStyle(new MediaStyleNotificationHelper.MediaStyle(mediaSession));
+        }
+        return builder.build();
     }
 
     // -------------------------------------------------------------------------

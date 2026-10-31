@@ -45,6 +45,7 @@ export interface EpisodeDbRow {
 }
 
 export function rowToEpisode(row: EpisodeDbRow, feedKey: FeedKey): Episode {
+  const imageUrl = row.image_url?.trim() || undefined;
   return {
     episodeKey: row.episode_key,
     feedKey,
@@ -55,7 +56,7 @@ export function rowToEpisode(row: EpisodeDbRow, feedKey: FeedKey): Episode {
     downloadState: row.download_state,
     ...(row.description !== null ? { description: row.description } : {}),
     ...(row.link !== null ? { link: row.link } : {}),
-    ...(row.image_url !== null ? { imageUrl: row.image_url } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
     ...(row.pub_date !== null ? { pubDate: row.pub_date } : {}),
     ...(row.duration_ms !== null ? { durationMs: row.duration_ms } : {}),
     ...(row.enclosure_url !== null ? { enclosureUrl: row.enclosure_url } : {}),
@@ -221,7 +222,7 @@ export class EpisodesRepository {
            title = ?,
            description = COALESCE(?, description),
            link = COALESCE(?, link),
-           image_url = COALESCE(?, image_url),
+           image_url = COALESCE(?, NULLIF(TRIM(image_url), '')),
            pub_date = COALESCE(?, pub_date),
            duration_ms = COALESCE(?, duration_ms),
            enclosure_url = COALESCE(?, enclosure_url),
@@ -239,7 +240,7 @@ export class EpisodesRepository {
       for (const ep of parsedEpisodes) {
         const epKey = computeEpisodeKey(feedKey, ep.identity);
         const existing = selectExisting.get(epKey) as { id: number; is_stub: number } | undefined;
-        const img = ep.imageUrl ?? options?.fallbackImageUrl ?? null;
+        const img = ep.imageUrl?.trim() || options?.fallbackImageUrl?.trim() || null;
         const mtime = options?.localMtimeByIdentity?.get(ep.identity) ?? null;
 
         let episodeId: number;

@@ -195,6 +195,79 @@ export interface MediaProxyDeps {
 }
 
 const STREAM_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_PROXIED_IMAGE_BYTES = 15 * 1024 * 1024;
+
+function sniffImageMimeFromBytes(bytes: Uint8Array): string | undefined {
+  if (bytes.byteLength >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return 'image/png';
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.byteLength >= 6 &&
+      bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 &&
+      (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+    return 'image/gif';
+  }
+  if (bytes.byteLength >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return 'image/webp';
+  }
+  if (bytes.byteLength >= 12 &&
+      bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70 &&
+      bytes[8] === 0x61 && bytes[9] === 0x76 && bytes[10] === 0x69) {
+    return 'image/avif';
+  }
+  if (bytes.byteLength >= 4) {
+    const head = new TextDecoder('utf-8', { fatal: false })
+      .decode(bytes.subarray(0, Math.min(bytes.byteLength, 512)))
+      .trimStart()
+      .toLowerCase();
+    if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) {
+      return 'image/svg+xml';
+    }
+  }
+  return undefined;
+}
+
+function inferImageMimeFromUrl(urlStr: string): string | undefined {
+  try {
+    const p = new URL(urlStr).pathname.toLowerCase();
+    if (p.endsWith('.png')) return 'image/png';
+    if (p.endsWith('.webp')) return 'image/webp';
+    if (p.endsWith('.gif')) return 'image/gif';
+    if (p.endsWith('.svg')) return 'image/svg+xml';
+    if (p.endsWith('.avif')) return 'image/avif';
+    if (p.endsWith('.bmp')) return 'image/bmp';
+    if (p.endsWith('.ico')) return 'image/x-icon';
+    if (p.endsWith('.jpg') || p.endsWith('.jpeg')) return 'image/jpeg';
+  } catch {
+    // ignore URL parse failure
+  }
+  return undefined;
+}
+
+function resolveProxiedImageMime(
+  declaredHeader: string | undefined,
+  finalUrl: string,
+  bytes?: Uint8Array,
+): string | null {
+  const sniffed = bytes ? sniffImageMimeFromBytes(bytes) : undefined;
+  const rawBase = declaredHeader?.split(';')[0]?.trim().toLowerCase() ?? '';
+  if (rawBase.startsWith('image/') && rawBase !== 'image/*' && rawBase !== 'image/jpg') {
+    return rawBase;
+  }
+  if (rawBase === 'image/jpg') {
+    return 'image/jpeg';
+  }
+  if ((rawBase === 'text/html' || rawBase === 'application/xhtml+xml') && !sniffed) {
+    return null;
+  }
+  return sniffed ?? inferImageMimeFromUrl(finalUrl) ?? 'image/jpeg';
+}
 
 export class MediaProxy {
   private readonly fetchFn: typeof fetch;
@@ -535,5 +608,93 @@ export class MediaProxy {
         'Cache-Control': 'private, max-age=300',
       },
     });
+  }
+
+  async handleImageProxy(params: {
+    readonly url: string | undefined;
+    readonly method: 'GET' | 'HEAD';
+    readonly signal?: AbortSignal | undefined;
+  }): Promise<Response> {
+    const trimmed = params.url?.trim() ?? '';
+    if (!trimmed) {
+      return new Response('Missing "url" query parameter', { status: 400 });
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return new Response('Invalid image URL', { status: 400 });
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return new Response('Image URL must use http:// or https://', { status: 400 });
+    }
+
+    try {
+      const resp = await this.http({
+        url: parsed.toString(),
+        method: params.method,
+        maxBodyBytes: MAX_PROXIED_IMAGE_BYTES,
+        timeoutMs: 20_000,
+        headers: {
+          Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        },
+        ...(params.signal ? { signal: params.signal } : {}),
+      });
+
+      if (resp.status < 200 || resp.status >= 300) {
+        return new Response(`Upstream image responded with HTTP ${resp.status}`, {
+          status: resp.status === 404 ? 404 : 502,
+        });
+      }
+
+      if (params.method === 'HEAD') {
+        const contentType = resolveProxiedImageMime(
+          resp.headers['content-type'],
+          resp.finalUrl || parsed.toString(),
+        );
+        if (!contentType) {
+          return new Response('Upstream response is not an image', { status: 502 });
+        }
+        const headers: Record<string, string> = {
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=86400',
+          'X-Content-Type-Options': 'nosniff',
+        };
+        if (resp.headers['content-length']) {
+          headers['Content-Length'] = resp.headers['content-length'];
+        }
+        return new Response(null, { status: 200, headers });
+      }
+
+      const bytes = await resp.bytes();
+      if (bytes.byteLength === 0) {
+        return new Response('Upstream image body is empty', { status: 502 });
+      }
+
+      const contentType = resolveProxiedImageMime(
+        resp.headers['content-type'],
+        resp.finalUrl || parsed.toString(),
+        bytes,
+      );
+      if (!contentType) {
+        return new Response('Upstream response is not an image', { status: 502 });
+      }
+
+      return new Response(bytes as unknown as BodyInit, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': String(bytes.byteLength),
+          'Cache-Control': 'public, max-age=86400',
+          'X-Content-Type-Options': 'nosniff',
+        },
+      });
+    } catch (err) {
+      if (err instanceof MiniPodError && err.code === 'invalid-url') {
+        return new Response(err.message, { status: 400 });
+      }
+      return new Response('Failed to fetch upstream image', { status: 502 });
+    }
   }
 }

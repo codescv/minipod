@@ -66,6 +66,8 @@ export const AtomNamespace: NamespaceHandler = {
                 state.currentItem.enclosureSize = size;
               }
             }
+          } else if (isImageMime(mime) && !state.currentItem.itunesImageSet && !state.currentItem.imageUrl) {
+            state.currentItem.imageUrl = href;
           }
         }
       } else if (FEED_CONTAINERS.has(parent.localName)) {
@@ -132,15 +134,17 @@ export const AtomNamespace: NamespaceHandler = {
         const ms = parsePubDateMs(trimmed);
         if (ms !== undefined) state.currentItem.pubDate = ms;
       }
-    } else if (entry.localName === 'logo' && parent.localName === 'feed') {
-      if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
-        const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
-        if (resolved) state.feed.imageUrl = resolved;
-      }
-    } else if (entry.localName === 'icon' && parent.localName === 'feed') {
-      if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
-        const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
-        if (resolved) state.feed.imageUrl = resolved;
+    } else if (entry.localName === 'logo' || entry.localName === 'icon') {
+      if (FEED_CONTAINERS.has(parent.localName)) {
+        if (!state.feed.itunesImageSet && !state.feed.imageUrl) {
+          const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
+          if (resolved) state.feed.imageUrl = resolved;
+        }
+      } else if (ITEM_CONTAINERS.has(parent.localName) && state.currentItem) {
+        if (!state.currentItem.itunesImageSet && !state.currentItem.imageUrl) {
+          const resolved = resolveFeedUrlMaybe(trimmed, state.baseUrl);
+          if (resolved) state.currentItem.imageUrl = resolved;
+        }
       }
     } else if (entry.localName === 'name' && parent.localName === 'author' && !state.currentItem) {
       state.feed.author = state.feed.author ? `${state.feed.author}, ${trimmed}` : trimmed;

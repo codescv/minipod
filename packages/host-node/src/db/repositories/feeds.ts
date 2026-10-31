@@ -45,6 +45,7 @@ export interface FeedDbRow {
 }
 
 export function rowToFeed(row: FeedDbRow): Feed {
+  const imageUrl = row.image_url?.trim() || undefined;
   return {
     feedKey: row.feed_key,
     kind: row.kind,
@@ -57,7 +58,7 @@ export function rowToFeed(row: FeedDbRow): Feed {
     ...(row.author !== null ? { author: row.author } : {}),
     ...(row.description !== null ? { description: row.description } : {}),
     ...(row.link !== null ? { link: row.link } : {}),
-    ...(row.image_url !== null ? { imageUrl: row.image_url } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
     ...(row.language !== null ? { language: row.language } : {}),
     ...(row.funding_url !== null ? { fundingUrl: row.funding_url } : {}),
     ...(row.next_page_url !== null ? { nextPageUrl: row.next_page_url } : {}),
@@ -184,7 +185,11 @@ export class FeedsRepository {
   }): { readonly feed: Feed; readonly addedEpisodes: number } {
     return transaction(this.db, () => {
       const existing = this.getRaw(options.feedKey);
-      const imageUrl = options.overrideImageUrl ?? options.parsed.imageUrl ?? existing?.image_url ?? undefined;
+      const imageUrl =
+        options.overrideImageUrl?.trim() ||
+        options.parsed.imageUrl?.trim() ||
+        existing?.image_url?.trim() ||
+        undefined;
 
       let feedId: number;
       if (!existing) {

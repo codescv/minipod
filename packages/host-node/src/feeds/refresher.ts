@@ -359,7 +359,7 @@ export class FeedRefresher {
     const parsed = parseFeed(xmlText, { baseUrl: finalUrl });
 
     const added = this.episodesRepo.upsertParsedEpisodes(row.id, feedKey, parsed.episodes, {
-      fallbackImageUrl: row.image_url ?? parsed.imageUrl,
+      fallbackImageUrl: row.image_url?.trim() || parsed.imageUrl?.trim(),
     });
 
     const nextUrl =

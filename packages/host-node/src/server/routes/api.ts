@@ -50,6 +50,17 @@ export function createApiRoutes(host: PlatformHost, mediaProxy: MediaProxy): Hon
   // Host info
   api.get('/info', (c) => handleApi(c, async () => host.info));
 
+  // CORS / Hotlink / Mixed-Content artwork image proxy (`GET|HEAD /api/image-proxy?url=<encoded>`)
+  api.on(['GET', 'HEAD'], '/image-proxy', (c) => {
+    const rawUrl = c.req.query('url');
+    const method = c.req.method === 'HEAD' ? 'HEAD' : 'GET';
+    return mediaProxy.handleImageProxy({
+      url: rawUrl,
+      method,
+      signal: c.req.raw.signal,
+    });
+  });
+
   // Feeds — register all static subpaths BEFORE `/:feedKey`
   api.get('/feeds', (c) => handleApi(c, () => host.feeds.list()));
 

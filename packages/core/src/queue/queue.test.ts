@@ -100,4 +100,35 @@ describe('queue/ops & AutoAdvancePolicy', () => {
     expect(ordered[0]!.pos < ordered[1]!.pos && ordered[1]!.pos < ordered[2]!.pos).toBe(true);
     expect(rebalanceQueueIfNeeded(nextState, ctx)).toEqual([]);
   });
+
+  it('falls back to feed.imageUrl when episode.imageUrl is empty or whitespace in buildQueueStub', () => {
+    const stubEmptyEpImage = buildQueueStub(
+      {
+        identity: 'id-empty',
+        title: 'Blank Ep Image',
+        enclosureUrl: 'https://x/ep.mp3',
+        imageUrl: '   ',
+      },
+      {
+        url: 'https://x/rss',
+        title: 'Podcast X',
+        imageUrl: ' https://x/feed-cover.jpg ',
+      },
+    );
+    expect(stubEmptyEpImage.imageUrl).toBe('https://x/feed-cover.jpg');
+
+    const stubBothEmpty = buildQueueStub(
+      {
+        identity: 'id-both-empty',
+        title: 'No Cover Anywhere',
+        imageUrl: '',
+      },
+      {
+        url: 'https://x/rss',
+        title: 'Podcast X',
+        imageUrl: '  ',
+      },
+    );
+    expect(stubBothEmpty.imageUrl).toBeUndefined();
+  });
 });

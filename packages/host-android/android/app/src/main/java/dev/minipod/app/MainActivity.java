@@ -1,14 +1,19 @@
 package dev.minipod.app;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
@@ -25,8 +30,12 @@ import java.util.Locale;
  * - Computes density-scaled `WindowInsetsCompat` (`systemBars | displayCutout`) and injects
  *   `--m-safe-top`, `--m-safe-right`, `--m-safe-bottom`, `--m-safe-left` CSS variables.
  * - Intercepts hardware/gesture back via `OnBackPressedCallback` calling `window.__minipodHandleBack()`.
+ * - Configures WebView mixed content (`MIXED_CONTENT_ALWAYS_ALLOW`) for `http://` podcast/episode covers,
+ *   requests `POST_NOTIFICATIONS` on Android 13+, and keeps `PlaybackService` running across backgrounding.
  */
 public class MainActivity extends BridgeActivity {
+    private static final int REQ_POST_NOTIFICATIONS = 1001;
+
     private float safeTopDp = 0f;
     private float safeRightDp = 0f;
     private float safeBottomDp = 0f;
@@ -36,8 +45,10 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(MiniPodPlugin.class);
         super.onCreate(savedInstanceState);
+        this.keepRunning = true;
 
         MiniPodPlugin.recordLaunchIntent(getIntent());
+        requestNotificationPermissionIfNeeded();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -122,8 +133,24 @@ public class MainActivity extends BridgeActivity {
             });
             if (getBridge().getWebView() != null) {
                 WebView webView = getBridge().getWebView();
+                WebSettings webSettings = webView.getSettings();
+                webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                webSettings.setMediaPlaybackRequiresUserGesture(false);
                 webView.postDelayed(this::syncSafeAreaCssVars, 150);
                 webView.postDelayed(this::syncSafeAreaCssVars, 600);
+            }
+        }
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                    REQ_POST_NOTIFICATIONS
+                );
             }
         }
     }
@@ -143,6 +170,20 @@ public class MainActivity extends BridgeActivity {
         }
         syncSafeAreaCssVars();
         MiniPodPlugin.resumePendingApkInstall(this);
+    }
+
+    @Override
+    public void onPause() {
+        this.keepRunning = true;
+        super.onPause();
+        // Never pause or stop PlaybackService when MainActivity leaves the foreground.
+    }
+
+    @Override
+    public void onStop() {
+        this.keepRunning = true;
+        super.onStop();
+        // PlaybackService continues running independently as a mediaPlayback foreground service.
     }
 
     private void syncSafeAreaCssVars() {

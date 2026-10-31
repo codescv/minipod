@@ -66,6 +66,7 @@ export interface IdbSyncStoreDeps {
 }
 
 export function idbRecordToFeed(r: IdbFeedRecord): Feed {
+  const imageUrl = r.imageUrl?.trim() || undefined;
   return {
     feedKey: r.feedKey,
     kind: r.kind,
@@ -78,7 +79,7 @@ export function idbRecordToFeed(r: IdbFeedRecord): Feed {
     ...(r.author !== undefined ? { author: r.author } : {}),
     ...(r.description !== undefined ? { description: r.description } : {}),
     ...(r.link !== undefined ? { link: r.link } : {}),
-    ...(r.imageUrl !== undefined ? { imageUrl: r.imageUrl } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
     ...(r.language !== undefined ? { language: r.language } : {}),
     ...(r.fundingUrl !== undefined ? { fundingUrl: r.fundingUrl } : {}),
     ...(r.nextPageUrl !== undefined ? { nextPageUrl: r.nextPageUrl } : {}),
@@ -89,6 +90,7 @@ export function idbRecordToFeed(r: IdbFeedRecord): Feed {
 }
 
 export function idbRecordToEpisode(r: IdbEpisodeRecord): Episode {
+  const imageUrl = r.imageUrl?.trim() || undefined;
   return {
     episodeKey: r.episodeKey,
     feedKey: r.feedKey,
@@ -99,7 +101,7 @@ export function idbRecordToEpisode(r: IdbEpisodeRecord): Episode {
     downloadState: r.downloadState,
     ...(r.description !== undefined ? { description: r.description } : {}),
     ...(r.link !== undefined ? { link: r.link } : {}),
-    ...(r.imageUrl !== undefined ? { imageUrl: r.imageUrl } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
     ...(r.pubDate !== undefined ? { pubDate: r.pubDate } : {}),
     ...(r.durationMs !== undefined ? { durationMs: r.durationMs } : {}),
     ...(r.enclosureUrl !== undefined ? { enclosureUrl: r.enclosureUrl } : {}),
@@ -944,7 +946,11 @@ export class IdbSyncStore implements SyncStore {
     );
 
     const stamp = this.hlc.stamp(existingFeed?.updatedAt);
-    const effectiveImage = params.overrideImageUrl ?? params.parsed.imageUrl ?? existingFeed?.imageUrl;
+    const effectiveImage =
+      params.overrideImageUrl?.trim() ||
+      params.parsed.imageUrl?.trim() ||
+      existingFeed?.imageUrl?.trim() ||
+      undefined;
 
     let maxPubDate = existingFeed?.lastEpisodeAt ?? 0;
     for (const item of params.parsed.episodes) {
@@ -954,7 +960,8 @@ export class IdbSyncStore implements SyncStore {
       const epKey = deriveEpisodeKey(params.feedKey, item.identity);
       const prevEp = existingEpByKey.get(epKey);
       const pubDate = item.pubDate ?? prevEp?.pubDate;
-      const epImage = item.imageUrl ?? effectiveImage ?? prevEp?.imageUrl;
+      const epImage =
+        item.imageUrl?.trim() || effectiveImage || prevEp?.imageUrl?.trim() || undefined;
       const localMtime = params.localMtimeByIdentity?.get(item.identity) ?? prevEp?.localMtimeMs;
 
       const epRec: IdbEpisodeRecord = {
@@ -1117,7 +1124,11 @@ export class IdbSyncStore implements SyncStore {
         added += 1;
       }
       const pubDate = item.pubDate ?? existing?.pubDate;
-      const epImage = item.imageUrl ?? feed.imageUrl ?? existing?.imageUrl;
+      const epImage =
+        item.imageUrl?.trim() ||
+        feed.imageUrl?.trim() ||
+        existing?.imageUrl?.trim() ||
+        undefined;
       const rec: IdbEpisodeRecord = {
         episodeKey: epKey,
         feedKey,
@@ -1594,6 +1605,7 @@ export class IdbSyncStore implements SyncStore {
 
 function stubToFallbackEpisode(entry: QueueEntry): Episode {
   const stub: QueueStub | undefined = entry.stub;
+  const imageUrl = stub?.imageUrl?.trim() || undefined;
   const mime = stub?.enclosureMime ?? '';
   const mediaType = mime.toLowerCase().startsWith('video/')
     ? 'VIDEO'
@@ -1612,6 +1624,6 @@ function stubToFallbackEpisode(entry: QueueEntry): Episode {
     ...(stub?.durationMs !== undefined ? { durationMs: stub.durationMs } : {}),
     ...(stub?.enclosureUrl !== undefined ? { enclosureUrl: stub.enclosureUrl } : {}),
     ...(stub?.enclosureMime !== undefined ? { enclosureMime: stub.enclosureMime } : {}),
-    ...(stub?.imageUrl !== undefined ? { imageUrl: stub.imageUrl } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
   };
 }
