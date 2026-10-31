@@ -5,14 +5,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
+import { getHostViewCache } from '../stores/view-cache';
 
 export function useDownloadedCount(): number {
   const host = useHost();
-  const [count, setCount] = useState(0);
+  const [count, setCount] = useState(() => getHostViewCache(host).downloadedCount);
   const seqRef = useRef(0);
 
   const refresh = useCallback(async () => {
     if (!host.info.capabilities.downloads) {
+      getHostViewCache(host).downloadedCount = 0;
       setCount(0);
       return;
     }
@@ -21,7 +23,10 @@ export function useDownloadedCount(): number {
       const feeds = await host.feeds.list();
       const downloadableFeeds = feeds.filter((f) => f.kind !== 'LOCAL');
       if (downloadableFeeds.length === 0) {
-        if (seq === seqRef.current) setCount(0);
+        if (seq === seqRef.current) {
+          getHostViewCache(host).downloadedCount = 0;
+          setCount(0);
+        }
         return;
       }
       const counts = await Promise.all(
@@ -35,10 +40,15 @@ export function useDownloadedCount(): number {
         }),
       );
       if (seq === seqRef.current) {
-        setCount(counts.reduce((acc, n) => acc + n, 0));
+        const total = counts.reduce((acc, n) => acc + n, 0);
+        getHostViewCache(host).downloadedCount = total;
+        setCount(total);
       }
     } catch {
-      if (seq === seqRef.current) setCount(0);
+      if (seq === seqRef.current) {
+        getHostViewCache(host).downloadedCount = 0;
+        setCount(0);
+      }
     }
   }, [host]);
 

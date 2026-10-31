@@ -7,6 +7,7 @@ import { ArtworkImage, Icon, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { useSettingsStore } from '../../stores/settings';
+import { getHostViewCache } from '../../stores/view-cache';
 
 export function TopCharts({
   onSelectResult,
@@ -19,13 +20,20 @@ export function TopCharts({
   const country = useSettingsStore((s) => s.settings.topChartsCountry);
   const updateSettings = useSettingsStore((s) => s.update);
 
-  const [countries, setCountries] = useState<readonly { readonly code: CountryCode; readonly name: string }[]>([]);
-  const [charts, setCharts] = useState<readonly SearchResult[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [countries, setCountries] = useState<
+    readonly { readonly code: CountryCode; readonly name: string }[]
+  >(() => getHostViewCache(host).topChartsCountries);
+  const [charts, setCharts] = useState<readonly SearchResult[]>(
+    () => getHostViewCache(host).topChartsByCountry.get(country) ?? [],
+  );
+  const [loading, setLoading] = useState(
+    () => !getHostViewCache(host).topChartsByCountry.has(country),
+  );
 
   useEffect(() => {
     let alive = true;
     void host.search.countries().then((list) => {
+      getHostViewCache(host).topChartsCountries = list;
       if (alive) setCountries(list);
     });
     return () => {
@@ -34,19 +42,29 @@ export function TopCharts({
   }, [host]);
 
   useEffect(() => {
+    const viewCache = getHostViewCache(host);
+    const cached = viewCache.topChartsByCountry.get(country);
+    if (cached !== undefined) {
+      setCharts(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     const ctrl = new AbortController();
-    setLoading(true);
     void host.search
       .topCharts(country, ctrl.signal)
       .then((items) => {
         if (!ctrl.signal.aborted) {
+          getHostViewCache(host).topChartsByCountry.set(country, items);
           setCharts(items);
           setLoading(false);
         }
       })
       .catch(() => {
         if (!ctrl.signal.aborted) {
-          setCharts([]);
+          if (!getHostViewCache(host).topChartsByCountry.has(country)) {
+            setCharts([]);
+          }
           setLoading(false);
         }
       });
@@ -54,6 +72,13 @@ export function TopCharts({
   }, [country, host]);
 
   const handleCountryChange = (next: CountryCode) => {
+    const cached = getHostViewCache(host).topChartsByCountry.get(next);
+    if (cached !== undefined) {
+      setCharts(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     void updateSettings(host, { topChartsCountry: next });
   };
 
@@ -82,9 +107,9 @@ export function TopCharts({
         </label>
       </div>
 
-      {loading ? (
+      {loading && charts.length === 0 ? (
         <div className="m-empty">{t('common.loading')}</div>
-      ) : charts.length === 0 ? (
+      ) : !loading && charts.length === 0 ? (
         <div className="m-empty" data-testid="top-charts-empty">
           {t('add.noChartData')}
         </div>

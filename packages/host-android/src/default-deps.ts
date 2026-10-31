@@ -16,7 +16,7 @@ import {
 } from './storage/idb';
 
 /** Bumped automatically by `scripts/bump-version.mjs` when packaging APKs. */
-export const version = '0.1.8';
+export const version = '0.1.9';
 
 export interface CapacitorHostDeps {
   readonly plugin: MiniPodPlugin;

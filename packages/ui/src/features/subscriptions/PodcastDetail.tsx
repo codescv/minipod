@@ -34,6 +34,11 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { stripHtmlToText } from '../../lib/format';
 import { showSnackbar } from '../../stores/snackbar';
+import {
+  filterCachedEpisodeRows,
+  getHostViewCache,
+  recomputeHostTimelineAndDownloads,
+} from '../../stores/view-cache';
 import { EpisodeRow } from './EpisodeRow';
 
 export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
@@ -42,9 +47,19 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const openDownloads = useRouteStore((s) => s.openDownloads);
   const downloadedCount = useDownloadedCount();
 
-  const [feed, setFeed] = useState<Feed | null>(null);
-  const [rows, setRows] = useState<readonly EpisodeRowModel[]>([]);
+  const [feed, setFeed] = useState<Feed | null>(
+    () => getHostViewCache(host).feedsByKey.get(feedKey) ?? null,
+  );
+  const [allRows, setAllRows] = useState<readonly EpisodeRowModel[]>(
+    () => getHostViewCache(host).episodesByFeed.get(feedKey) ?? [],
+  );
   const [filter, setFilter] = useState<EpisodeFilter>('all');
+  const [rows, setRows] = useState<readonly EpisodeRowModel[]>(
+    () => getHostViewCache(host).episodesByFeed.get(feedKey) ?? [],
+  );
+  const [loading, setLoading] = useState<boolean>(
+    () => !getHostViewCache(host).episodesByFeed.has(feedKey),
+  );
   const [dismissedKeys, setDismissedKeys] = useState<ReadonlySet<EpisodeKey>>(() => new Set());
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -53,11 +68,36 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
+  const prevFeedKeyRef = useRef(feedKey);
+
+  if (prevFeedKeyRef.current !== feedKey) {
+    prevFeedKeyRef.current = feedKey;
+    const viewCache = getHostViewCache(host);
+    const cachedAll = viewCache.episodesByFeed.get(feedKey) ?? [];
+    inlineUndoKeysRef.current.clear();
+    setFeed(viewCache.feedsByKey.get(feedKey) ?? null);
+    setAllRows(cachedAll);
+    setRows(filterCachedEpisodeRows(cachedAll, filter, inlineUndoKeysRef.current));
+    setDismissedKeys(new Set());
+    setLoading(!viewCache.episodesByFeed.has(feedKey));
+  }
 
   useEffect(() => {
     inlineUndoKeysRef.current.clear();
     setDismissedKeys(new Set());
   }, [feedKey, filter]);
+
+  const handleSelectFilter = useCallback(
+    (nextFilter: EpisodeFilter) => {
+      if (nextFilter === filter) return;
+      inlineUndoKeysRef.current.clear();
+      setDismissedKeys(new Set());
+      setFilter(nextFilter);
+      const cachedAll = getHostViewCache(host).episodesByFeed.get(feedKey) ?? allRows;
+      setRows(filterCachedEpisodeRows(cachedAll, nextFilter, inlineUndoKeysRef.current));
+    },
+    [allRows, feedKey, filter, host],
+  );
 
   const reload = useCallback(async () => {
     try {
@@ -67,6 +107,55 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         host.feeds.get(feedKey),
         host.episodes.list(feedKey, fetchFilter),
       ]);
+      const viewCache = getHostViewCache(host);
+      const nextFeedsByKey = new Map(viewCache.feedsByKey);
+      nextFeedsByKey.set(feedKey, loadedFeed);
+      viewCache.feedsByKey = nextFeedsByKey;
+      if (viewCache.feeds.some((f) => f.feedKey === feedKey)) {
+        viewCache.feeds = viewCache.feeds.map((f) => (f.feedKey === feedKey ? loadedFeed : f));
+      }
+
+      if (fetchFilter === 'all') {
+        viewCache.episodesByFeed.set(feedKey, page.items);
+        setAllRows(page.items);
+        if (viewCache.feedsLoaded) {
+          const derived = recomputeHostTimelineAndDownloads(
+            host,
+            viewCache.feeds,
+            viewCache.episodesByFeed,
+          );
+          viewCache.timelineItems = derived.timelineItems;
+          viewCache.downloadedCount = derived.downloadedCount;
+          viewCache.downloadedItems = derived.downloadedItems;
+        }
+      } else {
+        const existingAll = viewCache.episodesByFeed.get(feedKey);
+        if (existingAll) {
+          const updatedByKey = new Map(page.items.map((r) => [r.episode.episodeKey, r]));
+          const mergedAll = existingAll.map((r) => updatedByKey.get(r.episode.episodeKey) ?? r);
+          viewCache.episodesByFeed.set(feedKey, mergedAll);
+          setAllRows(mergedAll);
+        }
+        void host.episodes
+          .list(feedKey, 'all')
+          .then((allPage) => {
+            const c = getHostViewCache(host);
+            c.episodesByFeed.set(feedKey, allPage.items);
+            setAllRows(allPage.items);
+            if (c.feedsLoaded) {
+              const derived = recomputeHostTimelineAndDownloads(
+                host,
+                c.feeds,
+                c.episodesByFeed,
+              );
+              c.timelineItems = derived.timelineItems;
+              c.downloadedCount = derived.downloadedCount;
+              c.downloadedItems = derived.downloadedItems;
+            }
+          })
+          .catch(() => undefined);
+      }
+
       const nextRows =
         filter === 'unplayed' && fetchFilter === 'all'
           ? page.items.filter(
@@ -77,6 +166,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
           : page.items;
       setFeed(loadedFeed);
       setRows(nextRows);
+      setLoading(false);
       preloadArtworkUrls(
         [
           loadedFeed.imageUrl,
@@ -86,6 +176,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
       );
     } catch {
       // ignore if unsubscribed mid-flight
+      setLoading(false);
     }
   }, [feedKey, filter, host]);
 
@@ -270,31 +361,31 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         <Chip
           selected={filter === 'all'}
           testId="filter-chip-all"
-          onClick={() => setFilter('all')}
+          onClick={() => handleSelectFilter('all')}
         >
           {t('detail.filterAll')}
         </Chip>
         <Chip
           selected={filter === 'unplayed'}
           testId="filter-chip-unplayed"
-          onClick={() => setFilter('unplayed')}
+          onClick={() => handleSelectFilter('unplayed')}
         >
           {t('detail.filterUnplayed')}
         </Chip>
         <Chip
           selected={filter === 'downloaded'}
           testId="filter-chip-downloaded"
-          onClick={() => setFilter('downloaded')}
+          onClick={() => handleSelectFilter('downloaded')}
         >
           {t('detail.filterDownloaded')}
         </Chip>
       </div>
 
-      {visibleRows.length === 0 ? (
+      {!loading && visibleRows.length === 0 ? (
         <div className="m-empty" data-testid="detail-empty">
           {t('detail.noEpisodes')}
         </div>
-      ) : (
+      ) : visibleRows.length > 0 ? (
         <div className="m-episode-list" data-testid="detail-episode-list">
           {visibleRows.map((r) => (
             <EpisodeRow
@@ -329,7 +420,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
             />
           ))}
         </div>
-      )}
+      ) : null}
 
       {feed?.nextPageUrl && (
         <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 8 }}>

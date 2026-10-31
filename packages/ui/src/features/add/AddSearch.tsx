@@ -15,6 +15,7 @@ import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { looksLikeUrlInput } from '../../lib/identity';
 import { showSnackbar } from '../../stores/snackbar';
+import { getHostViewCache } from '../../stores/view-cache';
 import { TopCharts } from './TopCharts';
 
 const SOURCE_CHIPS: readonly {
@@ -43,7 +44,10 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
 
   const [input, setInput] = useState(initialInput ?? '');
   const [source, setSource] = useState<SourceId>('combined');
-  const [results, setResults] = useState<readonly SearchResult[]>([]);
+  const [results, setResults] = useState<readonly SearchResult[]>(() => {
+    const q = (initialInput ?? '').trim();
+    return q ? (getHostViewCache(host).searchResultsByKey.get(`combined::${q}`) ?? []) : [];
+  });
   const [searching, setSearching] = useState(false);
   const [resolving, setResolving] = useState(false);
 
@@ -109,12 +113,31 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
   const trimmed = input.trim();
   const isUrlLike = looksLikeUrlInput(trimmed);
 
+  const handleSelectSource = useCallback(
+    (nextSource: SourceId) => {
+      setSource(nextSource);
+      const q = input.trim();
+      if (q) {
+        const cached = getHostViewCache(host).searchResultsByKey.get(`${nextSource}::${q}`);
+        if (cached !== undefined) {
+          setResults(cached);
+        }
+      }
+    },
+    [host, input],
+  );
+
   // Debounced federated search when input is non-empty text
   useEffect(() => {
     if (!trimmed) {
       setResults([]);
       setSearching(false);
       return;
+    }
+    const cacheKey = `${source}::${trimmed}`;
+    const cached = getHostViewCache(host).searchResultsByKey.get(cacheKey);
+    if (cached !== undefined) {
+      setResults(cached);
     }
     const ctrl = new AbortController();
     setSearching(true);
@@ -123,13 +146,16 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
         .query(trimmed, source, ctrl.signal)
         .then((items) => {
           if (!ctrl.signal.aborted) {
+            getHostViewCache(host).searchResultsByKey.set(cacheKey, items);
             setResults(items);
             setSearching(false);
           }
         })
         .catch(() => {
           if (!ctrl.signal.aborted) {
-            setResults([]);
+            if (!getHostViewCache(host).searchResultsByKey.has(cacheKey)) {
+              setResults([]);
+            }
             setSearching(false);
           }
         });
@@ -244,14 +270,14 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
                 key={chip.id}
                 selected={source === chip.id}
                 testId={`source-chip-${chip.id}`}
-                onClick={() => setSource(chip.id)}
+                onClick={() => handleSelectSource(chip.id)}
               >
                 {t(chip.labelKey)}
               </Chip>
             ))}
           </div>
 
-          {searching ? (
+          {searching && results.length === 0 ? (
             <div className="m-empty" data-testid="add-searching">
               {t('add.searching')}
             </div>

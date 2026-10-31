@@ -14,8 +14,21 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     await screen.findByText('Syntax & Signal');
     fireEvent.click(screen.getByTestId('nav-rail-queue'));
 
-    expect(await screen.findByTestId('queue-screen')).toBeInTheDocument();
-    expect(await screen.findByTestId('queue-header-title')).toHaveTextContent(/Queue · 3 episodes ·/);
+    // Queue list and rows render synchronously on the very first render pass (frame 0) without waitFor or flashing queue-empty
+    expect(screen.getByTestId('queue-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-list')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-row-0')).toBeInTheDocument();
+    expect(screen.queryByTestId('queue-empty')).not.toBeInTheDocument();
+    expect(screen.getByTestId('queue-header-title')).toHaveTextContent(/Queue · 3 episodes ·/);
+
+    // Switching Queue -> Subscriptions -> Queue also preserves both lists synchronously on frame 0
+    fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
+    expect(screen.getByTestId('subs-grid')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-timeline-list')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    expect(screen.getByTestId('queue-list')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-row-0')).toBeInTheDocument();
+    expect(screen.queryByTestId('queue-empty')).not.toBeInTheDocument();
     // Top-right queue overflow menu is removed in v0.1.6
     expect(screen.queryByTestId('queue-overflow-btn')).not.toBeInTheDocument();
 

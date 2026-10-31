@@ -38,11 +38,15 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       screen.getByTestId(`feed-tile-${mdr.feedKey}`).querySelector('.m-podcast-tile__menu'),
     ).toBeNull();
 
-    // Direct top-right Settings button navigates to Settings and back to Subscriptions
+    // Direct top-right Settings button navigates to Settings and back to Subscriptions synchronously on frame 0 without clearing list
     fireEvent.click(screen.getByTestId('subs-settings-btn'));
-    expect(await screen.findByTestId('settings-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('settings-screen')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
-    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('subscriptions-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-grid')).toBeInTheDocument();
+    expect(screen.getByText('Syntax & Signal')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-timeline-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('subs-empty')).not.toBeInTheDocument();
 
     // Manual refresh button works
     fireEvent.click(screen.getByTestId('subs-refresh-btn'));
@@ -244,6 +248,25 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     fireEvent.click(expandToggle);
     expect(expandToggle).toHaveTextContent('Show all (8)');
     expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(6);
+
+    // Re-expand all 8 and verify switching tabs (Subscriptions -> Queue -> Settings -> Subscriptions) preserves expanded state & renders synchronously on frame 0
+    fireEvent.click(expandToggle);
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    expect(screen.getByTestId('queue-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-list')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-row-0')).toBeInTheDocument();
+    expect(screen.queryByTestId('queue-empty')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('nav-rail-settings'));
+    expect(screen.getByTestId('settings-screen')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
+    expect(screen.getByTestId('subscriptions-screen')).toBeInTheDocument();
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+    expect(screen.getByTestId('subs-timeline-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('subs-empty')).not.toBeInTheDocument();
   });
 
   it('localizes timeline and expandable subscriptions labels in zh-CN', async () => {

@@ -34,19 +34,19 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { preloadArtworkUrls } from '../../lib/artwork-cache';
 import { showSnackbar } from '../../stores/snackbar';
+import {
+  DEFAULT_TIMELINE_LIMIT,
+  getHostViewCache,
+  recomputeHostTimelineAndDownloads,
+  type TimelineEpisodeItem,
+} from '../../stores/view-cache';
 import { openOpmlImportWithXml } from '../add/OpmlImport';
 import { EpisodeRow } from './EpisodeRow';
 
 const GRID_COLLAPSE_THRESHOLD = 6;
-const TIMELINE_PAGE_SIZE = 30;
+const TIMELINE_PAGE_SIZE = DEFAULT_TIMELINE_LIMIT;
 const LONG_PRESS_DELAY_MS = 450;
 const LONG_PRESS_MOVE_SLOP_PX = 10;
-
-interface TimelineEpisodeItem {
-  readonly row: EpisodeRowModel;
-  readonly feed: Feed;
-  readonly allowDownloads: boolean;
-}
 
 interface ActiveFeedContextMenu {
   readonly feed: Feed;
@@ -164,13 +164,17 @@ export function SubscriptionsGrid() {
   const openDownloads = useRouteStore((s) => s.openDownloads);
   const setTab = useRouteStore((s) => s.setTab);
 
-  const [feeds, setFeeds] = useState<readonly Feed[]>([]);
-  const [timelineItems, setTimelineItems] = useState<readonly TimelineEpisodeItem[]>([]);
-  const [downloadedCount, setDownloadedCount] = useState(0);
-  const [subsExpanded, setSubsExpanded] = useState(false);
-  const [timelineLimit, setTimelineLimit] = useState(TIMELINE_PAGE_SIZE);
+  const [feeds, setFeeds] = useState<readonly Feed[]>(() => getHostViewCache(host).feeds);
+  const [timelineItems, setTimelineItems] = useState<readonly TimelineEpisodeItem[]>(
+    () => getHostViewCache(host).timelineItems,
+  );
+  const [downloadedCount, setDownloadedCount] = useState(
+    () => getHostViewCache(host).downloadedCount,
+  );
+  const [subsExpanded, setSubsExpanded] = useState(() => getHostViewCache(host).subsExpanded);
+  const [timelineLimit, setTimelineLimit] = useState(() => getHostViewCache(host).timelineLimit);
   const [contextMenu, setContextMenu] = useState<ActiveFeedContextMenu | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !getHostViewCache(host).timelineLoaded);
   const [refreshing, setRefreshing] = useState(false);
   const [authFailedKeys, setAuthFailedKeys] = useState<ReadonlySet<FeedKey>>(() => new Set());
   const [dragOver, setDragOver] = useState(false);
@@ -179,18 +183,61 @@ export function SubscriptionsGrid() {
   const loadSeqRef = useRef(0);
   const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
 
+  useEffect(() => {
+    getHostViewCache(host).subsExpanded = subsExpanded;
+  }, [host, subsExpanded]);
+
+  useEffect(() => {
+    getHostViewCache(host).timelineLimit = timelineLimit;
+  }, [host, timelineLimit]);
+
   const loadFeedsAndTimeline = useCallback(async () => {
     const seq = ++loadSeqRef.current;
+    const viewCache = getHostViewCache(host);
+    if (!viewCache.queueLoaded) {
+      void host.queue
+        .list()
+        .then((q) => {
+          const c = getHostViewCache(host);
+          if (!c.queueLoaded) {
+            c.queueRows = q;
+            c.queueLoaded = true;
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (viewCache.syncStatus === null) {
+      void host.sync
+        .status()
+        .then((st) => {
+          const c = getHostViewCache(host);
+          if (c.syncStatus === null) {
+            c.syncStatus = st;
+          }
+        })
+        .catch(() => undefined);
+    }
+
     try {
       const list = await host.feeds.list();
       if (seq !== loadSeqRef.current) return;
-      setFeeds(list);
+      const feedsByKey = new Map<FeedKey, Feed>(list.map((f) => [f.feedKey, f]));
+      viewCache.feeds = list;
+      viewCache.feedsByKey = feedsByKey;
+      viewCache.feedsLoaded = true;
       preloadArtworkUrls(
         list.map((f) => f.imageUrl),
         allowProxy,
       );
 
       if (list.length === 0) {
+        viewCache.episodesByFeed.clear();
+        viewCache.timelineItems = [];
+        viewCache.downloadedCount = 0;
+        viewCache.downloadedItems = [];
+        viewCache.timelineLoaded = true;
+        viewCache.downloadsLoaded = true;
+        setFeeds([]);
         setTimelineItems([]);
         setDownloadedCount(0);
         return;
@@ -200,41 +247,42 @@ export function SubscriptionsGrid() {
         list.map(async (feed) => {
           try {
             const page = await host.episodes.list(feed.feedKey, 'all');
-            const allowDownloads = Boolean(host.info.capabilities.downloads && feed.kind !== 'LOCAL');
-            return page.items.map(
-              (row): TimelineEpisodeItem => ({
-                row,
-                feed,
-                allowDownloads,
-              }),
-            );
+            return { feed, items: page.items };
           } catch {
-            return [] as readonly TimelineEpisodeItem[];
+            return { feed, items: [] as readonly EpisodeRowModel[] };
           }
         }),
       );
 
       if (seq !== loadSeqRef.current) return;
-      const allItems = perFeed.flat();
-      const dlCount = allItems.filter(
-        (item) => item.allowDownloads && item.row.episode.downloadState === 'DONE',
-      ).length;
-      setDownloadedCount(dlCount);
 
-      const mergedUnplayed = allItems
-        .filter(
-          (item) =>
-            item.row.progress?.state !== 'PLAYED' ||
-            inlineUndoKeysRef.current.has(item.row.episode.episodeKey),
-        )
-        .sort((a, b) => {
-          const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
-          if (pubDiff !== 0) return pubDiff;
-          return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
-        });
-      setTimelineItems(mergedUnplayed);
+      const activeFeedKeys = new Set(list.map((f) => f.feedKey));
+      for (const existingKey of viewCache.episodesByFeed.keys()) {
+        if (!activeFeedKeys.has(existingKey)) {
+          viewCache.episodesByFeed.delete(existingKey);
+        }
+      }
+      for (const { feed, items } of perFeed) {
+        viewCache.episodesByFeed.set(feed.feedKey, items);
+      }
+
+      const derived = recomputeHostTimelineAndDownloads(
+        host,
+        list,
+        viewCache.episodesByFeed,
+        inlineUndoKeysRef.current,
+      );
+      viewCache.timelineItems = derived.timelineItems;
+      viewCache.downloadedCount = derived.downloadedCount;
+      viewCache.downloadedItems = derived.downloadedItems;
+      viewCache.timelineLoaded = true;
+      viewCache.downloadsLoaded = true;
+
+      setFeeds(list);
+      setDownloadedCount(derived.downloadedCount);
+      setTimelineItems(derived.timelineItems);
       preloadArtworkUrls(
-        mergedUnplayed
+        derived.timelineItems
           .slice(0, TIMELINE_PAGE_SIZE)
           .map((item) => item.row.episode.imageUrl ?? item.feed.imageUrl),
         allowProxy,
@@ -251,6 +299,16 @@ export function SubscriptionsGrid() {
   }, [loadFeedsAndTimeline]);
 
   useHostEvents((ev) => {
+    if (ev.type === 'queue-changed') {
+      void host.queue
+        .list()
+        .then((q) => {
+          const c = getHostViewCache(host);
+          c.queueRows = q;
+          c.queueLoaded = true;
+        })
+        .catch(() => undefined);
+    }
     if (
       ev.type === 'feeds-changed' ||
       ev.type === 'episodes-changed' ||
@@ -431,7 +489,13 @@ export function SubscriptionsGrid() {
                   className="m-subs-expand-btn"
                   aria-expanded={subsExpanded}
                   data-testid="subs-expand-toggle"
-                  onClick={() => setSubsExpanded((v) => !v)}
+                  onClick={() =>
+                    setSubsExpanded((v) => {
+                      const next = !v;
+                      getHostViewCache(host).subsExpanded = next;
+                      return next;
+                    })
+                  }
                 >
                   <span>
                     {subsExpanded
@@ -455,11 +519,11 @@ export function SubscriptionsGrid() {
                 )}
               </div>
 
-              {timelineItems.length === 0 ? (
+              {!loading && timelineItems.length === 0 ? (
                 <div className="m-empty" style={{ padding: '24px 12px' }} data-testid="subs-timeline-empty">
                   {t('detail.noEpisodes')}
                 </div>
-              ) : (
+              ) : timelineItems.length > 0 ? (
                 <>
                   <div className="m-episode-list" data-testid="subs-timeline-list">
                     {timelineItems.slice(0, timelineLimit).map((item) => (
@@ -476,9 +540,13 @@ export function SubscriptionsGrid() {
                         }}
                         onRemove={(epKey) => {
                           inlineUndoKeysRef.current.delete(epKey);
-                          setTimelineItems((prev) =>
-                            prev.filter((entry) => entry.row.episode.episodeKey !== epKey),
-                          );
+                          setTimelineItems((prev) => {
+                            const next = prev.filter(
+                              (entry) => entry.row.episode.episodeKey !== epKey,
+                            );
+                            getHostViewCache(host).timelineItems = next;
+                            return next;
+                          });
                         }}
                         onUndoRemove={(epKey) => {
                           inlineUndoKeysRef.current.delete(epKey);
@@ -495,14 +563,20 @@ export function SubscriptionsGrid() {
                       <Button
                         variant="tonal"
                         data-testid="subs-timeline-load-more"
-                        onClick={() => setTimelineLimit((n) => n + TIMELINE_PAGE_SIZE)}
+                        onClick={() =>
+                          setTimelineLimit((n) => {
+                            const next = n + TIMELINE_PAGE_SIZE;
+                            getHostViewCache(host).timelineLimit = next;
+                            return next;
+                          })
+                        }
                       >
                         {t('subs.loadMoreTimeline')}
                       </Button>
                     </div>
                   )}
                 </>
-              )}
+              ) : null}
             </section>
           )}
         </>

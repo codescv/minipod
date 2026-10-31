@@ -14,6 +14,7 @@ import { useT } from '../../i18n';
 import { formatBytes, formatRelativeMinutes } from '../../lib/format';
 import { useSettingsStore } from '../../stores/settings';
 import { showSnackbar } from '../../stores/snackbar';
+import { getHostViewCache } from '../../stores/view-cache';
 import { useUpdateStore } from '../updater/updater';
 
 const REFRESH_OPTIONS: readonly AppSettings['backgroundRefreshHours'][] = [0, 1, 3, 6, 12, 24];
@@ -29,7 +30,9 @@ export function SettingsPage() {
   const openCloudSync = useRouteStore((s) => s.openCloudSync);
   const setOpmlImportOpen = useRouteStore((s) => s.setOpmlImportOpen);
 
-  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(
+    () => getHostViewCache(host).syncStatus,
+  );
   const [syncingNow, setSyncingNow] = useState(false);
   const [deviceDialogOpen, setDeviceDialogOpen] = useState(false);
   const [deviceDraft, setDeviceDraft] = useState(settings.sync.deviceName);
@@ -50,6 +53,7 @@ export function SettingsPage() {
   const loadStatus = useCallback(async () => {
     try {
       const st = await host.sync.status();
+      getHostViewCache(host).syncStatus = st;
       setSyncStatus(st);
     } catch {
       // ignore
@@ -62,6 +66,7 @@ export function SettingsPage() {
 
   useHostEvents((ev) => {
     if (ev.type === 'sync-status') {
+      getHostViewCache(host).syncStatus = ev.status;
       setSyncStatus(ev.status);
     }
   });
@@ -107,6 +112,7 @@ export function SettingsPage() {
     setSyncingNow(true);
     try {
       const next = await host.sync.syncNow();
+      getHostViewCache(host).syncStatus = next;
       setSyncStatus(next);
     } finally {
       setSyncingNow(false);

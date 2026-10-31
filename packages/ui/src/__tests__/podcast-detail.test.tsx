@@ -12,31 +12,33 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
     const { host, engine } = renderMiniPod({ width: 1024, videoCapable: false });
 
     fireEvent.click(await screen.findByText('Syntax & Signal'));
-    expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    // Opening a subscribed podcast from SubscriptionsGrid renders hero and episodes synchronously on frame 0 without flashing detail-empty
+    expect(screen.getByTestId('podcast-detail-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('detail-episode-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('detail-empty')).not.toBeInTheDocument();
 
-    // All 4 initial episodes visible
-    expect(await screen.findByText(/42: Zero-Backend Sync/)).toBeInTheDocument();
+    // All 4 initial episodes visible synchronously on frame 0
+    expect(screen.getByText(/42: Zero-Backend Sync/)).toBeInTheDocument();
     expect(screen.getByText(/41: Parsing 15 Years/)).toBeInTheDocument();
     expect(screen.getByText(/40: Live Studio Walkthrough/)).toBeInTheDocument();
     expect(screen.getByText(/39: SQLite WAL Mode/)).toBeInTheDocument();
 
-    // Filter `Unplayed` hides played episode 41
+    // Filter `Unplayed` hides played episode 41 synchronously on the very first render pass
     fireEvent.click(screen.getByTestId('filter-chip-unplayed'));
-    await waitFor(() => {
-      expect(screen.queryByText(/41: Parsing 15 Years/)).not.toBeInTheDocument();
-    });
+    expect(screen.queryByText(/41: Parsing 15 Years/)).not.toBeInTheDocument();
     expect(screen.getByText(/42: Zero-Backend Sync/)).toBeInTheDocument();
+    expect(screen.getByTestId('detail-episode-list')).toBeInTheDocument();
 
-    // Filter `Downloaded` shows only episode 42 (`DONE`)
+    // Filter `Downloaded` shows only episode 42 (`DONE`) synchronously on the very first render pass
     fireEvent.click(screen.getByTestId('filter-chip-downloaded'));
-    await waitFor(() => {
-      expect(screen.queryByText(/39: SQLite WAL Mode/)).not.toBeInTheDocument();
-    });
+    expect(screen.queryByText(/39: SQLite WAL Mode/)).not.toBeInTheDocument();
     expect(screen.getByText(/42: Zero-Backend Sync/)).toBeInTheDocument();
+    expect(screen.getByTestId('detail-episode-list')).toBeInTheDocument();
 
-    // Switch back to `All`
+    // Switch back to `All` synchronously on the very first render pass
     fireEvent.click(screen.getByTestId('filter-chip-all'));
-    expect(await screen.findByText(/39: SQLite WAL Mode/)).toBeInTheDocument();
+    expect(screen.getByText(/39: SQLite WAL Mode/)).toBeInTheDocument();
+    expect(screen.getByText(/41: Parsing 15 Years/)).toBeInTheDocument();
 
     const feeds = await host.feeds.list();
     const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;

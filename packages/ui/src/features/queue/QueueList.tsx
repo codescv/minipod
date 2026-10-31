@@ -27,6 +27,7 @@ import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
+import { getHostViewCache } from '../../stores/view-cache';
 
 interface PendingQueueInlineUndo {
   readonly epKey: EpisodeKey;
@@ -62,8 +63,11 @@ export function QueueList() {
   const player = usePlayer();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
-  const [rows, setRows] = useState<readonly QueueRow[]>([]);
-  const [feedsByKey, setFeedsByKey] = useState<ReadonlyMap<FeedKey, Feed>>(() => new Map());
+  const [rows, setRows] = useState<readonly QueueRow[]>(() => getHostViewCache(host).queueRows);
+  const [feedsByKey, setFeedsByKey] = useState<ReadonlyMap<FeedKey, Feed>>(
+    () => getHostViewCache(host).feedsByKey,
+  );
+  const [loading, setLoading] = useState(() => !getHostViewCache(host).queueLoaded);
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
   const [dragDeltaY, setDragDeltaY] = useState(0);
@@ -89,20 +93,30 @@ export function QueueList() {
   useEffect(() => clearUndoTimer, [clearUndoTimer]);
 
   const loadQueue = useCallback(async () => {
-    const [q, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
-    setRows(q);
-    const map = new Map<FeedKey, Feed>();
-    for (const f of fList) {
-      map.set(f.feedKey, f);
+    try {
+      const [q, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
+      const map = new Map<FeedKey, Feed>();
+      for (const f of fList) {
+        map.set(f.feedKey, f);
+      }
+      const viewCache = getHostViewCache(host);
+      viewCache.queueRows = q;
+      viewCache.queueLoaded = true;
+      viewCache.feeds = fList;
+      viewCache.feedsByKey = map;
+      viewCache.feedsLoaded = true;
+      setRows(q);
+      setFeedsByKey(map);
+      preloadArtworkUrls(
+        [
+          ...fList.map((f) => f.imageUrl),
+          ...q.map((r) => r.episode.imageUrl ?? r.entry.stub?.imageUrl),
+        ],
+        shouldUseImageProxy(host.info.platform),
+      );
+    } finally {
+      setLoading(false);
     }
-    setFeedsByKey(map);
-    preloadArtworkUrls(
-      [
-        ...fList.map((f) => f.imageUrl),
-        ...q.map((r) => r.episode.imageUrl ?? r.entry.stub?.imageUrl),
-      ],
-      shouldUseImageProxy(host.info.platform),
-    );
   }, [host]);
 
   useEffect(() => {
@@ -133,6 +147,7 @@ export function QueueList() {
       const beforeKey: EpisodeKey | null = afterItem ? afterItem.episode.episodeKey : null;
 
       setRows(copy);
+      getHostViewCache(host).queueRows = copy;
       await host.queue.move(moved.episode.episodeKey, beforeKey);
       await loadQueue();
     },
@@ -491,12 +506,12 @@ export function QueueList() {
         </h1>
       </header>
 
-      {rows.length === 0 && !pendingUndo ? (
+      {!loading && rows.length === 0 && !pendingUndo ? (
         <div className="m-empty" data-testid="queue-empty">
           <Icon name="queue" size={44} />
           <div>{t('queue.empty')}</div>
         </div>
-      ) : (
+      ) : rows.length > 0 || pendingUndo ? (
         <div ref={listRef} style={{ display: 'flex', flexDirection: 'column' }} data-testid="queue-list">
           {rows.map((r, idx) => {
             const epKey = r.episode.episodeKey;
@@ -619,7 +634,7 @@ export function QueueList() {
             </div>
           )}
         </div>
-      )}
+      ) : null}
 
       <ContextMenu
         open={activeContextMenu !== null && contextMenuItems.length > 0}

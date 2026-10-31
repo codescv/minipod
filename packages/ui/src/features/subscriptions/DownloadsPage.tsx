@@ -5,27 +5,26 @@
  * - Supports single-episode delete (via long-press context menu `ep-download-*` or swipe-left) and `Delete all`.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { EpisodeRow as EpisodeRowModel, Feed } from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
 import { Button, Icon, IconButton } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
+import { getHostViewCache, type DownloadedEpisodeItem } from '../../stores/view-cache';
 import { EpisodeRow } from './EpisodeRow';
-
-interface DownloadedEpisodeItem {
-  readonly row: EpisodeRowModel;
-  readonly feed: Feed;
-}
 
 export function DownloadsPage() {
   const host = useHost();
   const t = useT();
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
 
-  const [items, setItems] = useState<readonly DownloadedEpisodeItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [items, setItems] = useState<readonly DownloadedEpisodeItem[]>(
+    () => getHostViewCache(host).downloadedItems,
+  );
+  const [loading, setLoading] = useState(
+    () => !getHostViewCache(host).downloadsLoaded && !getHostViewCache(host).timelineLoaded,
+  );
   const [deletingAll, setDeletingAll] = useState(false);
   const seqRef = useRef(0);
 
@@ -33,12 +32,24 @@ export function DownloadsPage() {
     const seq = ++seqRef.current;
     try {
       if (!host.info.capabilities.downloads) {
-        if (seq === seqRef.current) setItems([]);
+        if (seq === seqRef.current) {
+          const viewCache = getHostViewCache(host);
+          viewCache.downloadedItems = [];
+          viewCache.downloadedCount = 0;
+          viewCache.downloadsLoaded = true;
+          setItems([]);
+        }
         return;
       }
       const feeds = (await host.feeds.list()).filter((f) => f.kind !== 'LOCAL');
       if (feeds.length === 0) {
-        if (seq === seqRef.current) setItems([]);
+        if (seq === seqRef.current) {
+          const viewCache = getHostViewCache(host);
+          viewCache.downloadedItems = [];
+          viewCache.downloadedCount = 0;
+          viewCache.downloadsLoaded = true;
+          setItems([]);
+        }
         return;
       }
 
@@ -61,6 +72,10 @@ export function DownloadsPage() {
         if (pubDiff !== 0) return pubDiff;
         return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
       });
+      const viewCache = getHostViewCache(host);
+      viewCache.downloadedItems = merged;
+      viewCache.downloadedCount = merged.length;
+      viewCache.downloadsLoaded = true;
       setItems(merged);
     } finally {
       if (seq === seqRef.current) {
