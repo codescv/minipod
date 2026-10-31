@@ -71,6 +71,8 @@ export const zhCN = {
   'detail.markPlayed': '标记为已播',
   'detail.markUnplayed': '标记为未播',
   'detail.markedPlayedRemovedSnack': '已标为已播并移除',
+  'detail.swipeHintPlayNext': '下一首播放',
+  'detail.swipeHintMarkPlayed': '标为已播',
   'detail.goToPodcast': '查看播客节目',
   'detail.shareLink': '分享单集链接',
   'detail.openInVideoPlayer': '在外部视频播放器中打开',
@@ -134,6 +136,7 @@ export const zhCN = {
   'queue.moveDown': '下移',
   'queue.markPlayedAndRemove': '标记为已播并移除',
   'queue.remove': '从队列移除',
+  'queue.swipeHintRemove': '从队列移除',
   'queue.removedSnack': '已从队列移除《{title}》',
 
   'player.nothingPlaying': '尚未播放单集',

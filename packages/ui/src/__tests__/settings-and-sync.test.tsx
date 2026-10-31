@@ -78,9 +78,9 @@ describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Them
 
     await screen.findByText('Syntax & Signal');
 
-    // On mobile (< 840px), Settings is accessed from Subscriptions overflow menu
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
-    fireEvent.click(screen.getByTestId('subs-mobile-settings'));
+    // On mobile (< 840px), Settings is accessed directly from the Subscriptions top-right Settings button
+    expect(screen.queryByTestId('subs-overflow-btn')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('subs-settings-btn'));
     expect(await screen.findByTestId('settings-screen')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId('settings-row-provider'));

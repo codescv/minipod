@@ -24,7 +24,20 @@ import {
   type HttpBasicCredentials,
   type HttpClient,
 } from '@minipod/core';
-import { createReadStream, existsSync, openSync, closeSync, readSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 
 export type ParsedByteRange =
@@ -189,6 +202,7 @@ export interface MediaProxyDeps {
   readonly fetchImpl?: typeof fetch;
   readonly http: HttpClient;
   readonly userAgent: string;
+  readonly artworkCacheDir?: string | undefined;
   readonly resolveEpisode: (episodeKey: EpisodeKey) => MediaProxyEpisodeInfo | undefined;
   readonly loadChaptersForEpisode: (episodeKey: EpisodeKey) => Promise<readonly Chapter[]>;
   readonly resolveLocalFeedCover: (feedKey: FeedKey) => { readonly coverPath: string; readonly isAudioFile: boolean } | undefined;
@@ -196,6 +210,36 @@ export interface MediaProxyDeps {
 
 const STREAM_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_PROXIED_IMAGE_BYTES = 15 * 1024 * 1024;
+const MAX_IMAGE_MEMORY_CACHE_ENTRIES = 256;
+
+interface CachedProxiedImage {
+  readonly bytes: Uint8Array;
+  readonly contentType: string;
+  readonly etag: string;
+}
+
+class UpstreamImageError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function matchesIfNoneMatch(
+  ifNoneMatchHeader: string | undefined,
+  etag: string,
+  rawHash: string,
+): boolean {
+  if (!ifNoneMatchHeader || !ifNoneMatchHeader.trim()) return false;
+  for (const part of ifNoneMatchHeader.split(',')) {
+    const token = part.trim().replace(/^W\//i, '').trim();
+    if (token === '*' || token === etag || token === rawHash) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function sniffImageMimeFromBytes(bytes: Uint8Array): string | undefined {
   if (bytes.byteLength >= 8 &&
@@ -274,18 +318,33 @@ export class MediaProxy {
   private readonly http: HttpClient;
   private readonly userAgent: string;
   private readonly deps: MediaProxyDeps;
+  private readonly artworkCacheDir: string | undefined;
   /** Session-scoped cache mapping enclosure URL -> resolved final CDN URL (`ARCHITECTURE.md §3.2`). */
   private readonly resolvedUrlCache = new Map<string, string>();
+  /** In-memory LRU cache of proxied artwork images keyed by SHA-256 hex of normalized URL. */
+  private readonly imageMemoryCache = new Map<string, CachedProxiedImage>();
+  /** Deduplicated in-flight upstream image downloads keyed by SHA-256 hex of normalized URL. */
+  private readonly inFlightImages = new Map<string, Promise<CachedProxiedImage>>();
 
   constructor(deps: MediaProxyDeps) {
     this.deps = deps;
     this.fetchFn = deps.fetchImpl ?? globalThis.fetch;
     this.http = deps.http;
     this.userAgent = deps.userAgent;
+    this.artworkCacheDir = deps.artworkCacheDir;
+    if (this.artworkCacheDir) {
+      try {
+        mkdirSync(this.artworkCacheDir, { recursive: true });
+      } catch {
+        // ignore directory creation failures on read-only paths
+      }
+    }
   }
 
   clearCache(): void {
     this.resolvedUrlCache.clear();
+    this.imageMemoryCache.clear();
+    this.inFlightImages.clear();
   }
 
   private getLocalFilePathForEpisode(ep: MediaProxyEpisodeInfo): string | undefined {
@@ -610,9 +669,100 @@ export class MediaProxy {
     });
   }
 
+  private putImageMemoryCache(hash: string, entry: CachedProxiedImage): void {
+    if (this.imageMemoryCache.has(hash)) {
+      this.imageMemoryCache.delete(hash);
+    }
+    this.imageMemoryCache.set(hash, entry);
+    while (this.imageMemoryCache.size > MAX_IMAGE_MEMORY_CACHE_ENTRIES) {
+      const oldestKey = this.imageMemoryCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.imageMemoryCache.delete(oldestKey);
+    }
+  }
+
+  private readImageDiskCache(hash: string, etag: string): CachedProxiedImage | undefined {
+    if (!this.artworkCacheDir) return undefined;
+    try {
+      const binPath = join(this.artworkCacheDir, `${hash}.bin`);
+      const jsonPath = join(this.artworkCacheDir, `${hash}.json`);
+      if (!existsSync(binPath) || !existsSync(jsonPath)) return undefined;
+      const meta = JSON.parse(readFileSync(jsonPath, 'utf8')) as {
+        readonly contentType?: string;
+      };
+      if (typeof meta.contentType !== 'string' || !meta.contentType.startsWith('image/')) {
+        return undefined;
+      }
+      const bytes = new Uint8Array(readFileSync(binPath));
+      if (bytes.byteLength === 0) return undefined;
+      const entry: CachedProxiedImage = {
+        bytes,
+        contentType: meta.contentType,
+        etag,
+      };
+      this.putImageMemoryCache(hash, entry);
+      return entry;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeImageDiskCache(
+    hash: string,
+    normalizedUrl: string,
+    entry: CachedProxiedImage,
+  ): void {
+    if (!this.artworkCacheDir) return;
+    try {
+      mkdirSync(this.artworkCacheDir, { recursive: true });
+      const binTmp = join(this.artworkCacheDir, `${hash}.bin.tmp.${process.pid}`);
+      const jsonTmp = join(this.artworkCacheDir, `${hash}.json.tmp.${process.pid}`);
+      const binPath = join(this.artworkCacheDir, `${hash}.bin`);
+      const jsonPath = join(this.artworkCacheDir, `${hash}.json`);
+      writeFileSync(binTmp, entry.bytes);
+      renameSync(binTmp, binPath);
+      writeFileSync(
+        jsonTmp,
+        JSON.stringify({
+          url: normalizedUrl,
+          contentType: entry.contentType,
+          byteLength: entry.bytes.byteLength,
+          cachedAt: Date.now(),
+        }),
+        'utf8',
+      );
+      renameSync(jsonTmp, jsonPath);
+    } catch {
+      // ignore disk cache write errors
+    }
+  }
+
+  private buildCachedImageResponse(
+    entry: CachedProxiedImage,
+    method: 'GET' | 'HEAD',
+    ifNoneMatchHeader: string | undefined,
+    rawHash: string,
+  ): Response {
+    const headers: Record<string, string> = {
+      'Content-Type': entry.contentType,
+      'Content-Length': String(entry.bytes.byteLength),
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      ETag: entry.etag,
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (matchesIfNoneMatch(ifNoneMatchHeader, entry.etag, rawHash)) {
+      return new Response(null, { status: 304, headers });
+    }
+    return new Response(
+      method === 'HEAD' ? null : (entry.bytes as unknown as BodyInit),
+      { status: 200, headers },
+    );
+  }
+
   async handleImageProxy(params: {
     readonly url: string | undefined;
     readonly method: 'GET' | 'HEAD';
+    readonly ifNoneMatchHeader?: string | undefined;
     readonly signal?: AbortSignal | undefined;
   }): Promise<Response> {
     const trimmed = params.url?.trim() ?? '';
@@ -630,67 +780,123 @@ export class MediaProxy {
       return new Response('Image URL must use http:// or https://', { status: 400 });
     }
 
+    const normalizedUrl = parsed.toString();
+    const hash = createHash('sha256').update(normalizedUrl).digest('hex');
+    const etag = `"${hash}"`;
+
+    // 1. Check in-memory LRU cache
+    const memHit = this.imageMemoryCache.get(hash);
+    if (memHit) {
+      this.putImageMemoryCache(hash, memHit);
+      return this.buildCachedImageResponse(memHit, params.method, params.ifNoneMatchHeader, hash);
+    }
+
+    // 2. Check persistent disk cache
+    const diskHit = this.readImageDiskCache(hash, etag);
+    if (diskHit) {
+      return this.buildCachedImageResponse(diskHit, params.method, params.ifNoneMatchHeader, hash);
+    }
+
     try {
-      const resp = await this.http({
-        url: parsed.toString(),
-        method: params.method,
-        maxBodyBytes: MAX_PROXIED_IMAGE_BYTES,
-        timeoutMs: 20_000,
-        headers: {
-          Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        },
-        ...(params.signal ? { signal: params.signal } : {}),
-      });
-
-      if (resp.status < 200 || resp.status >= 300) {
-        return new Response(`Upstream image responded with HTTP ${resp.status}`, {
-          status: resp.status === 404 ? 404 : 502,
-        });
-      }
-
       if (params.method === 'HEAD') {
+        const resp = await this.http({
+          url: normalizedUrl,
+          method: 'HEAD',
+          maxBodyBytes: MAX_PROXIED_IMAGE_BYTES,
+          timeoutMs: 20_000,
+          headers: {
+            Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          },
+          ...(params.signal ? { signal: params.signal } : {}),
+        });
+
+        if (resp.status < 200 || resp.status >= 300) {
+          return new Response(`Upstream image responded with HTTP ${resp.status}`, {
+            status: resp.status === 404 ? 404 : 502,
+          });
+        }
+
         const contentType = resolveProxiedImageMime(
           resp.headers['content-type'],
-          resp.finalUrl || parsed.toString(),
+          resp.finalUrl || normalizedUrl,
         );
         if (!contentType) {
           return new Response('Upstream response is not an image', { status: 502 });
         }
         const headers: Record<string, string> = {
           'Content-Type': contentType,
-          'Cache-Control': 'public, max-age=86400',
+          'Cache-Control': 'public, max-age=31536000, immutable',
+          ETag: etag,
           'X-Content-Type-Options': 'nosniff',
         };
         if (resp.headers['content-length']) {
           headers['Content-Length'] = resp.headers['content-length'];
         }
+        if (matchesIfNoneMatch(params.ifNoneMatchHeader, etag, hash)) {
+          return new Response(null, { status: 304, headers });
+        }
         return new Response(null, { status: 200, headers });
       }
 
-      const bytes = await resp.bytes();
-      if (bytes.byteLength === 0) {
-        return new Response('Upstream image body is empty', { status: 502 });
+      // 3. Deduplicate concurrent in-flight upstream image downloads
+      let pending = this.inFlightImages.get(hash);
+      if (!pending) {
+        const task = (async (): Promise<CachedProxiedImage> => {
+          try {
+            const resp = await this.http({
+              url: normalizedUrl,
+              method: 'GET',
+              maxBodyBytes: MAX_PROXIED_IMAGE_BYTES,
+              timeoutMs: 20_000,
+              headers: {
+                Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              },
+            });
+
+            if (resp.status < 200 || resp.status >= 300) {
+              throw new UpstreamImageError(
+                resp.status === 404 ? 404 : 502,
+                `Upstream image responded with HTTP ${resp.status}`,
+              );
+            }
+
+            const bytes = await resp.bytes();
+            if (bytes.byteLength === 0) {
+              throw new UpstreamImageError(502, 'Upstream image body is empty');
+            }
+
+            const contentType = resolveProxiedImageMime(
+              resp.headers['content-type'],
+              resp.finalUrl || normalizedUrl,
+              bytes,
+            );
+            if (!contentType) {
+              throw new UpstreamImageError(502, 'Upstream response is not an image');
+            }
+
+            const entry: CachedProxiedImage = {
+              bytes,
+              contentType,
+              etag,
+            };
+            this.putImageMemoryCache(hash, entry);
+            this.writeImageDiskCache(hash, normalizedUrl, entry);
+            return entry;
+          } finally {
+            this.inFlightImages.delete(hash);
+          }
+        })();
+
+        pending = task;
+        this.inFlightImages.set(hash, task);
       }
 
-      const contentType = resolveProxiedImageMime(
-        resp.headers['content-type'],
-        resp.finalUrl || parsed.toString(),
-        bytes,
-      );
-      if (!contentType) {
-        return new Response('Upstream response is not an image', { status: 502 });
-      }
-
-      return new Response(bytes as unknown as BodyInit, {
-        status: 200,
-        headers: {
-          'Content-Type': contentType,
-          'Content-Length': String(bytes.byteLength),
-          'Cache-Control': 'public, max-age=86400',
-          'X-Content-Type-Options': 'nosniff',
-        },
-      });
+      const entry = await pending;
+      return this.buildCachedImageResponse(entry, params.method, params.ifNoneMatchHeader, hash);
     } catch (err) {
+      if (err instanceof UpstreamImageError) {
+        return new Response(err.message, { status: err.status });
+      }
       if (err instanceof MiniPodError && err.code === 'invalid-url') {
         return new Response(err.message, { status: 400 });
       }

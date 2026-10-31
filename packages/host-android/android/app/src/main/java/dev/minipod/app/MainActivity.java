@@ -4,11 +4,14 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
@@ -20,8 +23,24 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 import com.getcapacitor.BridgeActivity;
+import com.getcapacitor.BridgeWebViewClient;
 import com.getcapacitor.WebViewListener;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 /**
  * Edge-to-edge Capacitor `BridgeActivity` for MiniPod (`ARCHITECTURE.md §3.2`, `§10`).
@@ -35,6 +54,14 @@ import java.util.Locale;
  */
 public class MainActivity extends BridgeActivity {
     private static final int REQ_POST_NOTIFICATIONS = 1001;
+    private static final String ARTWORK_USER_AGENT = "Podcasts/0.1.6";
+    private static final OkHttpClient ARTWORK_HTTP_CLIENT = new OkHttpClient.Builder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build();
+    private static final ConcurrentHashMap<String, Object> ARTWORK_LOCKS = new ConcurrentHashMap<>();
 
     private float safeTopDp = 0f;
     private float safeRightDp = 0f;
@@ -136,6 +163,18 @@ public class MainActivity extends BridgeActivity {
                 WebSettings webSettings = webView.getSettings();
                 webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
                 webSettings.setMediaPlaybackRequiresUserGesture(false);
+                webSettings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                webSettings.setDomStorageEnabled(true);
+                getBridge().setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                    @Override
+                    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                        WebResourceResponse cached = interceptArtworkRequest(request);
+                        if (cached != null) {
+                            return cached;
+                        }
+                        return super.shouldInterceptRequest(view, request);
+                    }
+                });
                 webView.postDelayed(this::syncSafeAreaCssVars, 150);
                 webView.postDelayed(this::syncSafeAreaCssVars, 600);
             }
@@ -221,5 +260,237 @@ public class MainActivity extends BridgeActivity {
         } else {
             moveTaskToBack(true);
         }
+    }
+
+    private WebResourceResponse interceptArtworkRequest(WebResourceRequest request) {
+        if (request == null || request.getUrl() == null) return null;
+        String method = request.getMethod();
+        if (method != null && !"GET".equalsIgnoreCase(method)) return null;
+
+        Uri url = request.getUrl();
+        String path = url.getPath() != null ? url.getPath() : "";
+        boolean isImageProxy = "/api/image-proxy".equals(path);
+        String targetUrl = null;
+
+        if (isImageProxy) {
+            targetUrl = url.getQueryParameter("url");
+        } else {
+            String scheme = url.getScheme();
+            String host = url.getHost();
+            if (("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && host != null
+                && !"localhost".equalsIgnoreCase(host)
+                && !"127.0.0.1".equals(host)
+                && isLikelyImageRequest(request, path)) {
+                targetUrl = url.toString();
+            }
+        }
+
+        if (targetUrl == null || targetUrl.trim().isEmpty()) {
+            return isImageProxy ? buildBadGatewayResponse() : null;
+        }
+        targetUrl = targetUrl.trim();
+        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+            return isImageProxy ? buildBadGatewayResponse() : null;
+        }
+
+        String hash = sha256Hex(targetUrl);
+        if (hash == null) {
+            return isImageProxy ? buildBadGatewayResponse() : null;
+        }
+
+        File cacheDir = new File(getCacheDir(), "artwork-cache");
+        if (!cacheDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            cacheDir.mkdirs();
+        }
+        File binFile = new File(cacheDir, hash + ".bin");
+        File mimeFile = new File(cacheDir, hash + ".mime");
+
+        Object lock = ARTWORK_LOCKS.computeIfAbsent(hash, k -> new Object());
+        try {
+            synchronized (lock) {
+                if (binFile.isFile() && binFile.length() > 0) {
+                    String cachedMime = readSmallTextFile(mimeFile);
+                    if (cachedMime == null || !cachedMime.startsWith("image/")) {
+                        cachedMime = inferMimeFromUrl(targetUrl);
+                    }
+                    return buildCachedArtworkResponse(binFile, cachedMime, hash);
+                }
+
+                Request okReq = new Request.Builder()
+                    .url(targetUrl)
+                    .header("User-Agent", ARTWORK_USER_AGENT)
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .get()
+                    .build();
+
+                try (Response resp = ARTWORK_HTTP_CLIENT.newCall(okReq).execute()) {
+                    if (!resp.isSuccessful()) {
+                        return isImageProxy ? buildBadGatewayResponse() : null;
+                    }
+                    ResponseBody body = resp.body();
+                    if (body == null) {
+                        return isImageProxy ? buildBadGatewayResponse() : null;
+                    }
+                    byte[] bytes = body.bytes();
+                    if (bytes.length == 0) {
+                        return isImageProxy ? buildBadGatewayResponse() : null;
+                    }
+                    String declaredType = resp.header("Content-Type");
+                    String mimeType = resolveArtworkMime(declaredType, targetUrl, bytes);
+                    if (mimeType == null) {
+                        return isImageProxy ? buildBadGatewayResponse() : null;
+                    }
+
+                    File tmpBin = new File(cacheDir, hash + ".bin.tmp." + Thread.currentThread().getId());
+                    try (FileOutputStream fos = new FileOutputStream(tmpBin)) {
+                        fos.write(bytes);
+                    }
+                    if (!tmpBin.renameTo(binFile)) {
+                        try (FileOutputStream fos = new FileOutputStream(binFile)) {
+                            fos.write(bytes);
+                        }
+                        //noinspection ResultOfMethodCallIgnored
+                        tmpBin.delete();
+                    }
+                    try (FileOutputStream mfos = new FileOutputStream(mimeFile)) {
+                        mfos.write(mimeType.getBytes(StandardCharsets.UTF_8));
+                    }
+
+                    return buildCachedArtworkResponse(binFile, mimeType, hash);
+                }
+            }
+        } catch (Exception e) {
+            return isImageProxy ? buildBadGatewayResponse() : null;
+        } finally {
+            ARTWORK_LOCKS.remove(hash, lock);
+        }
+    }
+
+    private static boolean isLikelyImageRequest(WebResourceRequest request, String path) {
+        Map<String, String> headers = request.getRequestHeaders();
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                String k = entry.getKey();
+                String v = entry.getValue();
+                if (k == null || v == null) continue;
+                if ("Sec-Fetch-Dest".equalsIgnoreCase(k) && "image".equalsIgnoreCase(v.trim())) {
+                    return true;
+                }
+                if ("Accept".equalsIgnoreCase(k) && v.trim().toLowerCase(Locale.US).startsWith("image/")) {
+                    return true;
+                }
+            }
+        }
+        String lower = path.toLowerCase(Locale.US);
+        return lower.endsWith(".jpg")
+            || lower.endsWith(".jpeg")
+            || lower.endsWith(".png")
+            || lower.endsWith(".webp")
+            || lower.endsWith(".gif")
+            || lower.endsWith(".avif");
+    }
+
+    private static WebResourceResponse buildCachedArtworkResponse(File binFile, String mimeType, String hash) throws Exception {
+        InputStream stream = new FileInputStream(binFile);
+        Map<String, String> responseHeaders = new HashMap<>();
+        responseHeaders.put("Cache-Control", "public, max-age=31536000, immutable");
+        responseHeaders.put("ETag", "\"" + hash + "\"");
+        responseHeaders.put("Access-Control-Allow-Origin", "*");
+        responseHeaders.put("Content-Length", String.valueOf(binFile.length()));
+        return new WebResourceResponse(mimeType, null, 200, "OK", responseHeaders, stream);
+    }
+
+    private static WebResourceResponse buildBadGatewayResponse() {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Access-Control-Allow-Origin", "*");
+        headers.put("Cache-Control", "no-store");
+        return new WebResourceResponse(
+            "text/plain",
+            "UTF-8",
+            502,
+            "Bad Gateway",
+            headers,
+            new ByteArrayInputStream(new byte[0])
+        );
+    }
+
+    private static String readSmallTextFile(File file) {
+        if (!file.isFile() || file.length() <= 0 || file.length() > 256) return null;
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] buf = new byte[(int) file.length()];
+            int n = fis.read(buf);
+            if (n <= 0) return null;
+            return new String(buf, 0, n, StandardCharsets.UTF_8).trim();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String sha256Hex(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                sb.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String inferMimeFromUrl(String url) {
+        String lower = url.toLowerCase(Locale.US);
+        int q = lower.indexOf('?');
+        if (q >= 0) lower = lower.substring(0, q);
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".webp")) return "image/webp";
+        if (lower.endsWith(".gif")) return "image/gif";
+        if (lower.endsWith(".avif")) return "image/avif";
+        if (lower.endsWith(".svg")) return "image/svg+xml";
+        return "image/jpeg";
+    }
+
+    private static String resolveArtworkMime(String declaredHeader, String url, byte[] bytes) {
+        if (bytes.length >= 8
+            && (bytes[0] & 0xff) == 0x89
+            && bytes[1] == 0x50
+            && bytes[2] == 0x4e
+            && bytes[3] == 0x47) {
+            return "image/png";
+        }
+        if (bytes.length >= 3
+            && (bytes[0] & 0xff) == 0xff
+            && (bytes[1] & 0xff) == 0xd8
+            && (bytes[2] & 0xff) == 0xff) {
+            return "image/jpeg";
+        }
+        if (bytes.length >= 6
+            && bytes[0] == 0x47
+            && bytes[1] == 0x49
+            && bytes[2] == 0x46) {
+            return "image/gif";
+        }
+        if (bytes.length >= 12
+            && bytes[0] == 0x52
+            && bytes[1] == 0x49
+            && bytes[2] == 0x46
+            && bytes[3] == 0x46
+            && bytes[8] == 0x57
+            && bytes[9] == 0x45
+            && bytes[10] == 0x42
+            && bytes[11] == 0x50) {
+            return "image/webp";
+        }
+        if (declaredHeader != null) {
+            String base = declaredHeader.split(";")[0].trim().toLowerCase(Locale.US);
+            if ("image/jpg".equals(base)) return "image/jpeg";
+            if (base.startsWith("image/") && !"image/*".equals(base)) return base;
+            if ("text/html".equals(base) || "application/xhtml+xml".equals(base)) return null;
+        }
+        return inferMimeFromUrl(url);
     }
 }

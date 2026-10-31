@@ -1,20 +1,33 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { shouldUseImageProxy } from '../components/m3';
+import {
+  clearArtworkCacheForTests,
+  getRememberedCandidateIndex,
+  isArtworkLoaded,
+  pinLoadedArtwork,
+  rememberResolvedCandidate,
+} from '../lib/artwork-cache';
 import { renderMiniPod } from './test-helpers';
 
 describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO Back Navigation', () => {
   afterEach(() => {
+    clearArtworkCacheForTests();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it('renders 3 subscribed podcasts in cover grid without unread badges or top-right ⋮ buttons, toggles list view, refreshes, and unsubscribes via context menu', async () => {
+  it('renders 3 subscribed podcasts in grid-only view with direct top-right Settings button (no overflow menu or list toggle), refreshes, and unsubscribes via context menu', async () => {
     const { host } = renderMiniPod({ width: 1024 });
 
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
     expect(screen.getByText('内核茶话会')).toBeInTheDocument();
     expect(screen.getByText('Minimalist Design Radio')).toBeInTheDocument();
     expect(screen.getByTestId('subs-grid')).toBeInTheDocument();
+    expect(screen.queryByTestId('subs-list')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('subs-overflow-btn')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('subs-toggle-layout')).not.toBeInTheDocument();
+    expect(screen.getByTestId('subs-settings-btn')).toBeInTheDocument();
 
     // Strictly zero unread badges and NO top-right `⋮` button on podcast tiles
     expect(screen.queryByText(/unplayed/i)).not.toBeInTheDocument();
@@ -25,17 +38,17 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       screen.getByTestId(`feed-tile-${mdr.feedKey}`).querySelector('.m-podcast-tile__menu'),
     ).toBeNull();
 
-    // Toggle to list view via overflow menu
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
-    fireEvent.click(screen.getByTestId('subs-toggle-layout'));
-    expect(await screen.findByTestId('subs-list')).toBeInTheDocument();
-    expect(screen.queryByTestId(`feed-menu-${mdr.feedKey}`)).not.toBeInTheDocument();
+    // Direct top-right Settings button navigates to Settings and back to Subscriptions
+    fireEvent.click(screen.getByTestId('subs-settings-btn'));
+    expect(await screen.findByTestId('settings-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
 
     // Manual refresh button works
     fireEvent.click(screen.getByTestId('subs-refresh-btn'));
 
-    // Unsubscribe Minimalist Design Radio via right-click context menu
-    fireEvent.contextMenu(screen.getByTestId(`feed-list-item-${mdr.feedKey}`), {
+    // Unsubscribe Minimalist Design Radio via right-click context menu on grid tile
+    fireEvent.contextMenu(screen.getByTestId(`feed-tile-${mdr.feedKey}`), {
       clientX: 240,
       clientY: 180,
     });
@@ -124,21 +137,19 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(screen.queryByTestId('subs-timeline-load-more')).not.toBeInTheDocument();
   });
 
-  it('conditionally displays Manage Downloads in top-right menu ONLY when >= 1 downloaded episode exists and opens DownloadsPage to delete downloads', async () => {
+  it('conditionally displays Manage Downloads button in top-right appbar ONLY when >= 1 downloaded episode exists and opens DownloadsPage to delete downloads with swipe hint', async () => {
     const { host } = renderMiniPod({
       width: 1024,
       hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
     });
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
 
-    // Initially 2 episodes (`ep42` and `kt-17`) have `downloadState === 'DONE'` -> `管理下载 (2)` appears!
-    await waitFor(() => {
-      fireEvent.click(screen.getByTestId('subs-overflow-btn'));
-      expect(screen.getByTestId('subs-manage-downloads')).toHaveTextContent('管理下载 (2)');
-    });
+    // Initially 2 episodes (`ep42` and `kt-17`) have `downloadState === 'DONE'` -> `管理下载 (2)` icon button appears!
+    const manageBtn = await screen.findByTestId('subs-manage-downloads');
+    expect(manageBtn.getAttribute('aria-label')).toBe('管理下载 (2)');
 
     // Open DownloadsPage
-    fireEvent.click(screen.getByTestId('subs-manage-downloads'));
+    fireEvent.click(manageBtn);
     expect(await screen.findByTestId('downloads-screen')).toBeInTheDocument();
     expect(screen.getByTestId('downloads-header-title')).toHaveTextContent('管理下载');
     expect(screen.getByTestId('downloads-count')).toHaveTextContent('2');
@@ -146,11 +157,17 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       2,
     );
 
-    // Swipe-left on the first downloaded row deletes that single download (`2 -> 1`)
+    // Swipe-left on the first downloaded row reveals `删除下载` danger edge hint and deletes that single download (`2 -> 1`)
     const firstDlRow = within(screen.getByTestId('downloads-list')).getAllByTestId(
       /^episode-row-/,
     )[0]!;
+    const firstDlKey = firstDlRow.getAttribute('data-testid')!.replace('episode-row-', '');
     fireEvent.touchStart(firstDlRow, { touches: [{ clientX: 260, clientY: 120 }] });
+    fireEvent.touchMove(firstDlRow, { touches: [{ clientX: 140, clientY: 121 }] });
+    const dlSwipeHint = screen.getByTestId(`swipe-hint-left-${firstDlKey}`);
+    expect(dlSwipeHint).toHaveTextContent('删除已下载文件');
+    expect(dlSwipeHint.getAttribute('data-swipe-armed')).toBe('true');
+
     fireEvent.touchEnd(firstDlRow, { changedTouches: [{ clientX: 120, clientY: 120 }] });
     await waitFor(() => {
       expect(screen.getByTestId('downloads-count')).toHaveTextContent('1');
@@ -163,9 +180,7 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     // Navigate back to Subscriptions -> `subs-manage-downloads` MUST BE HIDDEN when 0 downloads exist!
     fireEvent.click(screen.getByTestId('downloads-back-btn'));
     expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
     expect(screen.queryByTestId('subs-manage-downloads')).not.toBeInTheDocument();
-    fireEvent.keyDown(window, { key: 'Escape' });
 
     // Triggering a download via episode context menu makes `管理下载 (1)` reappear immediately!
     const firstTimelineRow = within(screen.getByTestId('subs-timeline-list')).getAllByTestId(
@@ -178,11 +193,11 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     await waitFor(async () => {
       expect((await host.episodes.get(epKey)).episode.downloadState).toBe('DONE');
     });
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
-    expect(await screen.findByTestId('subs-manage-downloads')).toHaveTextContent('管理下载 (1)');
+    const reappearedBtn = await screen.findByTestId('subs-manage-downloads');
+    expect(reappearedBtn.getAttribute('aria-label')).toBe('管理下载 (1)');
   });
 
-  it('collapses >6 subscriptions in grid mode (and >4 in list mode) with Show all (N) / Show less toggle', async () => {
+  it('collapses >6 subscriptions in grid mode with Show all (N) / Show less toggle', async () => {
     const { host } = renderMiniPod({ width: 1024 });
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
 
@@ -213,12 +228,6 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     fireEvent.click(expandToggle);
     expect(expandToggle).toHaveTextContent('Show all (8)');
     expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(6);
-
-    // Switch to list mode -> collapses to 4 items
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
-    fireEvent.click(screen.getByTestId('subs-toggle-layout'));
-    expect(await screen.findByTestId('subs-list')).toBeInTheDocument();
-    expect(within(screen.getByTestId('subs-list')).getAllByTestId(/^feed-list-item-/).length).toBe(4);
   });
 
   it('localizes timeline and expandable subscriptions labels in zh-CN', async () => {
@@ -346,7 +355,9 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(screen.queryByTestId('subs-context-menu')).not.toBeInTheDocument();
 
     // 3. Regular Menu near bottom-right flips above anchor & clamps inside viewport
-    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
+    fireEvent.click(tile);
+    expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('detail-overflow-btn'));
     const overflowPopup = document.body.querySelector('.m-menu') as HTMLElement | null;
     expect(overflowPopup).not.toBeNull();
     const menuLeft = Number.parseFloat(overflowPopup!.style.left);
@@ -355,6 +366,34 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(menuLeft + 200).toBeLessThanOrEqual(390 - 8);
     expect(menuTop).toBeGreaterThanOrEqual(8);
     expect(menuTop + 112).toBeLessThanOrEqual(844 - 8);
+  });
+
+  it('pins decoded artwork bitmaps in memory, remembers resolved candidate index, and enables image proxy on Android & desktop', async () => {
+    expect(shouldUseImageProxy('desktop')).toBe(true);
+    expect(shouldUseImageProxy('node')).toBe(true);
+    expect(shouldUseImageProxy('android')).toBe(true);
+
+    const testUrl = 'https://cdn.example.org/cover-1.jpg';
+    expect(isArtworkLoaded(testUrl)).toBe(false);
+    pinLoadedArtwork(testUrl);
+    expect(isArtworkLoaded(testUrl)).toBe(true);
+
+    const candidatesKey = `${testUrl}\n/api/image-proxy?url=${encodeURIComponent(testUrl)}`;
+    expect(getRememberedCandidateIndex(candidatesKey)).toBeUndefined();
+    rememberResolvedCandidate(candidatesKey, 1);
+    expect(getRememberedCandidateIndex(candidatesKey)).toBe(1);
+
+    const { host } = renderMiniPod({ width: 1024 });
+    expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
+    const feeds = await host.feeds.list();
+    const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
+    const tileImg = screen.getByTestId(`feed-tile-${syntax.feedKey}`).querySelector('img')!;
+
+    // Triggering load on tile image pins the URL in artwork-cache and switches loading="eager" / decoding="sync"
+    fireEvent.load(tileImg);
+    expect(isArtworkLoaded(tileImg.getAttribute('src'))).toBe(true);
+    expect(tileImg.getAttribute('loading')).toBe('eager');
+    expect(tileImg.getAttribute('decoding')).toBe('sync');
   });
 
   it('shows calm empty state with Find podcasts CTA when there are no subscriptions', async () => {

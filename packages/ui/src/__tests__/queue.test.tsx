@@ -16,6 +16,8 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
 
     expect(await screen.findByTestId('queue-screen')).toBeInTheDocument();
     expect(await screen.findByTestId('queue-header-title')).toHaveTextContent(/Queue · 3 episodes ·/);
+    // Top-right queue overflow menu is removed in v0.1.6
+    expect(screen.queryByTestId('queue-overflow-btn')).not.toBeInTheDocument();
 
     const initialQueue = await host.queue.list();
     expect(initialQueue).toHaveLength(3);
@@ -107,6 +109,13 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       handle0,
       new MouseEvent('pointermove', { bubbles: true, cancelable: true, button: 0, clientX: 16, clientY: 250 }),
     );
+
+    // Live item-following drag: dragged row follows pointer (+120px) while rows 1 & 2 shift UP (-60px)
+    expect(screen.getByTestId('queue-row-0').getAttribute('data-drag-offset-y')).toBe('120');
+    expect(screen.getByTestId('queue-row-0').style.transform).toContain('translate3d(0, 120px, 0)');
+    expect(screen.getByTestId('queue-row-1').getAttribute('data-shift-y')).toBe('-60');
+    expect(screen.getByTestId('queue-row-2').getAttribute('data-shift-y')).toBe('-60');
+
     fireEvent(
       handle0,
       new MouseEvent('pointerup', { bubbles: true, cancelable: true, button: 0, clientX: 16, clientY: 250 }),
@@ -118,6 +127,8 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       expect(reordered[1]?.episode.episodeKey).toBe(secondKey);
       expect(reordered[2]?.episode.episodeKey).toBe(thirdKey);
     });
+    expect(screen.getByTestId('queue-row-0').getAttribute('data-drag-offset-y')).toBe('0');
+    expect(screen.getByTestId('queue-row-1').getAttribute('data-shift-y')).toBe('0');
 
     // Swipe Right (`deltaX > +64px`) on queue row does NOT remove from queue
     const midRow = screen.getByTestId('queue-row-1');
@@ -125,9 +136,17 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     fireEvent.touchEnd(midRow, { changedTouches: [{ clientX: 200, clientY: 190 }] });
     expect(await host.queue.list()).toHaveLength(3);
 
-    // Swipe Left (`deltaX < -64px`) on middle item (index 1) removes from queue + Undo restores original slot!
+    // Swipe Left (`deltaX < -64px`) on middle item (index 1) reveals armed edge hint + removes from queue + Undo restores original slot!
     fireEvent.touchStart(midRow, { touches: [{ clientX: 260, clientY: 190 }] });
+    fireEvent.touchMove(midRow, { touches: [{ clientX: 225, clientY: 191 }] });
+    const removeHintUnarmed = screen.getByTestId(`swipe-hint-left-${secondKey}`);
+    expect(removeHintUnarmed).toHaveTextContent('Remove');
+    expect(removeHintUnarmed.getAttribute('data-swipe-armed')).toBe('false');
+
     fireEvent.touchMove(midRow, { touches: [{ clientX: 150, clientY: 192 }] });
+    const removeHintArmed = screen.getByTestId(`swipe-hint-left-${secondKey}`);
+    expect(removeHintArmed.getAttribute('data-swipe-armed')).toBe('true');
+
     fireEvent.touchEnd(midRow, { changedTouches: [{ clientX: 140, clientY: 192 }] });
 
     await waitFor(async () => {
@@ -141,10 +160,5 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       expect(restored).toHaveLength(3);
       expect(restored[1]?.episode.episodeKey).toBe(secondKey);
     });
-
-    // Clear queue
-    fireEvent.click(screen.getByTestId('queue-overflow-btn'));
-    fireEvent.click(screen.getByTestId('queue-clear-btn'));
-    expect(await screen.findByTestId('queue-empty')).toBeInTheDocument();
   });
 });

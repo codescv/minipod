@@ -55,6 +55,12 @@ patchIfExists('packages/host-node/src/server/context.ts', (src) =>
 patchIfExists('packages/host-android/src/default-deps.ts', (src) =>
   src.replace(/version = '[0-9]+\.[0-9]+\.[0-9]+';/, `version = '${nextVersion}';`),
 );
+patchIfExists('packages/ui/src/host/mock-host.ts', (src) =>
+  src.replace(/appVersion: options\?\.appVersion \?\? '[0-9]+\.[0-9]+\.[0-9]+'/, `appVersion: options?.appVersion ?? '${nextVersion}'`),
+);
+patchIfExists('packages/host-android/android/app/src/main/java/dev/minipod/app/MainActivity.java', (src) =>
+  src.replace(/ARTWORK_USER_AGENT = "Podcasts\/[0-9]+\.[0-9]+\.[0-9]+"/, `ARTWORK_USER_AGENT = "Podcasts/${nextVersion}"`),
+);
 patchIfExists('packages/ui/src/features/updater/updater.ts', (src) =>
   src
     .replace(/currentVersion: '[0-9]+\.[0-9]+\.[0-9]+'/g, `currentVersion: '${nextVersion}'`)

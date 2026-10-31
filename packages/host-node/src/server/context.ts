@@ -83,7 +83,7 @@ import { SettingsStore } from '../settings/store';
 import { NodeSyncService } from '../sync/scheduler-host';
 import { applyNodeUpdate, checkNodeUpdate } from '../updater/self-updater';
 
-export const MINIPOD_VERSION = '0.1.5';
+export const MINIPOD_VERSION = '0.1.6';
 
 const DESKTOP_CAPABILITIES: HostCapabilities = {
   nativeAudio: false,
@@ -417,6 +417,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
     ...(options?.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     http,
     userAgent,
+    artworkCacheDir: isMemory ? undefined : join(dataDir, 'artwork-cache'),
     resolveEpisode: (episodeKey) => {
       const raw = episodesRepo.getRawByKey(episodeKey);
       if (!raw) return undefined;

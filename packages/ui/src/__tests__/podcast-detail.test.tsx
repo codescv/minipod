@@ -134,10 +134,18 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       expect(updated.episode.downloadState).toBe('DONE');
     });
 
-    // Swipe Left (`deltaX < -64px`, right-to-left) on ep 39 -> inserts as Play Next (index 1)
+    // Swipe Left (`deltaX < -64px`, right-to-left) on ep 39 -> reveals Play Next edge hint & inserts as Play Next (index 1)
     const row39Fresh = screen.getByTestId(`episode-row-${ep39.episodeKey}`);
     fireEvent.touchStart(row39Fresh, { touches: [{ clientX: 280, clientY: 120 }] });
+    fireEvent.touchMove(row39Fresh, { touches: [{ clientX: 240, clientY: 121 }] });
+    const leftHintUnarmed = screen.getByTestId(`swipe-hint-left-${ep39.episodeKey}`);
+    expect(leftHintUnarmed).toHaveTextContent('Play next');
+    expect(leftHintUnarmed.getAttribute('data-swipe-armed')).toBe('false');
+
     fireEvent.touchMove(row39Fresh, { touches: [{ clientX: 170, clientY: 122 }] });
+    const leftHintArmed = screen.getByTestId(`swipe-hint-left-${ep39.episodeKey}`);
+    expect(leftHintArmed.getAttribute('data-swipe-armed')).toBe('true');
+
     fireEvent.touchEnd(row39Fresh, { changedTouches: [{ clientX: 160, clientY: 122 }] });
 
     expect(await screen.findByTestId('snackbar')).toHaveTextContent('Playing next');
@@ -146,7 +154,7 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       expect(q[1]?.episode.episodeKey).toBe(ep39.episodeKey);
     });
 
-    // Swipe Right (`deltaX > +64px`, left-to-right) via pointer drag on ep 39 -> marks PLAYED & removes immediately even in `All` filter!
+    // Swipe Right (`deltaX > +64px`, left-to-right) via pointer drag on ep 39 -> reveals Mark Played edge hint, marks PLAYED & removes immediately even in `All` filter!
     const row39BeforeDismiss = screen.getByTestId(`episode-row-${ep39.episodeKey}`);
     fireEvent(
       row39BeforeDismiss,
@@ -156,6 +164,10 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       row39BeforeDismiss,
       new MouseEvent('pointermove', { bubbles: true, button: 0, clientX: 195, clientY: 152 }),
     );
+    const rightHintArmed = screen.getByTestId(`swipe-hint-right-${ep39.episodeKey}`);
+    expect(rightHintArmed).toHaveTextContent('Mark played');
+    expect(rightHintArmed.getAttribute('data-swipe-armed')).toBe('true');
+
     fireEvent(
       row39BeforeDismiss,
       new MouseEvent('pointerup', { bubbles: true, button: 0, clientX: 210, clientY: 152 }),

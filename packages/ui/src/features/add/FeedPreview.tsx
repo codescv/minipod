@@ -486,7 +486,7 @@ function PreviewEpisodeRow({
     }
   };
 
-  const { swipeOffsetX, handlers } = useRowGestures({
+  const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
     onTap: handlePlay,
     onContext: (x, y) => setCtxPos({ x, y }),
     onSwipeLeft: () => {
@@ -517,40 +517,58 @@ function PreviewEpisodeRow({
 
   return (
     <>
-      <div
-        className={cx('m-episode-row', isCurrent && 'is-current', isPlaying && 'is-playing')}
-        role="button"
-        tabIndex={0}
-        aria-haspopup="menu"
-        aria-label={ep.title}
-        data-testid={`preview-ep-row-${idx}`}
-        style={
-          swipeOffsetX !== 0
-            ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
-            : undefined
-        }
-        {...handlers}
-      >
-        <div className="m-episode-row__thumb">
-          <ArtworkImage
-            src={ep.imageUrl}
-            fallbackSrc={preview.parsed.imageUrl}
-            allowProxyFallback={allowProxy}
-            className="m-episode-row__thumb-img"
-            loading="lazy"
-            draggable={false}
-            placeholder={<Icon name="podcasts" size={20} />}
-          />
-        </div>
-        <div className="m-episode-row__body">
-          <div className="m-episode-row__title">{ep.title}</div>
-          {(dateStr || durStr) && (
-            <div className="m-episode-row__meta">
-              {dateStr && <span>{dateStr}</span>}
-              {dateStr && durStr && <span>·</span>}
-              {durStr && <span>{durStr}</span>}
-            </div>
-          )}
+      <div className="m-swipe-container">
+        {swipeDirection === 'left' && (
+          <div
+            aria-hidden="true"
+            className={cx(
+              'm-swipe-hint',
+              'm-swipe-hint--left',
+              'm-swipe-hint--primary',
+              swipeArmed && 'is-armed',
+            )}
+            data-testid={`swipe-hint-left-${epKey}`}
+            data-swipe-armed={swipeArmed ? 'true' : 'false'}
+          >
+            <Icon name="playlistAdd" size={18} />
+            <span>{t('detail.swipeHintPlayNext')}</span>
+          </div>
+        )}
+        <div
+          className={cx('m-episode-row', isCurrent && 'is-current', isPlaying && 'is-playing')}
+          role="button"
+          tabIndex={0}
+          aria-haspopup="menu"
+          aria-label={ep.title}
+          data-testid={`preview-ep-row-${idx}`}
+          style={
+            swipeOffsetX !== 0
+              ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
+              : undefined
+          }
+          {...handlers}
+        >
+          <div className="m-episode-row__thumb">
+            <ArtworkImage
+              src={ep.imageUrl}
+              fallbackSrc={preview.parsed.imageUrl}
+              allowProxyFallback={allowProxy}
+              className="m-episode-row__thumb-img"
+              loading="lazy"
+              draggable={false}
+              placeholder={<Icon name="podcasts" size={20} />}
+            />
+          </div>
+          <div className="m-episode-row__body">
+            <div className="m-episode-row__title">{ep.title}</div>
+            {(dateStr || durStr) && (
+              <div className="m-episode-row__meta">
+                {dateStr && <span>{dateStr}</span>}
+                {dateStr && durStr && <span>·</span>}
+                {durStr && <span>{durStr}</span>}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

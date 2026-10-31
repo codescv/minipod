@@ -73,6 +73,8 @@ export const en: Messages = {
   'detail.markPlayed': 'Mark played',
   'detail.markUnplayed': 'Mark unplayed',
   'detail.markedPlayedRemovedSnack': 'Marked played and removed',
+  'detail.swipeHintPlayNext': 'Play next',
+  'detail.swipeHintMarkPlayed': 'Mark played',
   'detail.goToPodcast': 'Go to podcast',
   'detail.shareLink': 'Share link',
   'detail.openInVideoPlayer': 'Open in video player',
@@ -136,6 +138,7 @@ export const en: Messages = {
   'queue.moveDown': 'Move down',
   'queue.markPlayedAndRemove': 'Mark played & remove',
   'queue.remove': 'Remove from queue',
+  'queue.swipeHintRemove': 'Remove',
   'queue.removedSnack': 'Removed "{title}" from queue',
 
   'player.nothingPlaying': 'Nothing playing',

@@ -185,4 +185,90 @@ describe('MediaProxy & parseRangeHeader', () => {
     expect(await second.text()).toBe('0123456789');
     expect(redirectHits).toBe(1);
   });
+
+  it('caches proxied artwork images in RAM + persistent disk, deduplicates concurrent fetches, and serves ETag / 304', async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'minipod-artwork-cache-'));
+    tempDirs.push(cacheDir);
+
+    let upstreamImageHits = 0;
+    const pngBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    ]);
+
+    const server = createServer((req, res) => {
+      if (req.url === '/cover.png') {
+        upstreamImageHits += 1;
+        setTimeout(() => {
+          res.writeHead(200, {
+            'Content-Type': 'image/png',
+            'Content-Length': String(pngBytes.length),
+          });
+          res.end(pngBytes);
+        }, 25);
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    activeServers.push(server);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const imageUrl = `http://127.0.0.1:${port}/cover.png`;
+
+    const http = createNodeHttpClient();
+    const proxy = new MediaProxy({
+      http,
+      userAgent: 'MiniPod/0.1.6-test',
+      artworkCacheDir: cacheDir,
+      resolveEpisode: () => undefined,
+      loadChaptersForEpisode: async () => [],
+      resolveLocalFeedCover: () => undefined,
+    });
+
+    // Fire 4 concurrent GET requests for the same artwork URL -> deduplicated into 1 upstream fetch
+    const responses = await Promise.all([
+      proxy.handleImageProxy({ url: imageUrl, method: 'GET' }),
+      proxy.handleImageProxy({ url: imageUrl, method: 'GET' }),
+      proxy.handleImageProxy({ url: imageUrl, method: 'GET' }),
+      proxy.handleImageProxy({ url: imageUrl, method: 'GET' }),
+    ]);
+
+    expect(upstreamImageHits).toBe(1);
+    const etag = responses[0]!.headers.get('etag');
+    expect(etag).toMatch(/^"[0-9a-f]{64}"$/);
+
+    for (const r of responses) {
+      expect(r.status).toBe(200);
+      expect(r.headers.get('content-type')).toBe('image/png');
+      expect(r.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+      expect(r.headers.get('etag')).toBe(etag);
+      const body = Buffer.from(await r.arrayBuffer());
+      expect(body.equals(pngBytes)).toBe(true);
+    }
+
+    // Subsequent conditional GET with matching If-None-Match returns 304 without touching upstream
+    const notModified = await proxy.handleImageProxy({
+      url: imageUrl,
+      method: 'GET',
+      ifNoneMatchHeader: etag ?? undefined,
+    });
+    expect(notModified.status).toBe(304);
+    expect(upstreamImageHits).toBe(1);
+
+    // Cold RAM cache (new MediaProxy instance reading from persistent disk artworkCacheDir) serves from disk without upstream hit
+    const proxyFromDisk = new MediaProxy({
+      http,
+      userAgent: 'MiniPod/0.1.6-test',
+      artworkCacheDir: cacheDir,
+      resolveEpisode: () => undefined,
+      loadChaptersForEpisode: async () => [],
+      resolveLocalFeedCover: () => undefined,
+    });
+    const diskHit = await proxyFromDisk.handleImageProxy({ url: imageUrl, method: 'GET' });
+    expect(diskHit.status).toBe(200);
+    expect(diskHit.headers.get('content-type')).toBe('image/png');
+    expect(diskHit.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(Buffer.from(await diskHit.arrayBuffer()).equals(pngBytes)).toBe(true);
+    expect(upstreamImageHits).toBe(1);
+  });
 });

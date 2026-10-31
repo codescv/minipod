@@ -1,6 +1,6 @@
 {
   "name": "@minipod/host-android",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "MiniPod Android standalone host: Capacitor 8 shell around @minipod/ui with an in-WebView PlatformHost (IndexedDB storage, MiniPodPlugin.java for CORS-free HTTP / SAF / native Media3 MediaSessionService playback).",
   "license": "MIT",
   "type": "module",

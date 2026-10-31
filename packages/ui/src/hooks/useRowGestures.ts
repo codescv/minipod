@@ -19,7 +19,9 @@ import {
 export const ROW_LONG_PRESS_DELAY_MS = 450;
 export const ROW_LONG_PRESS_SLOP_PX = 10;
 export const ROW_SWIPE_THRESHOLD_PX = 64;
-const ROW_SWIPE_MAX_VISUAL_PX = 88;
+const ROW_SWIPE_MAX_VISUAL_PX = 116;
+
+export type SwipeDirection = 'left' | 'right' | null;
 
 export interface UseRowGesturesOptions {
   readonly onTap: () => void;
@@ -49,9 +51,12 @@ export function useRowGestures({
   onSwipeRight,
 }: UseRowGesturesOptions): {
   readonly swipeOffsetX: number;
+  readonly swipeDirection: SwipeDirection;
+  readonly swipeArmed: boolean;
   readonly handlers: RowGestureHandlers;
 } {
   const [swipeOffsetX, setSwipeOffsetX] = useState(0);
+  const [swipeArmed, setSwipeArmed] = useState(false);
 
   const callbacksRef = useRef({ onTap, onContext, onSwipeLeft, onSwipeRight });
   callbacksRef.current = { onTap, onContext, onSwipeLeft, onSwipeRight };
@@ -72,12 +77,23 @@ export function useRowGestures({
     }
   }, []);
 
-  const updateVisualOffset = useCallback((dx: number) => {
+  const resetSwipeVisual = useCallback(() => {
+    setSwipeOffsetX(0);
+    setSwipeArmed(false);
+  }, []);
+
+  const updateVisualOffset = useCallback((dx: number, dy: number) => {
     const { onSwipeLeft: canLeft, onSwipeRight: canRight } = callbacksRef.current;
     const minX = canLeft ? -ROW_SWIPE_MAX_VISUAL_PX : 0;
     const maxX = canRight ? ROW_SWIPE_MAX_VISUAL_PX : 0;
     const clamped = Math.max(minX, Math.min(maxX, Math.round(dx * 0.75)));
     setSwipeOffsetX(clamped);
+    const armed =
+      clamped !== 0 &&
+      Math.abs(dx) > ROW_SWIPE_THRESHOLD_PX &&
+      Math.abs(dx) > Math.abs(dy) * 1.5 &&
+      ((dx < 0 && Boolean(canLeft)) || (dx > 0 && Boolean(canRight)));
+    setSwipeArmed(armed);
   }, []);
 
   const finishPointerAt = useCallback(
@@ -85,7 +101,7 @@ export function useRowGestures({
       clearTimer();
       const start = pointerStartRef.current;
       pointerStartRef.current = null;
-      setSwipeOffsetX(0);
+      resetSwipeVisual();
 
       if (cancelled || !start || touchActiveRef.current || recentTouchEndRef.current) {
         return;
@@ -116,7 +132,7 @@ export function useRowGestures({
         suppressClickRef.current = true;
       }
     },
-    [clearTimer],
+    [clearTimer, resetSwipeVisual],
   );
 
   useEffect(() => {
@@ -145,11 +161,11 @@ export function useRowGestures({
         longPressedRef.current = true;
         pointerStartRef.current = null;
         touchStartRef.current = null;
-        setSwipeOffsetX(0);
+        resetSwipeVisual();
         callbacksRef.current.onContext(x, y);
       }, ROW_LONG_PRESS_DELAY_MS);
     },
-    [clearTimer],
+    [clearTimer, resetSwipeVisual],
   );
 
   const handlers: RowGestureHandlers = {
@@ -181,7 +197,7 @@ export function useRowGestures({
       }
       if (!touchActiveRef.current && Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
         didSwipeRef.current = true;
-        updateVisualOffset(dx);
+        updateVisualOffset(dx, dy);
       }
     },
 
@@ -224,7 +240,7 @@ export function useRowGestures({
       }
       if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
         didSwipeRef.current = true;
-        updateVisualOffset(dx);
+        updateVisualOffset(dx, dy);
       }
     },
 
@@ -238,7 +254,7 @@ export function useRowGestures({
       queueMicrotask(() => {
         recentTouchEndRef.current = false;
       });
-      setSwipeOffsetX(0);
+      resetSwipeVisual();
 
       if (longPressedRef.current) {
         if (e.cancelable) {
@@ -280,7 +296,7 @@ export function useRowGestures({
       pointerStartRef.current = null;
       touchActiveRef.current = false;
       longPressedRef.current = false;
-      setSwipeOffsetX(0);
+      resetSwipeVisual();
     },
 
     onClick: (e) => {
@@ -300,7 +316,7 @@ export function useRowGestures({
       clearTimer();
       touchStartRef.current = null;
       pointerStartRef.current = null;
-      setSwipeOffsetX(0);
+      resetSwipeVisual();
       callbacksRef.current.onContext(e.clientX, e.clientY);
     },
 
@@ -317,5 +333,8 @@ export function useRowGestures({
     },
   };
 
-  return { swipeOffsetX, handlers };
+  const swipeDirection: SwipeDirection =
+    swipeOffsetX < 0 ? 'left' : swipeOffsetX > 0 ? 'right' : null;
+
+  return { swipeOffsetX, swipeDirection, swipeArmed, handlers };
 }

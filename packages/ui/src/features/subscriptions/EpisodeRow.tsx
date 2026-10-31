@@ -15,6 +15,7 @@ import {
   cx,
   Icon,
   shouldUseImageProxy,
+  type IconName,
   type MenuEntry,
 } from '../../components/m3';
 import { useRowGestures } from '../../hooks/useRowGestures';
@@ -34,6 +35,9 @@ export interface EpisodeRowProps {
   readonly onRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onUndoRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onSwipeLeftOverride?: (() => void) | undefined;
+  readonly swipeLeftHintLabel?: string | undefined;
+  readonly swipeLeftHintIcon?: IconName | undefined;
+  readonly swipeLeftHintTone?: 'primary' | 'danger' | undefined;
   readonly onChanged: () => void;
 }
 
@@ -46,6 +50,9 @@ export function EpisodeRow({
   onRemove,
   onUndoRemove,
   onSwipeLeftOverride,
+  swipeLeftHintLabel,
+  swipeLeftHintIcon,
+  swipeLeftHintTone,
   onChanged,
 }: EpisodeRowProps) {
   const host = useHost();
@@ -144,7 +151,7 @@ export function EpisodeRow({
     });
   };
 
-  const { swipeOffsetX, handlers } = useRowGestures({
+  const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
     onTap: handlePlayToggle,
     onContext: (x, y) => setCtxPos({ x, y }),
     onSwipeLeft: () => {
@@ -158,6 +165,10 @@ export function EpisodeRow({
       void handleMarkPlayedAndRemove();
     },
   });
+
+  const leftHintLabel = swipeLeftHintLabel ?? t('detail.swipeHintPlayNext');
+  const leftHintIcon: IconName = swipeLeftHintIcon ?? 'playlistAdd';
+  const leftHintTone = swipeLeftHintTone ?? 'primary';
 
   const menuItems: MenuEntry[] = [
     {
@@ -248,49 +259,78 @@ export function EpisodeRow({
 
   return (
     <>
-      <div
-        className={cx(
-          'm-episode-row',
-          isPlayed && 'is-played',
-          isCurrent && 'is-current',
-          isPlaying && 'is-playing',
+      <div className="m-swipe-container">
+        {swipeDirection === 'right' && (
+          <div
+            aria-hidden="true"
+            className={cx('m-swipe-hint', 'm-swipe-hint--right', swipeArmed && 'is-armed')}
+            data-testid={`swipe-hint-right-${episode.episodeKey}`}
+            data-swipe-armed={swipeArmed ? 'true' : 'false'}
+          >
+            <Icon name="check" size={18} />
+            <span>{t('detail.swipeHintMarkPlayed')}</span>
+          </div>
         )}
-        role="button"
-        tabIndex={0}
-        aria-haspopup="menu"
-        aria-label={episode.title}
-        data-testid={`episode-row-${episode.episodeKey}`}
-        style={
-          swipeOffsetX !== 0
-            ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
-            : undefined
-        }
-        {...handlers}
-      >
+        {swipeDirection === 'left' && (
+          <div
+            aria-hidden="true"
+            className={cx(
+              'm-swipe-hint',
+              'm-swipe-hint--left',
+              `m-swipe-hint--${leftHintTone}`,
+              swipeArmed && 'is-armed',
+            )}
+            data-testid={`swipe-hint-left-${episode.episodeKey}`}
+            data-swipe-armed={swipeArmed ? 'true' : 'false'}
+          >
+            <Icon name={leftHintIcon} size={18} />
+            <span>{leftHintLabel}</span>
+          </div>
+        )}
         <div
-          className="m-episode-row__thumb"
-          data-testid={`ep-thumb-${episode.episodeKey}`}
-        >
-          <ArtworkImage
-            src={episode.imageUrl}
-            fallbackSrc={feedImageUrl}
-            allowProxyFallback={allowProxy}
-            className="m-episode-row__thumb-img"
-            loading="lazy"
-            draggable={false}
-            placeholder={<Icon name="podcasts" size={20} />}
-          />
-        </div>
-
-        <div className="m-episode-row__body">
-          <div className="m-episode-row__title">{episode.title}</div>
-          {(dateStr || remStr) && (
-            <div className="m-episode-row__meta">
-              {dateStr && <span>{dateStr}</span>}
-              {dateStr && remStr && <span>·</span>}
-              {remStr && <span>{remStr}</span>}
-            </div>
+          className={cx(
+            'm-episode-row',
+            isPlayed && 'is-played',
+            isCurrent && 'is-current',
+            isPlaying && 'is-playing',
           )}
+          role="button"
+          tabIndex={0}
+          aria-haspopup="menu"
+          aria-label={episode.title}
+          data-testid={`episode-row-${episode.episodeKey}`}
+          style={
+            swipeOffsetX !== 0
+              ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
+              : undefined
+          }
+          {...handlers}
+        >
+          <div
+            className="m-episode-row__thumb"
+            data-testid={`ep-thumb-${episode.episodeKey}`}
+          >
+            <ArtworkImage
+              src={episode.imageUrl}
+              fallbackSrc={feedImageUrl}
+              allowProxyFallback={allowProxy}
+              className="m-episode-row__thumb-img"
+              loading="lazy"
+              draggable={false}
+              placeholder={<Icon name="podcasts" size={20} />}
+            />
+          </div>
+
+          <div className="m-episode-row__body">
+            <div className="m-episode-row__title">{episode.title}</div>
+            {(dateStr || remStr) && (
+              <div className="m-episode-row__meta">
+                {dateStr && <span>{dateStr}</span>}
+                {dateStr && remStr && <span>·</span>}
+                {remStr && <span>{remStr}</span>}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

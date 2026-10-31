@@ -145,6 +145,9 @@ export function DownloadsPage() {
               feedImageUrl={item.feed.imageUrl}
               allowDownloads
               onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
+              swipeLeftHintLabel={t('detail.deleteDownload')}
+              swipeLeftHintIcon="delete"
+              swipeLeftHintTone="danger"
               onSwipeLeftOverride={() => {
                 void host.episodes
                   .deleteDownload(item.row.episode.episodeKey)

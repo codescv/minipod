@@ -607,12 +607,92 @@ button:disabled {
   flex-direction: column;
 }
 
+.m-swipe-container {
+  position: relative;
+  overflow: hidden;
+}
+
+.m-swipe-hint {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+  font: var(--md-sys-typescale-label-medium);
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  z-index: 0;
+  opacity: 0.78;
+  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.m-swipe-hint--left {
+  right: 0;
+  justify-content: flex-end;
+  min-width: 116px;
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.m-swipe-hint--right {
+  left: 0;
+  justify-content: flex-start;
+  min-width: 116px;
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.m-swipe-hint--primary {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.m-swipe-hint--danger {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+
+.m-swipe-hint.is-armed {
+  opacity: 1;
+}
+
+.m-swipe-hint--left.m-swipe-hint--primary.is-armed,
+.m-swipe-hint--left:not(.m-swipe-hint--danger).is-armed {
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+}
+
+.m-swipe-hint--left.m-swipe-hint--danger.is-armed {
+  background: var(--md-sys-color-error);
+  color: var(--md-sys-color-on-error);
+}
+
+.m-swipe-hint--right.is-armed {
+  background: var(--md-sys-color-tertiary);
+  color: var(--md-sys-color-on-tertiary);
+}
+
+.m-swipe-hint .m-icon {
+  transition: transform 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.m-swipe-hint.is-armed .m-icon {
+  transform: scale(1.16);
+}
+
 .m-episode-row {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 10px 4px;
   border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  background: var(--md-sys-color-surface);
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
@@ -622,7 +702,7 @@ button:disabled {
 }
 
 .m-episode-row:hover {
-  background: color-mix(in srgb, var(--md-sys-color-on-surface) 4%, transparent);
+  background: color-mix(in srgb, var(--md-sys-color-on-surface) 4%, var(--md-sys-color-surface));
 }
 
 .m-episode-row.is-played .m-episode-row__title {
@@ -757,6 +837,8 @@ button:disabled {
 
 /* ---- Queue --------------------------------------------------------------- */
 .m-queue-row {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -772,21 +854,15 @@ button:disabled {
 }
 
 .m-queue-row:hover {
-  background: color-mix(in srgb, var(--md-sys-color-on-surface) 4%, transparent);
+  background: color-mix(in srgb, var(--md-sys-color-on-surface) 4%, var(--md-sys-color-surface));
 }
 
 .m-queue-row.is-dragging {
-  opacity: 0.6;
+  opacity: 0.96;
+  z-index: 20;
   background: var(--md-sys-color-surface-container-high);
-}
-
-.m-queue-row.is-drop-target {
-  border-top: 2px solid var(--md-sys-color-primary);
-}
-
-.m-queue-row.is-drop-target.is-drop-target-below {
-  border-top: 0;
-  border-bottom: 2px solid var(--md-sys-color-primary);
+  box-shadow: var(--md-sys-elevation-3);
+  border-radius: var(--md-sys-shape-corner-small);
 }
 
 .m-queue-row__handle {

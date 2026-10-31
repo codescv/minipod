@@ -57,6 +57,7 @@ export function createApiRoutes(host: PlatformHost, mediaProxy: MediaProxy): Hon
     return mediaProxy.handleImageProxy({
       url: rawUrl,
       method,
+      ifNoneMatchHeader: c.req.header('if-none-match'),
       signal: c.req.raw.signal,
     });
   });

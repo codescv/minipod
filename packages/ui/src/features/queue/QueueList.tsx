@@ -1,27 +1,25 @@
 /**
- * Unified Queue screen (`DESIGN.md` §4.5 + `v0.1.5`):
- * - Header `Queue · N episodes · Xh Ym` + `⋮` (*Manage downloads* when non-empty, *Clear queue*, *Refresh*)
+ * Unified Queue screen (`DESIGN.md` §4.5 + `v0.1.6`):
+ * - Header `Queue · N episodes · Xh Ym` (no top-right overflow menu)
  * - Zero inline play or `⋮` row buttons:
  *   - Tap / click row directly plays (or pauses if current)
  *   - Long-press (~450ms) / right-click / `ContextMenu` opens `<ContextMenu testId="queue-context-menu">`
- *   - Swipe-left (`deltaX < -64px`) removes from queue with Undo snackbar restoring original slot
- * - Compact `20×36` drag handle (`queue-handle-*`) with working Pointer Events + Touch drag-to-reorder
- *   (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
+ *   - Swipe-left (`deltaX < -64px`) reveals right-edge `Remove` / `从队列移除` action hint and removes with Undo snackbar
+ * - Compact `20×36` drag handle (`queue-handle-*`) with live item-following Pointer/Touch drag-to-reorder
+ *   and real-time neighbor slot shifting (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
-import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
   ContextMenu,
   cx,
   Icon,
-  Menu,
   nonEmptyUrl,
+  preloadArtworkUrls,
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
-import { useDownloadedCount } from '../../hooks/useDownloadedCount';
 import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
@@ -30,10 +28,24 @@ import { formatHumanDuration, formatShortDate } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar } from '../../stores/snackbar';
 
+interface QueueSlotSnapshot {
+  readonly idx: number;
+  readonly top: number;
+  readonly bottom: number;
+  readonly midY: number;
+  readonly height: number;
+}
+
 interface ActiveHandleDrag {
   fromIdx: number;
   targetIdx: number;
   pointerId: number | null;
+  startY: number;
+  currentY: number;
+  dragRowHeight: number;
+  minDeltaY: number;
+  maxDeltaY: number;
+  slots: readonly QueueSlotSnapshot[];
 }
 
 export function QueueList() {
@@ -41,14 +53,14 @@ export function QueueList() {
   const locale = useLocale();
   const t = useT();
   const player = usePlayer();
-  const openDownloads = useRouteStore((s) => s.openDownloads);
-  const downloadedCount = useDownloadedCount();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const [rows, setRows] = useState<readonly QueueRow[]>([]);
   const [feedsByKey, setFeedsByKey] = useState<ReadonlyMap<FeedKey, Feed>>(() => new Map());
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
+  const [dragDeltaY, setDragDeltaY] = useState(0);
+  const [dragRowHeight, setDragRowHeight] = useState(64);
   const [activeContextMenu, setActiveContextMenu] = useState<{
     readonly idx: number;
     readonly x: number;
@@ -66,6 +78,13 @@ export function QueueList() {
       map.set(f.feedKey, f);
     }
     setFeedsByKey(map);
+    preloadArtworkUrls(
+      [
+        ...fList.map((f) => f.imageUrl),
+        ...q.map((r) => r.episode.imageUrl ?? r.entry.stub?.imageUrl),
+      ],
+      shouldUseImageProxy(host.info.platform),
+    );
   }, [host]);
 
   useEffect(() => {
@@ -105,50 +124,129 @@ export function QueueList() {
   const moveIndexToRef = useRef(moveIndexTo);
   moveIndexToRef.current = moveIndexTo;
 
-  const computeTargetIdx = useCallback((clientY: number, fallbackIdx: number): number => {
-    const container = listRef.current;
-    if (!container || !Number.isFinite(clientY)) return fallbackIdx;
-    const els = Array.from(container.querySelectorAll<HTMLElement>('[data-queue-idx]'));
-    if (els.length === 0) return fallbackIdx;
+  const computeTargetIdx = useCallback(
+    (
+      clientY: number,
+      fallbackIdx: number,
+      slots?: readonly QueueSlotSnapshot[],
+    ): number => {
+      if (!Number.isFinite(clientY)) return fallbackIdx;
 
-    let anyNonZeroHeight = false;
-    let closestIdx = fallbackIdx;
-    let closestDist = Number.POSITIVE_INFINITY;
-
-    for (const el of els) {
-      const idx = Number.parseInt(el.dataset.queueIdx ?? '', 10);
-      if (!Number.isFinite(idx)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.height > 0) {
-        anyNonZeroHeight = true;
+      if (slots && slots.some((s) => s.height > 0)) {
+        let closestIdx = fallbackIdx;
+        let closestDist = Number.POSITIVE_INFINITY;
+        for (const s of slots) {
+          if (s.height > 0 && clientY >= s.top && clientY <= s.bottom) {
+            return s.idx;
+          }
+          const dist = Math.abs(clientY - s.midY);
+          if (dist < closestDist) {
+            closestDist = dist;
+            closestIdx = s.idx;
+          }
+        }
+        return closestIdx;
       }
-      if (rect.height > 0 && clientY >= rect.top && clientY <= rect.bottom) {
-        return idx;
-      }
-      const midY = rect.top + rect.height / 2;
-      const dist = Math.abs(clientY - midY);
-      if (dist < closestDist) {
-        closestDist = dist;
-        closestIdx = idx;
-      }
-    }
 
-    return anyNonZeroHeight ? closestIdx : fallbackIdx;
-  }, []);
+      const container = listRef.current;
+      if (!container) return fallbackIdx;
+      const els = Array.from(container.querySelectorAll<HTMLElement>('[data-queue-idx]'));
+      if (els.length === 0) return fallbackIdx;
 
-  const startHandleDrag = useCallback((idx: number, pointerId: number | null) => {
-    setActiveContextMenu(null);
-    dragStateRef.current = { fromIdx: idx, targetIdx: idx, pointerId };
-    setDraggingIdx(idx);
-    setDropTargetIdx(idx);
-  }, []);
+      let anyNonZeroHeight = false;
+      let closestIdx = fallbackIdx;
+      let closestDist = Number.POSITIVE_INFINITY;
+
+      for (const el of els) {
+        const idx = Number.parseInt(el.dataset.queueIdx ?? '', 10);
+        if (!Number.isFinite(idx)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.height > 0) {
+          anyNonZeroHeight = true;
+        }
+        if (rect.height > 0 && clientY >= rect.top && clientY <= rect.bottom) {
+          return idx;
+        }
+        const midY = rect.top + rect.height / 2;
+        const dist = Math.abs(clientY - midY);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestIdx = idx;
+        }
+      }
+
+      return anyNonZeroHeight ? closestIdx : fallbackIdx;
+    },
+    [],
+  );
+
+  const startHandleDrag = useCallback(
+    (idx: number, pointerId: number | null, clientY: number) => {
+      setActiveContextMenu(null);
+      const slots: QueueSlotSnapshot[] = [];
+      const container = listRef.current;
+      if (container) {
+        const els = Array.from(container.querySelectorAll<HTMLElement>('[data-queue-idx]'));
+        for (const el of els) {
+          const elIdx = Number.parseInt(el.dataset.queueIdx ?? '', 10);
+          if (!Number.isFinite(elIdx)) continue;
+          const rect = el.getBoundingClientRect();
+          slots.push({
+            idx: elIdx,
+            top: rect.top,
+            bottom: rect.bottom,
+            midY: rect.top + rect.height / 2,
+            height: rect.height,
+          });
+        }
+        slots.sort((a, b) => a.idx - b.idx);
+      }
+
+      const fromSlot = slots.find((s) => s.idx === idx);
+      const firstSlot = slots[0];
+      const lastSlot = slots[slots.length - 1];
+      const rowH = fromSlot && fromSlot.height > 0 ? Math.round(fromSlot.height) : 64;
+      const hasRealBounds = Boolean(fromSlot && firstSlot && lastSlot && fromSlot.height > 0);
+      const minDeltaY = hasRealBounds ? firstSlot!.top - fromSlot!.top - 12 : -2000;
+      const maxDeltaY = hasRealBounds ? lastSlot!.bottom - fromSlot!.bottom + 12 : 2000;
+      const safeStartY =
+        Number.isFinite(clientY) && clientY !== 0
+          ? clientY
+          : (fromSlot?.midY ?? (Number.isFinite(clientY) ? clientY : 0));
+
+      dragStateRef.current = {
+        fromIdx: idx,
+        targetIdx: idx,
+        pointerId,
+        startY: safeStartY,
+        currentY: safeStartY,
+        dragRowHeight: rowH,
+        minDeltaY,
+        maxDeltaY,
+        slots,
+      };
+      setDraggingIdx(idx);
+      setDropTargetIdx(idx);
+      setDragDeltaY(0);
+      setDragRowHeight(rowH);
+    },
+    [],
+  );
 
   const updateHandleDrag = useCallback(
     (pointerId: number | null, clientY: number) => {
       const st = dragStateRef.current;
       if (!st) return;
       if (st.pointerId !== null && pointerId !== null && st.pointerId !== pointerId) return;
-      const nextTarget = computeTargetIdx(clientY, st.targetIdx);
+
+      if (Number.isFinite(clientY)) {
+        st.currentY = clientY;
+        const rawDelta = clientY - st.startY;
+        const clampedDelta = Math.max(st.minDeltaY, Math.min(st.maxDeltaY, rawDelta));
+        setDragDeltaY(clampedDelta);
+      }
+
+      const nextTarget = computeTargetIdx(clientY, st.targetIdx, st.slots);
       if (nextTarget !== st.targetIdx) {
         st.targetIdx = nextTarget;
         setDropTargetIdx(nextTarget);
@@ -166,11 +264,12 @@ export function QueueList() {
 
       const finalTarget =
         !cancelled && clientY !== undefined && Number.isFinite(clientY)
-          ? computeTargetIdx(clientY, st.targetIdx)
+          ? computeTargetIdx(clientY, st.targetIdx, st.slots)
           : st.targetIdx;
 
       setDraggingIdx(null);
       setDropTargetIdx(null);
+      setDragDeltaY(0);
 
       if (!cancelled && st.fromIdx !== finalTarget) {
         void moveIndexToRef.current(st.fromIdx, finalTarget);
@@ -272,39 +371,6 @@ export function QueueList() {
         ? t('queue.headerMeta', { count: rows.length, duration: durationLabel })
         : t('queue.headerCountOnly', { count: rows.length });
 
-  const appBarMenu: MenuEntry[] = [
-    ...(downloadedCount > 0
-      ? [
-          {
-            key: 'manage-downloads',
-            label: t('subs.manageDownloads', { count: downloadedCount }),
-            icon: 'downloaded' as const,
-            testId: 'queue-manage-downloads',
-            onSelect: () => openDownloads(),
-          },
-        ]
-      : []),
-    {
-      key: 'clear-queue',
-      label: t('queue.clear'),
-      icon: 'delete',
-      disabled: rows.length === 0,
-      testId: 'queue-clear-btn',
-      onSelect: () => {
-        void host.queue.clear().then(loadQueue);
-      },
-    },
-    {
-      key: 'refresh-queue',
-      label: t('common.refresh'),
-      icon: 'refresh',
-      testId: 'queue-refresh-btn',
-      onSelect: () => {
-        void loadQueue();
-      },
-    },
-  ];
-
   const contextTargetRow = activeContextMenu ? rows[activeContextMenu.idx] : undefined;
   const contextMenuItems: MenuEntry[] =
     activeContextMenu && contextTargetRow
@@ -370,7 +436,6 @@ export function QueueList() {
         <h1 className="m-appbar__title" data-testid="queue-header-title">
           {headerText}
         </h1>
-        <Menu label={t('common.more')} items={appBarMenu} testId="queue-overflow-btn" />
       </header>
 
       {rows.length === 0 ? (
@@ -423,8 +488,11 @@ export function QueueList() {
                 isPlaying={isPlaying}
                 draggingIdx={draggingIdx}
                 dropTargetIdx={dropTargetIdx}
+                dragDeltaY={dragDeltaY}
+                dragRowHeight={dragRowHeight}
                 dragHandleLabel={`${t('queue.dragHandle')} ${r.episode.title}`}
                 dragHandleTitle={t('queue.dragHandle')}
+                swipeLeftHintLabel={t('queue.swipeHintRemove')}
                 onPlay={() => {
                   if (isCurrent) {
                     void player.togglePlayPause();
@@ -477,8 +545,11 @@ function QueueRowItem({
   isPlaying,
   draggingIdx,
   dropTargetIdx,
+  dragDeltaY,
+  dragRowHeight,
   dragHandleLabel,
   dragHandleTitle,
+  swipeLeftHintLabel,
   onPlay,
   onContext,
   onSwipeLeftRemove,
@@ -500,15 +571,18 @@ function QueueRowItem({
   readonly isPlaying: boolean;
   readonly draggingIdx: number | null;
   readonly dropTargetIdx: number | null;
+  readonly dragDeltaY: number;
+  readonly dragRowHeight: number;
   readonly dragHandleLabel: string;
   readonly dragHandleTitle: string;
+  readonly swipeLeftHintLabel: string;
   readonly onPlay: () => void;
   readonly onContext: (x: number, y: number) => void;
   readonly onSwipeLeftRemove: () => void;
   readonly onMoveIndex: (from: number, to: number) => void;
   readonly onSetDragging: (idx: number | null) => void;
   readonly onSetDropTarget: (idx: number | null) => void;
-  readonly onStartHandleDrag: (idx: number, pointerId: number | null) => void;
+  readonly onStartHandleDrag: (idx: number, pointerId: number | null, clientY: number) => void;
   readonly onUpdateHandleDrag: (pointerId: number | null, clientY: number) => void;
   readonly onFinishHandleDrag: (
     pointerId: number | null,
@@ -517,169 +591,225 @@ function QueueRowItem({
   ) => void;
 }) {
   const epKey = row.episode.episodeKey;
-  const { swipeOffsetX, handlers } = useRowGestures({
+  const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
     onTap: onPlay,
     onContext,
     onSwipeLeft: onSwipeLeftRemove,
   });
 
   const isDragging = draggingIdx === idx;
+  const isAnyDragging = draggingIdx !== null;
   const isDropTarget = dropTargetIdx === idx && draggingIdx !== null && draggingIdx !== idx;
-  const dropBelow = isDropTarget && draggingIdx !== null && idx > draggingIdx;
+
+  let shiftY = 0;
+  if (
+    draggingIdx !== null &&
+    dropTargetIdx !== null &&
+    idx !== draggingIdx &&
+    draggingIdx !== dropTargetIdx
+  ) {
+    if (draggingIdx < dropTargetIdx && idx > draggingIdx && idx <= dropTargetIdx) {
+      shiftY = -dragRowHeight;
+    } else if (draggingIdx > dropTargetIdx && idx >= dropTargetIdx && idx < draggingIdx) {
+      shiftY = dragRowHeight;
+    }
+  }
+
+  const roundedDragDeltaY = isDragging ? Math.round(dragDeltaY) : 0;
+
+  let rowStyle: CSSProperties | undefined;
+  if (isDragging) {
+    rowStyle = {
+      transform: `translate3d(0, ${roundedDragDeltaY}px, 0) scale(1.015)`,
+      zIndex: 20,
+      position: 'relative',
+      boxShadow: 'var(--md-sys-elevation-3)',
+      background: 'var(--md-sys-color-surface-container-high)',
+      transition: 'box-shadow 120ms ease, background-color 120ms ease',
+    };
+  } else if (isAnyDragging) {
+    rowStyle = {
+      transform: `translate3d(0, ${shiftY}px, 0)`,
+      transition: 'transform 180ms cubic-bezier(0.2, 0, 0, 1)',
+    };
+  } else if (swipeOffsetX !== 0) {
+    rowStyle = {
+      transform: `translateX(${swipeOffsetX}px)`,
+      transition: 'none',
+    };
+  }
 
   return (
-    <div
-      className={cx(
-        'm-queue-row',
-        isCurrent && 'is-current',
-        isPlaying && 'is-playing',
-        isDragging && 'is-dragging',
-        isDropTarget && 'is-drop-target',
-        dropBelow && 'is-drop-target-below',
+    <div className="m-swipe-container">
+      {swipeDirection === 'left' && !isAnyDragging && (
+        <div
+          aria-hidden="true"
+          className={cx(
+            'm-swipe-hint',
+            'm-swipe-hint--left',
+            'm-swipe-hint--danger',
+            swipeArmed && 'is-armed',
+          )}
+          data-testid={`swipe-hint-left-${epKey}`}
+          data-swipe-armed={swipeArmed ? 'true' : 'false'}
+        >
+          <Icon name="delete" size={18} />
+          <span>{swipeLeftHintLabel}</span>
+        </div>
       )}
-      role="button"
-      tabIndex={0}
-      aria-haspopup="menu"
-      aria-label={row.episode.title}
-      data-testid={`queue-row-${idx}`}
-      data-queue-idx={idx}
-      data-episode-key={epKey}
-      style={
-        swipeOffsetX !== 0
-          ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
-          : undefined
-      }
-      onDragStart={(e) => {
-        onSetDragging(idx);
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', String(idx));
-      }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        onSetDropTarget(idx);
-      }}
-      onDragEnd={() => {
-        onSetDragging(null);
-        onSetDropTarget(null);
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        const rawFrom = e.dataTransfer.getData('text/plain');
-        const from = draggingIdx ?? Number.parseInt(rawFrom, 10);
-        onSetDragging(null);
-        onSetDropTarget(null);
-        if (Number.isFinite(from)) {
-          onMoveIndex(from, idx);
-        }
-      }}
-      onPointerDown={handlers.onPointerDown}
-      onPointerMove={handlers.onPointerMove}
-      onPointerUp={handlers.onPointerUp}
-      onPointerCancel={handlers.onPointerCancel}
-      onTouchStart={handlers.onTouchStart}
-      onTouchMove={handlers.onTouchMove}
-      onTouchEnd={handlers.onTouchEnd}
-      onTouchCancel={handlers.onTouchCancel}
-      onClick={handlers.onClick}
-      onContextMenu={handlers.onContextMenu}
-      onKeyDown={(e) => {
-        if (e.altKey && e.key === 'ArrowUp') {
-          e.preventDefault();
-          onMoveIndex(idx, idx - 1);
-          return;
-        }
-        if (e.altKey && e.key === 'ArrowDown') {
-          e.preventDefault();
-          onMoveIndex(idx, idx + 1);
-          return;
-        }
-        handlers.onKeyDown(e);
-      }}
-    >
+
       <div
-        className="m-queue-row__handle"
-        aria-label={dragHandleLabel}
-        title={dragHandleTitle}
-        data-testid={`queue-handle-${epKey}`}
-        onPointerDown={(e) => {
-          if (typeof e.button === 'number' && e.button > 0) return;
+        className={cx(
+          'm-queue-row',
+          isCurrent && 'is-current',
+          isPlaying && 'is-playing',
+          isDragging && 'is-dragging',
+          isDropTarget && 'is-drop-target',
+          shiftY !== 0 && 'is-shifted',
+        )}
+        role="button"
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={row.episode.title}
+        data-testid={`queue-row-${idx}`}
+        data-queue-idx={idx}
+        data-episode-key={epKey}
+        data-drag-offset-y={roundedDragDeltaY}
+        data-shift-y={shiftY}
+        style={rowStyle}
+        onDragStart={(e) => {
+          onSetDragging(idx);
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', String(idx));
+        }}
+        onDragOver={(e) => {
           e.preventDefault();
-          e.stopPropagation();
-          try {
-            e.currentTarget.setPointerCapture?.(e.pointerId);
-          } catch {
-            // ignore in non-capturing test environments
-          }
-          onStartHandleDrag(idx, e.pointerId);
+          onSetDropTarget(idx);
         }}
-        onPointerMove={(e) => {
-          onUpdateHandleDrag(e.pointerId, e.clientY);
+        onDragEnd={() => {
+          onSetDragging(null);
+          onSetDropTarget(null);
         }}
-        onPointerUp={(e) => {
-          try {
-            e.currentTarget.releasePointerCapture?.(e.pointerId);
-          } catch {
-            // ignore
-          }
-          onFinishHandleDrag(e.pointerId, e.clientY, false);
-        }}
-        onPointerCancel={(e) => {
-          try {
-            e.currentTarget.releasePointerCapture?.(e.pointerId);
-          } catch {
-            // ignore
-          }
-          onFinishHandleDrag(e.pointerId, undefined, true);
-        }}
-        onTouchStart={(e) => {
-          e.stopPropagation();
-          if (draggingIdx === null) {
-            onStartHandleDrag(idx, null);
-          }
-        }}
-        onTouchMove={(e) => {
-          e.stopPropagation();
-          const touch = e.touches[0];
-          if (touch) {
-            onUpdateHandleDrag(null, touch.clientY);
-          }
-        }}
-        onTouchEnd={(e) => {
-          e.stopPropagation();
-          const touch = e.changedTouches[0];
-          onFinishHandleDrag(null, touch?.clientY, false);
-        }}
-        onClick={(e) => {
+        onDrop={(e) => {
           e.preventDefault();
-          e.stopPropagation();
+          const rawFrom = e.dataTransfer.getData('text/plain');
+          const from = draggingIdx ?? Number.parseInt(rawFrom, 10);
+          onSetDragging(null);
+          onSetDropTarget(null);
+          if (Number.isFinite(from)) {
+            onMoveIndex(from, idx);
+          }
+        }}
+        onPointerDown={handlers.onPointerDown}
+        onPointerMove={handlers.onPointerMove}
+        onPointerUp={handlers.onPointerUp}
+        onPointerCancel={handlers.onPointerCancel}
+        onTouchStart={handlers.onTouchStart}
+        onTouchMove={handlers.onTouchMove}
+        onTouchEnd={handlers.onTouchEnd}
+        onTouchCancel={handlers.onTouchCancel}
+        onClick={handlers.onClick}
+        onContextMenu={handlers.onContextMenu}
+        onKeyDown={(e) => {
+          if (e.altKey && e.key === 'ArrowUp') {
+            e.preventDefault();
+            onMoveIndex(idx, idx - 1);
+            return;
+          }
+          if (e.altKey && e.key === 'ArrowDown') {
+            e.preventDefault();
+            onMoveIndex(idx, idx + 1);
+            return;
+          }
+          handlers.onKeyDown(e);
         }}
       >
-        <Icon name="drag" size={16} />
-      </div>
+        <div
+          className="m-queue-row__handle"
+          aria-label={dragHandleLabel}
+          title={dragHandleTitle}
+          data-testid={`queue-handle-${epKey}`}
+          onPointerDown={(e) => {
+            if (typeof e.button === 'number' && e.button > 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            try {
+              e.currentTarget.setPointerCapture?.(e.pointerId);
+            } catch {
+              // ignore in non-capturing test environments
+            }
+            onStartHandleDrag(idx, e.pointerId, e.clientY);
+          }}
+          onPointerMove={(e) => {
+            onUpdateHandleDrag(e.pointerId, e.clientY);
+          }}
+          onPointerUp={(e) => {
+            try {
+              e.currentTarget.releasePointerCapture?.(e.pointerId);
+            } catch {
+              // ignore
+            }
+            onFinishHandleDrag(e.pointerId, e.clientY, false);
+          }}
+          onPointerCancel={(e) => {
+            try {
+              e.currentTarget.releasePointerCapture?.(e.pointerId);
+            } catch {
+              // ignore
+            }
+            onFinishHandleDrag(e.pointerId, undefined, true);
+          }}
+          onTouchStart={(e) => {
+            e.stopPropagation();
+            if (draggingIdx === null) {
+              const touch = e.touches[0];
+              onStartHandleDrag(idx, null, touch?.clientY ?? 0);
+            }
+          }}
+          onTouchMove={(e) => {
+            e.stopPropagation();
+            const touch = e.touches[0];
+            if (touch) {
+              onUpdateHandleDrag(null, touch.clientY);
+            }
+          }}
+          onTouchEnd={(e) => {
+            e.stopPropagation();
+            const touch = e.changedTouches[0];
+            onFinishHandleDrag(null, touch?.clientY, false);
+          }}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <Icon name="drag" size={16} />
+        </div>
 
-      <ArtworkImage
-        src={primaryCoverUrl}
-        fallbackSrc={feedCoverUrl}
-        allowProxyFallback={allowProxy}
-        className="m-queue-row__cover"
-        loading="lazy"
-        draggable={false}
-        placeholder={
-          <div className="m-queue-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
-            <Icon name="podcasts" size={20} />
-          </div>
-        }
-      />
+        <ArtworkImage
+          src={primaryCoverUrl}
+          fallbackSrc={feedCoverUrl}
+          allowProxyFallback={allowProxy}
+          className="m-queue-row__cover"
+          loading="lazy"
+          draggable={false}
+          placeholder={
+            <div className="m-queue-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
+              <Icon name="podcasts" size={20} />
+            </div>
+          }
+        />
 
-      <div className="m-episode-row__body">
-        <div className="m-episode-row__title">{row.episode.title}</div>
-        {(dateStr || remStr) && (
-          <div className="m-episode-row__meta">
-            {dateStr && <span>{dateStr}</span>}
-            {dateStr && remStr && <span>·</span>}
-            {remStr && <span>{remStr}</span>}
-          </div>
-        )}
+        <div className="m-episode-row__body">
+          <div className="m-episode-row__title">{row.episode.title}</div>
+          {(dateStr || remStr) && (
+            <div className="m-episode-row__meta">
+              {dateStr && <span>{dateStr}</span>}
+              {dateStr && remStr && <span>·</span>}
+              {remStr && <span>{remStr}</span>}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

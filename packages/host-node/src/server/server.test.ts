@@ -264,7 +264,8 @@ describe('MiniPod Hono server + REST client integration', () => {
     );
     expect(okRes.status).toBe(200);
     expect(okRes.headers.get('content-type')).toBe('image/png');
-    expect(okRes.headers.get('cache-control')).toBe('public, max-age=86400');
+    expect(okRes.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(okRes.headers.get('etag')).toMatch(/^"[0-9a-f]{64}"$/);
     expect(capturedHeaders['referer']).toBeUndefined();
     expect(String(capturedHeaders['user-agent'] ?? '')).toContain('MiniPod/');
     const bodyBuf = Buffer.from(await okRes.arrayBuffer());

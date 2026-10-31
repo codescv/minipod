@@ -76,6 +76,15 @@ export { useRouteStore, type RootTab, type ScreenRoute, type SidePanelTab } from
 export { useSettingsStore, DEFAULT_APP_SETTINGS } from './stores/settings';
 export { useSnackbarStore, showSnackbar } from './stores/snackbar';
 export { buildM3Tokens, applyM3Tokens, normaliseSeed, DEFAULT_SEED_COLOR } from './theme/m3-theme';
+export {
+  clearArtworkCacheForTests,
+  getPinnedArtworkCount,
+  getRememberedCandidateIndex,
+  isArtworkLoaded,
+  pinLoadedArtwork,
+  preloadArtworkUrls,
+  rememberResolvedCandidate,
+} from './lib/artwork-cache';
 export { resolveLocale, translate, useLocale, useT } from './i18n';
 export { UpdateBanner } from './features/updater/UpdateBanner';
 export {

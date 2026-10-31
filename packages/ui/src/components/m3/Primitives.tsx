@@ -14,8 +14,27 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { registerBackInterceptor } from '../../app/back';
+import {
+  clearArtworkCacheForTests,
+  getPinnedArtworkCount,
+  getRememberedCandidateIndex,
+  isArtworkLoaded,
+  pinLoadedArtwork,
+  preloadArtworkUrls,
+  rememberResolvedCandidate,
+} from '../../lib/artwork-cache';
 import { useSnackbarStore } from '../../stores/snackbar';
 import { Icon, type IconName } from './Icon';
+
+export {
+  clearArtworkCacheForTests,
+  getPinnedArtworkCount,
+  getRememberedCandidateIndex,
+  isArtworkLoaded,
+  pinLoadedArtwork,
+  preloadArtworkUrls,
+  rememberResolvedCandidate,
+};
 
 export function cx(...parts: ReadonlyArray<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
@@ -599,7 +618,7 @@ export function nonEmptyUrl(url?: string | null): string | undefined {
 }
 
 export function shouldUseImageProxy(platform?: string): boolean {
-  return platform === 'desktop' || platform === 'node';
+  return platform === 'desktop' || platform === 'node' || platform === 'android';
 }
 
 export function buildArtworkCandidates(
@@ -662,18 +681,24 @@ export function ArtworkImage({
 }: ArtworkImageProps) {
   const candidates = buildArtworkCandidates(src, fallbackSrc, allowProxyFallback, extraFallbackSrc);
   const candidatesKey = candidates.join('\n');
+  const rememberedIdx = getRememberedCandidateIndex(candidatesKey) ?? 0;
+  const defaultIdx =
+    rememberedIdx >= 0 && rememberedIdx < candidates.length ? rememberedIdx : 0;
 
   const [errorState, setErrorState] = useState<{ readonly key: string; readonly index: number }>({
     key: candidatesKey,
-    index: 0,
+    index: defaultIdx,
   });
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
 
-  const activeIdx = errorState.key === candidatesKey ? errorState.index : 0;
+  const activeIdx = errorState.key === candidatesKey ? errorState.index : defaultIdx;
   const activeSrc = candidates[activeIdx];
 
   if (!activeSrc) {
     return <>{placeholder}</>;
   }
+
+  const cached = loadedSrc === activeSrc || isArtworkLoaded(activeSrc);
 
   return (
     <img
@@ -683,13 +708,20 @@ export function ArtworkImage({
       className={className}
       style={style}
       title={title}
-      loading={loading}
+      loading={cached ? 'eager' : loading}
+      decoding={cached ? 'sync' : 'async'}
       draggable={draggable}
       data-testid={testId}
+      data-artwork-cached={cached ? 'true' : 'false'}
       onClick={onClick}
+      onLoad={() => {
+        pinLoadedArtwork(activeSrc);
+        rememberResolvedCandidate(candidatesKey, activeIdx);
+        setLoadedSrc(activeSrc);
+      }}
       onError={() => {
         setErrorState((prev) => {
-          const curIdx = prev.key === candidatesKey ? prev.index : 0;
+          const curIdx = prev.key === candidatesKey ? prev.index : defaultIdx;
           return { key: candidatesKey, index: curIdx + 1 };
         });
       }}

@@ -24,6 +24,7 @@ import {
   Icon,
   IconButton,
   Menu,
+  preloadArtworkUrls,
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
@@ -64,6 +65,13 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
       ]);
       setFeed(loadedFeed);
       setRows(page.items);
+      preloadArtworkUrls(
+        [
+          loadedFeed.imageUrl,
+          ...page.items.slice(0, 24).map((item) => item.episode.imageUrl),
+        ],
+        shouldUseImageProxy(host.info.platform),
+      );
     } catch {
       // ignore if unsubscribed mid-flight
     }

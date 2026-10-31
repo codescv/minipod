@@ -1,10 +1,10 @@
 /**
- * Subscriptions screen (`DESIGN.md` §4.1 + v0.1.3 enhancements):
- * - 3-col mobile / 6-col desktop cover grid + list toggle (zero unread badges)
- * - Collapsible subscriptions bar when > 6 feeds in grid mode (or > 4 in list mode)
+ * Subscriptions screen (`DESIGN.md` §4.1 + v0.1.6 enhancements):
+ * - 3-col mobile / 6-col desktop cover grid (zero unread badges)
+ * - Collapsible subscriptions bar when > 6 feeds
  * - Long-press (~450ms) / right-click / keyboard viewport-clamped context menu (no top-right `⋮` button)
  * - Latest Episodes Timeline (`最新单集`) directly below Subscriptions across all subscribed feeds
- * - Manual `⟳` refresh + touch pull-to-refresh + `.opml` / `.xml` drag-and-drop import
+ * - Manual `⟳` refresh + direct top-right Settings button + touch pull-to-refresh + `.opml` / `.xml` drag-and-drop import
  */
 import {
   useCallback,
@@ -25,7 +25,6 @@ import {
   FAB,
   Icon,
   IconButton,
-  Menu,
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
@@ -33,13 +32,12 @@ import { useIsDesktop } from '../../hooks/useMediaQuery';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
-import { useSettingsStore } from '../../stores/settings';
+import { preloadArtworkUrls } from '../../lib/artwork-cache';
 import { showSnackbar } from '../../stores/snackbar';
 import { openOpmlImportWithXml } from '../add/OpmlImport';
 import { EpisodeRow } from './EpisodeRow';
 
 const GRID_COLLAPSE_THRESHOLD = 6;
-const LIST_COLLAPSE_THRESHOLD = 4;
 const TIMELINE_PAGE_SIZE = 30;
 const LONG_PRESS_DELAY_MS = 450;
 const LONG_PRESS_MOVE_SLOP_PX = 10;
@@ -161,9 +159,6 @@ export function SubscriptionsGrid() {
   const isDesktop = useIsDesktop();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
-  const layout = useSettingsStore((s) => s.settings.subscriptionsLayout);
-  const updateSettings = useSettingsStore((s) => s.update);
-
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const openAdd = useRouteStore((s) => s.openAdd);
   const openDownloads = useRouteStore((s) => s.openDownloads);
@@ -189,6 +184,10 @@ export function SubscriptionsGrid() {
       const list = await host.feeds.list();
       if (seq !== loadSeqRef.current) return;
       setFeeds(list);
+      preloadArtworkUrls(
+        list.map((f) => f.imageUrl),
+        allowProxy,
+      );
 
       if (list.length === 0) {
         setTimelineItems([]);
@@ -229,12 +228,18 @@ export function SubscriptionsGrid() {
           return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
         });
       setTimelineItems(mergedUnplayed);
+      preloadArtworkUrls(
+        mergedUnplayed
+          .slice(0, TIMELINE_PAGE_SIZE)
+          .map((item) => item.row.episode.imageUrl ?? item.feed.imageUrl),
+        allowProxy,
+      );
     } finally {
       if (seq === loadSeqRef.current) {
         setLoading(false);
       }
     }
-  }, [host]);
+  }, [allowProxy, host]);
 
   useEffect(() => {
     void loadFeedsAndTimeline();
@@ -278,11 +283,6 @@ export function SubscriptionsGrid() {
     }
   }, [host, loadFeedsAndTimeline, refreshing]);
 
-  const handleToggleLayout = useCallback(() => {
-    const next = layout === 'grid' ? 'list' : 'grid';
-    void updateSettings(host, { subscriptionsLayout: next });
-  }, [host, layout, updateSettings]);
-
   const handleUnsubscribe = useCallback(
     async (feed: Feed) => {
       await host.feeds.unsubscribe(feed.feedKey);
@@ -299,38 +299,6 @@ export function SubscriptionsGrid() {
     },
     [t],
   );
-
-  const appBarMenuItems: MenuEntry[] = [
-    ...(downloadedCount > 0
-      ? [
-          {
-            key: 'manage-downloads',
-            label: t('subs.manageDownloads', { count: downloadedCount }),
-            icon: 'downloaded' as const,
-            testId: 'subs-manage-downloads',
-            onSelect: () => openDownloads(),
-          },
-        ]
-      : []),
-    {
-      key: 'toggle-layout',
-      label: layout === 'grid' ? t('subs.viewGrid') : t('subs.viewList'),
-      icon: layout === 'grid' ? 'list' : 'grid',
-      testId: 'subs-toggle-layout',
-      onSelect: handleToggleLayout,
-    },
-    ...(!isDesktop
-      ? [
-          {
-            key: 'mobile-settings',
-            label: t('nav.settings'),
-            icon: 'settings' as const,
-            testId: 'subs-mobile-settings',
-            onSelect: () => setTab('settings'),
-          },
-        ]
-      : []),
-  ];
 
   const feedMenuItems = (feed: Feed): MenuEntry[] => [
     {
@@ -353,9 +321,8 @@ export function SubscriptionsGrid() {
     },
   ];
 
-  const collapseThreshold = layout === 'grid' ? GRID_COLLAPSE_THRESHOLD : LIST_COLLAPSE_THRESHOLD;
-  const canCollapse = feeds.length > collapseThreshold;
-  const visibleFeeds = canCollapse && !subsExpanded ? feeds.slice(0, collapseThreshold) : feeds;
+  const canCollapse = feeds.length > GRID_COLLAPSE_THRESHOLD;
+  const visibleFeeds = canCollapse && !subsExpanded ? feeds.slice(0, GRID_COLLAPSE_THRESHOLD) : feeds;
 
   return (
     <div
@@ -399,6 +366,14 @@ export function SubscriptionsGrid() {
     >
       <header className="m-appbar">
         <h1 className="m-appbar__title">{t('subs.title')}</h1>
+        {downloadedCount > 0 && (
+          <IconButton
+            icon="downloaded"
+            label={t('subs.manageDownloads', { count: downloadedCount })}
+            data-testid="subs-manage-downloads"
+            onClick={() => openDownloads()}
+          />
+        )}
         <IconButton
           icon="refresh"
           label={refreshing ? t('subs.refreshing') : t('subs.refreshAll')}
@@ -408,7 +383,12 @@ export function SubscriptionsGrid() {
             void handleRefreshAll();
           }}
         />
-        <Menu label={t('common.more')} items={appBarMenuItems} testId="subs-overflow-btn" />
+        <IconButton
+          icon="settings"
+          label={t('nav.settings')}
+          data-testid="subs-settings-btn"
+          onClick={() => setTab('settings')}
+        />
       </header>
 
       {!loading && feeds.length === 0 ? (
@@ -425,35 +405,19 @@ export function SubscriptionsGrid() {
       ) : (
         <>
           <div className="m-subs-section">
-            {layout === 'grid' ? (
-              <div className="m-subs-grid" data-testid="subs-grid">
-                {visibleFeeds.map((feed) => (
-                  <PodcastTile
-                    key={feed.feedKey}
-                    feed={feed}
-                    needsAuth={authFailedKeys.has(feed.feedKey)}
-                    needsAuthLabel={t('subs.needsAuth')}
-                    allowProxy={allowProxy}
-                    onOpen={() => openPodcastDetail(feed.feedKey)}
-                    onContext={(x, y) => setContextMenu({ feed, x, y })}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div className="m-subs-list" data-testid="subs-list">
-                {visibleFeeds.map((feed) => (
-                  <SubscriptionListItem
-                    key={feed.feedKey}
-                    feed={feed}
-                    needsAuth={authFailedKeys.has(feed.feedKey)}
-                    needsAuthLabel={t('subs.needsAuth')}
-                    allowProxy={allowProxy}
-                    onOpen={() => openPodcastDetail(feed.feedKey)}
-                    onContext={(x, y) => setContextMenu({ feed, x, y })}
-                  />
-                ))}
-              </div>
-            )}
+            <div className="m-subs-grid" data-testid="subs-grid">
+              {visibleFeeds.map((feed) => (
+                <PodcastTile
+                  key={feed.feedKey}
+                  feed={feed}
+                  needsAuth={authFailedKeys.has(feed.feedKey)}
+                  needsAuthLabel={t('subs.needsAuth')}
+                  allowProxy={allowProxy}
+                  onOpen={() => openPodcastDetail(feed.feedKey)}
+                  onContext={(x, y) => setContextMenu({ feed, x, y })}
+                />
+              ))}
+            </div>
 
             {canCollapse && (
               <div className="m-subs-expand-wrap">
@@ -603,76 +567,6 @@ function PodcastTile({
         )}
       </div>
       <div className="m-podcast-tile__title">{displayTitle}</div>
-    </div>
-  );
-}
-
-function SubscriptionListItem({
-  feed,
-  needsAuth,
-  needsAuthLabel,
-  allowProxy,
-  onOpen,
-  onContext,
-}: {
-  readonly feed: Feed;
-  readonly needsAuth: boolean;
-  readonly needsAuthLabel: string;
-  readonly allowProxy: boolean;
-  readonly onOpen: () => void;
-  readonly onContext: (x: number, y: number) => void;
-}) {
-  const displayTitle = feed.title ?? feed.url;
-  const interactions = useLongPressHandlers({ onOpen, onContext });
-
-  return (
-    <div
-      className="m-result-row"
-      role="button"
-      tabIndex={0}
-      aria-haspopup="menu"
-      data-testid={`feed-list-item-${feed.feedKey}`}
-      {...interactions}
-    >
-      <ArtworkImage
-        src={feed.imageUrl}
-        allowProxyFallback={allowProxy}
-        className="m-result-row__cover"
-        loading="lazy"
-        draggable={false}
-        placeholder={
-          <div className="m-result-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
-            <Icon name="podcasts" size={24} />
-          </div>
-        }
-      />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div
-          style={{
-            font: 'var(--md-sys-typescale-title-small)',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {displayTitle}
-        </div>
-        {feed.author && (
-          <div
-            style={{
-              font: 'var(--md-sys-typescale-body-small)',
-              color: 'var(--md-sys-color-on-surface-variant)',
-            }}
-          >
-            {feed.author}
-          </div>
-        )}
-      </div>
-      {needsAuth && (
-        <span className="m-pill-badge" title={needsAuthLabel}>
-          <Icon name="lock" size={14} />
-        </span>
-      )}
     </div>
   );
 }
