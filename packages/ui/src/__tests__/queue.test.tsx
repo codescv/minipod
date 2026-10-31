@@ -142,8 +142,34 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     fireEvent.click(row2Initial);
     vi.useRealTimers();
 
-    expect(screen.getByTestId('queue-context-menu')).toBeInTheDocument();
-    expect(screen.getByTestId(`queue-mark-played-${thirdKey}`)).toBeInTheDocument();
+    const queueCtxMenu = screen.getByTestId('queue-context-menu');
+    expect(queueCtxMenu).toBeInTheDocument();
+    // Strictly 3 items in `queue-context-menu`: Move to top, Download / Delete download, Remove
+    expect(queueCtxMenu.querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    expect(screen.getByTestId(`queue-move-top-${thirdKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`queue-download-${thirdKey}`)).toHaveTextContent('Delete download');
+    expect(screen.getByTestId(`queue-remove-${thirdKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`queue-move-up-${thirdKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`queue-move-down-${thirdKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`queue-mark-played-${thirdKey}`)).not.toBeInTheDocument();
+
+    // Delete download from `queue-context-menu`, then re-download from `queue-context-menu`
+    fireEvent.click(screen.getByTestId(`queue-download-${thirdKey}`));
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
+    });
+    fireEvent.contextMenu(screen.getByTestId('queue-row-2'), { clientX: 180, clientY: 250 });
+    expect(screen.getByTestId(`queue-download-${thirdKey}`)).toHaveTextContent('Download episode');
+    fireEvent.click(screen.getByTestId(`queue-download-${thirdKey}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`queue-cache-status-${thirdKey}`)).toHaveAttribute(
+        'data-cache-state',
+        'done',
+      );
+    });
+
+    // Move 3rd item to top via `queue-move-top-*`
+    fireEvent.contextMenu(screen.getByTestId('queue-row-2'), { clientX: 180, clientY: 250 });
     fireEvent.click(screen.getByTestId(`queue-move-top-${thirdKey}`));
 
     await waitFor(async () => {
@@ -248,5 +274,49 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       expect(restored[1]?.episode.episodeKey).toBe(secondKey);
     });
     expect(screen.queryByTestId(`inline-undo-${secondKey}`)).not.toBeInTheDocument();
+  });
+
+  it('localizes strictly 3 queue context menu items in zh-CN (置顶 / 下载 / 移除) and handles top-row & downloading disabled states', async () => {
+    const { host } = renderMiniPod({
+      width: 390,
+      hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
+    });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    const q = await host.queue.list();
+    const firstKey = q[0]!.episode.episodeKey;
+    const secondKey = q[1]!.episode.episodeKey;
+
+    // Row 0 (`firstKey` is DONE): `置顶` is disabled at idx 0, `删除已下载文件` enabled, `从队列移除` enabled
+    fireEvent.contextMenu(screen.getByTestId('queue-row-0'), { clientX: 120, clientY: 160 });
+    const menu0 = screen.getByTestId('queue-context-menu');
+    expect(menu0.querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    expect(screen.getByTestId(`queue-move-top-${firstKey}`)).toHaveTextContent('置顶');
+    expect(screen.getByTestId(`queue-move-top-${firstKey}`)).toBeDisabled();
+    expect(screen.getByTestId(`queue-download-${firstKey}`)).toHaveTextContent('删除已下载文件');
+    expect(screen.getByTestId(`queue-remove-${firstKey}`)).toHaveTextContent('从队列移除');
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Row 1 (`secondKey` set to RUNNING): `下载中…` is disabled, `置顶` is enabled
+    act(() => {
+      host.emit({
+        type: 'download-updated',
+        episodeKey: secondKey,
+        state: 'RUNNING',
+        progress: 0.3,
+      });
+    });
+    fireEvent.contextMenu(screen.getByTestId('queue-row-1'), { clientX: 120, clientY: 220 });
+    expect(screen.getByTestId('queue-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    expect(screen.getByTestId(`queue-move-top-${secondKey}`)).not.toBeDisabled();
+    expect(screen.getByTestId(`queue-download-${secondKey}`)).toHaveTextContent('下载中…');
+    expect(screen.getByTestId(`queue-download-${secondKey}`)).toBeDisabled();
+
+    // Remove row 1 via `queue-remove-*`
+    fireEvent.click(screen.getByTestId(`queue-remove-${secondKey}`));
+    await waitFor(async () => {
+      expect(await host.queue.list()).toHaveLength(2);
+    });
   });
 });

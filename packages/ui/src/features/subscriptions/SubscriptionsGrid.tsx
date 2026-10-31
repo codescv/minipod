@@ -46,6 +46,7 @@ import { openOpmlImportWithXml } from '../add/OpmlImport';
 import { EpisodeRow } from './EpisodeRow';
 
 export const MAX_SUBS_COLLAPSED_ROWS = 2;
+export const AUTO_REFRESH_MIN_INTERVAL_MS = 30 * 60_000;
 const TIMELINE_PAGE_SIZE = DEFAULT_TIMELINE_LIMIT;
 const LONG_PRESS_DELAY_MS = 450;
 const LONG_PRESS_MOVE_SLOP_PX = 10;
@@ -210,8 +211,11 @@ export function SubscriptionsGrid() {
   );
 
   const subsGridRef = useRef<HTMLDivElement | null>(null);
-  const pullStartYRef = useRef<number | null>(null);
   const loadSeqRef = useRef(0);
+  const unmountedRef = useRef(false);
+  const entryAutoRefreshCheckedRef = useRef(false);
+  const refreshingRef = useRef(false);
+  const handleRefreshAllRef = useRef<() => Promise<void>>(async () => {});
   const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
 
   useEffect(() => {
@@ -303,7 +307,7 @@ export function SubscriptionsGrid() {
 
     try {
       const list = await host.feeds.list();
-      if (seq !== loadSeqRef.current) return;
+      if (seq !== loadSeqRef.current || unmountedRef.current) return;
       const feedsByKey = new Map<FeedKey, Feed>(list.map((f) => [f.feedKey, f]));
       viewCache.feeds = list;
       viewCache.feedsByKey = feedsByKey;
@@ -312,6 +316,29 @@ export function SubscriptionsGrid() {
         list.map((f) => f.imageUrl),
         allowProxy,
       );
+
+      if (!entryAutoRefreshCheckedRef.current) {
+        entryAutoRefreshCheckedRef.current = true;
+        if (list.length > 0) {
+          const now = Date.now();
+          const maxFeedRefreshedAt = list.reduce(
+            (max, f) => Math.max(max, f.lastRefreshedAt ?? 0),
+            0,
+          );
+          const lastRefreshAt =
+            viewCache.lastAutoRefreshAt > 0
+              ? viewCache.lastAutoRefreshAt
+              : maxFeedRefreshedAt > 0 && now - maxFeedRefreshedAt < AUTO_REFRESH_MIN_INTERVAL_MS
+                ? maxFeedRefreshedAt
+                : 0;
+          if (now - lastRefreshAt >= AUTO_REFRESH_MIN_INTERVAL_MS) {
+            viewCache.lastAutoRefreshAt = now;
+            void handleRefreshAllRef.current();
+          } else if (viewCache.lastAutoRefreshAt === 0 && lastRefreshAt > 0) {
+            viewCache.lastAutoRefreshAt = lastRefreshAt;
+          }
+        }
+      }
 
       if (list.length === 0) {
         viewCache.episodesByFeed.clear();
@@ -387,7 +414,12 @@ export function SubscriptionsGrid() {
   }, [allowProxy, host]);
 
   useEffect(() => {
+    unmountedRef.current = false;
+    entryAutoRefreshCheckedRef.current = false;
     void loadFeedsAndTimeline();
+    return () => {
+      unmountedRef.current = true;
+    };
   }, [loadFeedsAndTimeline]);
 
   useHostEvents((ev) => {
@@ -428,15 +460,48 @@ export function SubscriptionsGrid() {
   });
 
   const handleRefreshAll = useCallback(async () => {
-    if (refreshing) return;
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    getHostViewCache(host).lastAutoRefreshAt = Date.now();
     setRefreshing(true);
     try {
       await host.feeds.refresh();
       await loadFeedsAndTimeline();
     } finally {
-      setRefreshing(false);
+      refreshingRef.current = false;
+      if (!unmountedRef.current) {
+        setRefreshing(false);
+      }
     }
-  }, [host, loadFeedsAndTimeline, refreshing]);
+  }, [host, loadFeedsAndTimeline]);
+  handleRefreshAllRef.current = handleRefreshAll;
+
+  const handleMarkAllTimelinePlayed = useCallback(async () => {
+    if (timelineItems.length === 0) return;
+    const viewCache = getHostViewCache(host);
+    let maxPubDate = Date.now();
+    for (const feedRows of viewCache.episodesByFeed.values()) {
+      for (const r of feedRows) {
+        if ((r.episode.pubDate ?? 0) > maxPubDate) {
+          maxPubDate = r.episode.pubDate ?? 0;
+        }
+      }
+    }
+    for (const item of timelineItems) {
+      if ((item.row.episode.pubDate ?? 0) > maxPubDate) {
+        maxPubDate = item.row.episode.pubDate ?? 0;
+      }
+    }
+    viewCache.timelineClearedCutoffMs = maxPubDate;
+    const itemsToMark = [...timelineItems];
+    inlineUndoKeysRef.current.clear();
+    viewCache.timelineItems = [];
+    setTimelineItems([]);
+    await Promise.all(
+      itemsToMark.map((item) => host.progress.markPlayed(item.row.episode.episodeKey, true)),
+    );
+    await loadFeedsAndTimeline();
+  }, [host, loadFeedsAndTimeline, timelineItems]);
 
   const handleUnsubscribe = useCallback(
     async (feed: Feed) => {
@@ -498,20 +563,6 @@ export function SubscriptionsGrid() {
         if (/\.(opml|xml)$/i.test(file.name) || file.type.includes('xml')) {
           e.preventDefault();
           void file.text().then((xml) => openOpmlImportWithXml(xml));
-        }
-      }}
-      onTouchStart={(e) => {
-        const touch = e.touches[0];
-        if (touch && window.scrollY <= 0) {
-          pullStartYRef.current = touch.clientY;
-        }
-      }}
-      onTouchEnd={(e) => {
-        const startY = pullStartYRef.current;
-        pullStartYRef.current = null;
-        const touch = e.changedTouches[0];
-        if (startY !== null && touch && touch.clientY - startY > 80) {
-          void handleRefreshAll();
         }
       }}
       style={
@@ -616,6 +667,17 @@ export function SubscriptionsGrid() {
                     {timelineItems.length}
                   </span>
                 )}
+                <IconButton
+                  icon="check"
+                  iconSize={18}
+                  label={t('subs.markAllPlayed')}
+                  disabled={timelineItems.length === 0}
+                  data-testid="subs-mark-all-played-btn"
+                  style={{ marginLeft: 'auto', width: 36, height: 36 }}
+                  onClick={() => {
+                    void handleMarkAllTimelinePlayed();
+                  }}
+                />
               </div>
 
               {!loading && timelineItems.length === 0 ? (

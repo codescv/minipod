@@ -125,13 +125,18 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
     fireEvent.click(row39);
     vi.useRealTimers();
 
-    // Playback did NOT switch to ep 39 on long-press, and context menu opened
+    // Playback did NOT switch to ep 39 on long-press, and context menu opened with strictly 2 items (`Add to queue`, `View details`)
     expect(engine.getSnapshot().episodeKey).toBe(ep42.episodeKey);
-    expect(screen.getByTestId('ep-context-menu')).toBeInTheDocument();
-    expect(screen.getByTestId(`ep-play-next-${ep39.episodeKey}`)).toBeInTheDocument();
+    const epCtxMenu = screen.getByTestId('ep-context-menu');
+    expect(epCtxMenu).toBeInTheDocument();
+    expect(epCtxMenu.querySelectorAll('[role="menuitem"]')).toHaveLength(2);
     expect(screen.getByTestId(`ep-queue-btn-${ep39.episodeKey}`)).toBeInTheDocument();
-    expect(screen.getByTestId(`ep-download-${ep39.episodeKey}`)).toBeInTheDocument();
-    expect(screen.getByTestId(`ep-mark-played-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-view-details-${ep39.episodeKey}`)).toHaveTextContent(
+      'View details',
+    );
+    expect(screen.queryByTestId(`ep-play-next-${ep39.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-download-${ep39.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-mark-played-${ep39.episodeKey}`)).not.toBeInTheDocument();
 
     // Add to queue from context menu and verify Undo / toggle
     fireEvent.click(screen.getByTestId(`ep-queue-btn-${ep39.episodeKey}`));
@@ -146,21 +151,42 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       clientX: 200,
       clientY: 260,
     });
+    expect(screen.getByTestId('ep-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(
+      2,
+    );
     fireEvent.click(await screen.findByTestId(`ep-queue-btn-${ep39.episodeKey}`));
     await waitFor(async () => {
       const q = await host.queue.list();
       expect(q.some((r) => r.episode.episodeKey === ep39.episodeKey)).toBe(false);
     });
 
-    // Download ep 39 from context menu (`NONE` -> `DONE`)
-    fireEvent.contextMenu(screen.getByTestId(`episode-row-${ep39.episodeKey}`), {
+    // Clicking `ep-view-details-*` opens `episode-detail-sheet` with Shownotes, Play/Pause, and Queue toggle
+    fireEvent.contextMenu(screen.getByTestId(`episode-row-${ep42.episodeKey}`), {
       clientX: 200,
-      clientY: 260,
+      clientY: 180,
     });
-    fireEvent.click(await screen.findByTestId(`ep-download-${ep39.episodeKey}`));
-    await waitFor(async () => {
-      const updated = await host.episodes.get(ep39.episodeKey);
-      expect(updated.episode.downloadState).toBe('DONE');
+    fireEvent.click(await screen.findByTestId(`ep-view-details-${ep42.episodeKey}`));
+    const detailSheet42 = await screen.findByTestId('episode-detail-sheet');
+    expect(detailSheet42).toHaveTextContent(ep42.title);
+    expect(detailSheet42).toHaveTextContent('Syntax & Signal');
+    expect(screen.getByTestId(`ep-detail-play-${ep42.episodeKey}`)).toHaveTextContent('Pause');
+    expect(screen.getByTestId(`ep-detail-queue-${ep42.episodeKey}`)).toHaveTextContent(
+      'Remove from queue',
+    );
+    expect(screen.queryByTestId(`ep-open-podcast-${ep42.episodeKey}`)).not.toBeInTheDocument();
+    const shownotes42 = screen.getByTestId(`ep-detail-shownotes-${ep42.episodeKey}`);
+    expect(shownotes42).toHaveTextContent('Fractional indexing');
+    const externalLink = shownotes42.querySelector('a')!;
+    fireEvent.click(externalLink);
+    expect(host.openedExternalUrls).toContain('https://antennapod.org');
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
+    });
+
+    // Pre-download ep 39 via host so swipe-right mark-played also verifies auto-delete download when played
+    await act(async () => {
+      await host.episodes.download(ep39.episodeKey);
     });
 
     // Swipe Left (`deltaX < -64px`, right-to-left) on ep 39 -> reveals Play Next edge hint & inserts as Play Next (index 1)
@@ -235,12 +261,19 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       expect(restored.inQueue).toBe(true);
     });
 
-    // Audio-only VIDEO episode context menu includes `ep-open-video-*`
+    // Audio-only VIDEO episode context menu still has strictly 2 items, and its `episode-detail-sheet` includes `ep-open-video-*`
     fireEvent.contextMenu(screen.getByTestId(`episode-row-${ep40Video.episodeKey}`), {
       clientX: 200,
       clientY: 200,
     });
-    expect(await screen.findByTestId(`ep-open-video-${ep40Video.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId('ep-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(
+      2,
+    );
+    fireEvent.click(await screen.findByTestId(`ep-view-details-${ep40Video.episodeKey}`));
+    expect(await screen.findByTestId('episode-detail-sheet')).toBeInTheDocument();
+    const openVideoBtn = await screen.findByTestId(`ep-open-video-${ep40Video.episodeKey}`);
+    fireEvent.click(openVideoBtn);
+    expect(host.openedExternalUrls).toContain('https://cdn.example.org/ss/40.mp4');
     fireEvent.keyDown(window, { key: 'Escape' });
 
     // RFC 5005 `Load older episodes` appends archived episodes 38 & 37 and removes footer button

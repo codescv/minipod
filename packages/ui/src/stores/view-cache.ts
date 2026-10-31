@@ -44,6 +44,8 @@ export interface HostViewCache {
   readonly feedSortOrder: Map<FeedKey, EpisodeSortOrder>;
   timelineItems: readonly TimelineEpisodeItem[];
   timelineLoaded: boolean;
+  timelineClearedCutoffMs: number;
+  lastAutoRefreshAt: number;
   downloadedCount: number;
   downloadedItems: readonly DownloadedEpisodeItem[];
   downloadsLoaded: boolean;
@@ -68,6 +70,8 @@ function createEmptyHostViewCache(): HostViewCache {
     feedSortOrder: new Map(),
     timelineItems: [],
     timelineLoaded: false,
+    timelineClearedCutoffMs: 0,
+    lastAutoRefreshAt: 0,
     downloadedCount: 0,
     downloadedItems: [],
     downloadsLoaded: false,
@@ -150,6 +154,12 @@ export function recomputeHostTimelineAndDownloads(
       const epKey = item.row.episode.episodeKey;
       if (inlineUndoKeys !== undefined && inlineUndoKeys.has(epKey)) {
         return true;
+      }
+      if (
+        viewCache.timelineClearedCutoffMs > 0 &&
+        (item.row.episode.pubDate ?? 0) <= viewCache.timelineClearedCutoffMs
+      ) {
+        return false;
       }
       if (item.row.progress?.state === 'PLAYED') return false;
       if (item.row.progress?.state === 'IN_PROGRESS') return false;

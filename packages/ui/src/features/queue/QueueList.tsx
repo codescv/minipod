@@ -441,35 +441,6 @@ export function QueueList() {
     await loadQueue();
   }, [clearUndoTimer, host, loadQueue, pendingUndo]);
 
-  const handleMarkPlayedAndRemoveWithUndo = useCallback(
-    async (idx: number) => {
-      const target = rows[idx];
-      if (!target) return;
-      const epKey = target.episode.episodeKey;
-      const nextNeighborKey: EpisodeKey | null = rows[idx + 1]?.episode.episodeKey ?? null;
-      await host.progress.markPlayed(epKey, true);
-      await host.queue.remove(epKey);
-      await loadQueue();
-
-      showSnackbar(t('detail.markedPlayedRemovedSnack'), {
-        action: {
-          label: t('common.undo'),
-          run: () => {
-            void (async () => {
-              await host.progress.markPlayed(epKey, false);
-              await host.queue.add(epKey);
-              if (nextNeighborKey !== null) {
-                await host.queue.move(epKey, nextNeighborKey);
-              }
-              await loadQueue();
-            })();
-          },
-        },
-      });
-    },
-    [host, loadQueue, rows, t],
-  );
-
   const totalRemainingMs = rows.reduce((acc, r) => {
     const dur = r.progress?.durationMs ?? r.episode.durationMs ?? r.entry.stub?.durationMs ?? 0;
     const pos = r.progress?.state === 'IN_PROGRESS' ? r.progress.positionMs : 0;
@@ -531,6 +502,44 @@ export function QueueList() {
       ? (() => {
           const idx = activeContextMenu.idx;
           const epKey = contextTargetRow.episode.episodeKey;
+          const dlState = contextTargetRow.episode.downloadState;
+          const downloadItem: MenuEntry =
+            dlState === 'DONE'
+              ? {
+                  key: 'download',
+                  label: t('detail.deleteDownload'),
+                  icon: 'downloaded',
+                  disabled: !canDownload,
+                  testId: `queue-download-${epKey}`,
+                  onSelect: () => {
+                    void host.episodes.deleteDownload(epKey).then(() => loadQueue());
+                  },
+                }
+              : dlState === 'RUNNING' || dlState === 'QUEUED'
+                ? {
+                    key: 'download',
+                    label: t('detail.downloading'),
+                    icon: 'download',
+                    disabled: true,
+                    testId: `queue-download-${epKey}`,
+                    onSelect: () => {},
+                  }
+                : {
+                    key: 'download',
+                    label: t('detail.download'),
+                    icon: 'download',
+                    disabled:
+                      !canDownload ||
+                      contextTargetRow.episode.feedKey.startsWith('l_') ||
+                      !Boolean(
+                        contextTargetRow.episode.enclosureUrl ??
+                          contextTargetRow.entry.stub?.enclosureUrl,
+                      ),
+                    testId: `queue-download-${epKey}`,
+                    onSelect: () => {
+                      void host.episodes.download(epKey).then(() => loadQueue());
+                    },
+                  };
           return [
             {
               key: 'move-top',
@@ -542,35 +551,7 @@ export function QueueList() {
                 void moveIndexTo(idx, 0);
               },
             },
-            {
-              key: 'move-up',
-              label: t('queue.moveUp'),
-              icon: 'expandLess',
-              disabled: idx === 0,
-              testId: `queue-move-up-${epKey}`,
-              onSelect: () => {
-                void moveIndexTo(idx, idx - 1);
-              },
-            },
-            {
-              key: 'move-down',
-              label: t('queue.moveDown'),
-              icon: 'expandMore',
-              disabled: idx === rows.length - 1,
-              testId: `queue-move-down-${epKey}`,
-              onSelect: () => {
-                void moveIndexTo(idx, idx + 1);
-              },
-            },
-            {
-              key: 'mark-played',
-              label: t('queue.markPlayedAndRemove'),
-              icon: 'check',
-              testId: `queue-mark-played-${epKey}`,
-              onSelect: () => {
-                void handleMarkPlayedAndRemoveWithUndo(idx);
-              },
-            },
+            downloadItem,
             {
               key: 'remove',
               label: t('queue.remove'),

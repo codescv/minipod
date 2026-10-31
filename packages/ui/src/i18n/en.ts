@@ -37,6 +37,7 @@ export const en: Messages = {
   'subs.needsAuth': 'Needs sign-in',
   'subs.localBadge': 'Local folder',
   'subs.timelineTitle': 'Latest episodes',
+  'subs.markAllPlayed': 'Mark all as played',
   'subs.expandAll': 'Show all ({count})',
   'subs.collapse': 'Show less',
   'subs.loadMoreTimeline': 'Load more',
@@ -78,6 +79,7 @@ export const en: Messages = {
   'detail.swipeHintPlayNext': 'Play next',
   'detail.swipeHintMarkPlayed': 'Mark played',
   'detail.goToPodcast': 'Go to podcast',
+  'detail.viewDetails': 'View details',
   'detail.shareLink': 'Share link',
   'detail.openInVideoPlayer': 'Open in video player',
 

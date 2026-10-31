@@ -1,10 +1,12 @@
-import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { shouldUseImageProxy } from '../components/m3';
 import {
+  AUTO_REFRESH_MIN_INTERVAL_MS,
   computeSubscriptionsGridCols,
   MAX_SUBS_COLLAPSED_ROWS,
 } from '../features/subscriptions/SubscriptionsGrid';
+import { App, createMockPlatformHost, createMockPlayerEngine } from '../index';
 import {
   clearArtworkCacheForTests,
   getRememberedCandidateIndex,
@@ -12,7 +14,7 @@ import {
   pinLoadedArtwork,
   rememberResolvedCandidate,
 } from '../lib/artwork-cache';
-import { renderMiniPod } from './test-helpers';
+import { renderMiniPod, setViewportWidth } from './test-helpers';
 
 describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO Back Navigation', () => {
   afterEach(() => {
@@ -156,13 +158,25 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       expect(engine.getSnapshot().episodeKey).toBe(tappedEp.episodeKey);
     });
 
-    // Opening podcast from timeline episode's context menu (`Go to podcast`) navigates to PodcastDetail
+    // Opening podcast from timeline episode's 2-item context menu (`View details` -> `Go to podcast`) navigates to PodcastDetail
     fireEvent.contextMenu(screen.getByTestId(`episode-row-${firstEp.episodeKey}`), {
       clientX: 200,
       clientY: 240,
     });
-    fireEvent.click(await screen.findByTestId(`ep-open-podcast-${firstEp.episodeKey}`));
+    const epMenu = await screen.findByTestId('ep-context-menu');
+    expect(within(epMenu).getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getByTestId(`ep-queue-btn-${firstEp.episodeKey}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`ep-view-details-${firstEp.episodeKey}`));
+
+    const detailSheet = await screen.findByTestId('episode-detail-sheet');
+    expect(detailSheet).toHaveTextContent(firstEp.title);
+    expect(screen.getByTestId(`ep-detail-play-${firstEp.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-queue-${firstEp.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-shownotes-${firstEp.episodeKey}`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId(`ep-open-podcast-${firstEp.episodeKey}`));
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
 
     // Navigate back to Subscriptions and add enough feeds so total unplayed timeline episodes > 30
     fireEvent.click(screen.getByTestId('detail-back-btn'));
@@ -240,17 +254,28 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
     expect(screen.queryByTestId('subs-manage-downloads')).not.toBeInTheDocument();
 
-    // Triggering a download via episode context menu makes `管理下载 (1)` reappear immediately!
+    // Queueing an episode via the 2-item episode context menu (`加入队列`, `查看详情`) and downloading it from Queue makes `管理下载 (1)` reappear immediately!
     const firstTimelineRow = within(screen.getByTestId('subs-timeline-list')).getAllByTestId(
       /^episode-row-/,
     )[0]!;
     const epKey = firstTimelineRow.getAttribute('data-testid')!.replace('episode-row-', '');
     fireEvent.contextMenu(firstTimelineRow, { clientX: 180, clientY: 220 });
-    fireEvent.click(await screen.findByTestId(`ep-download-${epKey}`));
+    const zhEpMenu = await screen.findByTestId('ep-context-menu');
+    expect(within(zhEpMenu).getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getByTestId(`ep-queue-btn-${epKey}`)).toHaveTextContent('加入队列');
+    expect(screen.getByTestId(`ep-view-details-${epKey}`)).toHaveTextContent('查看详情');
+    fireEvent.click(screen.getByTestId(`ep-queue-btn-${epKey}`));
+
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    expect(await screen.findByTestId('queue-screen')).toBeInTheDocument();
+    const queuedRow = await screen.findByTestId('queue-row-3');
+    fireEvent.contextMenu(queuedRow, { clientX: 180, clientY: 220 });
+    fireEvent.click(await screen.findByTestId(`queue-download-${epKey}`));
 
     await waitFor(async () => {
       expect((await host.episodes.get(epKey)).episode.downloadState).toBe('DONE');
     });
+    fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
     const reappearedBtn = await screen.findByTestId('subs-manage-downloads');
     expect(reappearedBtn.getAttribute('aria-label')).toBe('管理下载 (1)');
   });
@@ -565,5 +590,141 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       consumed = Boolean(window.__minipodHandleBack?.());
     });
     expect(consumed).toBe(false);
+  });
+
+  it('marks all Latest Episodes as played via subs-mark-all-played-btn on the right of 最新单集, clears the list, and only admits newer unplayed episodes afterwards', async () => {
+    let mockNow = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => mockNow);
+
+    const { host } = renderMiniPod({
+      width: 1024,
+      hostOptions: {
+        now: () => mockNow,
+        initialSettings: { uiLanguage: 'zh-CN' },
+      },
+    });
+
+    expect(await screen.findByText('最新单集')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('4');
+
+    const markAllBtn = screen.getByTestId('subs-mark-all-played-btn');
+    expect(markAllBtn).not.toBeDisabled();
+    expect(markAllBtn.getAttribute('aria-label')).toBe('全部标为已播');
+    expect(markAllBtn.style.marginLeft).toBe('auto');
+    expect(markAllBtn.closest('.m-timeline-header')).not.toBeNull();
+
+    const initialTimelineKeys = within(screen.getByTestId('subs-timeline-list'))
+      .getAllByTestId(/^episode-row-/)
+      .map((el) => el.getAttribute('data-testid')!.replace('episode-row-', ''));
+    expect(initialTimelineKeys).toHaveLength(4);
+
+    fireEvent.click(markAllBtn);
+
+    // Immediately clears timeline list on frame 0 and disables button
+    expect(screen.queryByTestId('subs-timeline-list')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('subs-timeline-empty')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-mark-all-played-btn')).toBeDisabled();
+
+    // Every episode previously in `最新单集` is marked PLAYED
+    await waitFor(async () => {
+      for (const epKey of initialTimelineKeys) {
+        const row = await host.episodes.get(epKey);
+        expect(row.progress?.state).toBe('PLAYED');
+      }
+    });
+
+    // Removing an older unstarted episode from Queue (`pubDate <= timelineClearedCutoffMs`) does NOT admit it back into `最新单集`
+    const queueBefore = await host.queue.list();
+    const unstartedQueued = queueBefore.find(
+      (q) =>
+        q.progress?.state !== 'PLAYED' &&
+        q.progress?.state !== 'IN_PROGRESS' &&
+        (q.progress?.positionMs ?? 0) <= 0,
+    );
+    expect(unstartedQueued).toBeDefined();
+    await act(async () => {
+      await host.queue.remove(unstartedQueued!.episode.episodeKey);
+    });
+    expect(screen.getByTestId('subs-timeline-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('subs-timeline-list')).not.toBeInTheDocument();
+
+    // Subscribing to a feed whose episodes all have `pubDate <= timelineClearedCutoffMs` ALSO stays excluded
+    await act(async () => {
+      await host.feeds.subscribe('https://feeds.example.org/archive-only-show.xml');
+    });
+    expect(screen.getByTestId('subs-timeline-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('subs-timeline-list')).not.toBeInTheDocument();
+
+    // Advancing clock by +2 days so a newly published episode has `pubDate > timelineClearedCutoffMs` (while its older sibling is `-6d <= cutoff`)
+    mockNow += 2 * 86_400_000;
+    await act(async () => {
+      await host.feeds.subscribe('https://feeds.example.org/fresh-updates-show.xml');
+    });
+
+    // Strictly ONLY the 1 newly updated episode (`pubDate > cutoff`) enters `最新单集`!
+    await waitFor(() => {
+      expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('1');
+    });
+    const freshRows = within(screen.getByTestId('subs-timeline-list')).getAllByTestId(
+      /^episode-row-/,
+    );
+    expect(freshRows).toHaveLength(1);
+    expect(screen.getByTestId('subs-mark-all-played-btn')).not.toBeDisabled();
+  });
+
+  it('disables downward pull-to-refresh on Subscriptions and enforces the 30-minute AUTO_REFRESH_MIN_INTERVAL_MS cooldown on entry while manual refresh always runs', async () => {
+    expect(AUTO_REFRESH_MIN_INTERVAL_MS).toBe(30 * 60_000);
+
+    let mockNow = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => mockNow);
+
+    setViewportWidth(390);
+    const host = createMockPlatformHost({
+      now: () => mockNow,
+      initialSettings: { uiLanguage: 'en' },
+    });
+    const refreshSpy = vi.spyOn(host.feeds, 'refresh');
+    const engine = createMockPlayerEngine({ capabilities: { video: true } });
+
+    render(<App host={host} engine={engine} />);
+
+    expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Touch pull-down (`touchstart` -> `touchend` downward) on `subscriptions-screen` MUST NOT trigger refresh
+    const subsScreen = screen.getByTestId('subscriptions-screen');
+    fireEvent.touchStart(subsScreen, { touches: [{ clientX: 180, clientY: 20 }] });
+    fireEvent.touchMove(subsScreen, { touches: [{ clientX: 180, clientY: 220 }] });
+    fireEvent.touchEnd(subsScreen, { changedTouches: [{ clientX: 180, clientY: 240 }] });
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+    // Re-entering Subscriptions within 30 minutes (e.g. +10 min) skips auto-refresh
+    mockNow += 10 * 60_000;
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    expect(screen.getByTestId('queue-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('nav-bar-subscriptions'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+    // Re-entering Subscriptions after >= 30 minutes triggers auto-refresh once
+    mockNow += AUTO_REFRESH_MIN_INTERVAL_MS;
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    expect(screen.getByTestId('queue-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('nav-bar-subscriptions'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+    });
+
+    // Manual `subs-refresh-btn` ALWAYS runs immediately even with 0ms elapsed
+    fireEvent.click(screen.getByTestId('subs-refresh-btn'));
+    await waitFor(() => {
+      expect(refreshSpy).toHaveBeenCalledTimes(3);
+    });
   });
 });
