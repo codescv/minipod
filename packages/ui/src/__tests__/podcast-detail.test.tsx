@@ -148,13 +148,21 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
 
     fireEvent.touchEnd(row39Fresh, { changedTouches: [{ clientX: 160, clientY: 122 }] });
 
-    expect(await screen.findByTestId('snackbar')).toHaveTextContent('Playing next');
+    expect(await screen.findByTestId(`inline-undo-${ep39.episodeKey}`)).toHaveTextContent(
+      'Playing next',
+    );
+    expect(screen.getByTestId(`inline-undo-btn-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+    // Episode row itself still has 0 inline buttons
+    expect(screen.getByTestId(`episode-row-${ep39.episodeKey}`).querySelectorAll('button')).toHaveLength(
+      0,
+    );
     await waitFor(async () => {
       const q = await host.queue.list();
       expect(q[1]?.episode.episodeKey).toBe(ep39.episodeKey);
     });
 
-    // Swipe Right (`deltaX > +64px`, left-to-right) via pointer drag on ep 39 -> reveals Mark Played edge hint, marks PLAYED & removes immediately even in `All` filter!
+    // Swipe Right (`deltaX > +64px`, left-to-right) via pointer drag on ep 39 -> reveals Mark Played edge hint, marks PLAYED & replaces row in-place with inline Undo (no bottom snackbar)!
     const row39BeforeDismiss = screen.getByTestId(`episode-row-${ep39.episodeKey}`);
     fireEvent(
       row39BeforeDismiss,
@@ -176,16 +184,20 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
     await waitFor(() => {
       expect(screen.queryByTestId(`episode-row-${ep39.episodeKey}`)).not.toBeInTheDocument();
     });
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+    expect(await screen.findByTestId(`inline-undo-${ep39.episodeKey}`)).toHaveTextContent(
+      'Marked played and removed',
+    );
     await waitFor(async () => {
       const updated = await host.episodes.get(ep39.episodeKey);
       expect(updated.progress?.state).toBe('PLAYED');
       expect(updated.inQueue).toBe(false);
     });
-    expect(await screen.findByTestId('snackbar')).toHaveTextContent('Marked played and removed');
 
-    // Undo restores ep 39 to unplayed AND puts it back in the visible list & queue!
-    fireEvent.click(screen.getByTestId('snackbar-action'));
+    // Inline Undo restores ep 39 to unplayed AND puts it back in the visible list & queue!
+    fireEvent.click(screen.getByTestId(`inline-undo-btn-${ep39.episodeKey}`));
     expect(await screen.findByTestId(`episode-row-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`inline-undo-${ep39.episodeKey}`)).not.toBeInTheDocument();
     await waitFor(async () => {
       const restored = await host.episodes.get(ep39.episodeKey);
       expect(restored.progress?.state).toBe('NEW');

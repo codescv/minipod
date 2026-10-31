@@ -152,13 +152,17 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     await waitFor(async () => {
       expect(await host.queue.list()).toHaveLength(2);
     });
-    expect(await screen.findByTestId('snackbar')).toHaveTextContent(/Removed/);
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+    const inlineUndoEl = await screen.findByTestId(`inline-undo-${secondKey}`);
+    expect(inlineUndoEl).toHaveTextContent(/Removed/);
+    expect(inlineUndoEl.getAttribute('data-queue-undo-idx')).toBe('1');
 
-    fireEvent.click(screen.getByTestId('snackbar-action'));
+    fireEvent.click(screen.getByTestId(`inline-undo-btn-${secondKey}`));
     await waitFor(async () => {
       const restored = await host.queue.list();
       expect(restored).toHaveLength(3);
       expect(restored[1]?.episode.episodeKey).toBe(secondKey);
     });
+    expect(screen.queryByTestId(`inline-undo-${secondKey}`)).not.toBeInTheDocument();
   });
 });

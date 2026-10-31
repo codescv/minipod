@@ -4,7 +4,7 @@
  * 2. Multi-feed HTML `<link rel="alternate">` radio selector (`choices`).
  * 3. Full feed preview with `[ Subscribe ]` AND direct tap-to-play episode streaming + long-press / swipe-left queue gestures.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   DiscoveredFeedLink,
   EpisodeKey,
@@ -30,7 +30,7 @@ import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, stripHtmlToText } from '../../lib/format';
 import { deriveEpisodeKey } from '../../lib/identity';
 import { usePlayer } from '../../player/usePlayer';
-import { showSnackbar } from '../../stores/snackbar';
+import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 
 export interface FeedPreviewScreenProps {
   readonly url: string;
@@ -434,6 +434,17 @@ function PreviewEpisodeRow({
   const t = useT();
   const player = usePlayer();
   const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
+  const [inlineUndo, setInlineUndo] = useState(false);
+  const inlineUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearInlineUndoTimer = useCallback(() => {
+    if (inlineUndoTimerRef.current !== null) {
+      clearTimeout(inlineUndoTimerRef.current);
+      inlineUndoTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearInlineUndoTimer, [clearInlineUndoTimer]);
 
   const isCurrent = player.episode?.episodeKey === epKey;
   const isPlaying = isCurrent && player.snapshot.playing;
@@ -465,6 +476,29 @@ function PreviewEpisodeRow({
     }
   };
 
+  const handleSwipePlayNext = async () => {
+    try {
+      useSnackbarStore.getState().clear();
+      clearInlineUndoTimer();
+      await host.queue.playNext(epKey);
+      await onQueueChanged();
+      setInlineUndo(true);
+      inlineUndoTimerRef.current = setTimeout(() => {
+        inlineUndoTimerRef.current = null;
+        setInlineUndo(false);
+      }, 4000);
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleRunInlineUndo = async () => {
+    clearInlineUndoTimer();
+    setInlineUndo(false);
+    await host.queue.remove(epKey);
+    await onQueueChanged();
+  };
+
   const handleToggleQueue = async () => {
     try {
       if (inQueue) {
@@ -490,7 +524,7 @@ function PreviewEpisodeRow({
     onTap: handlePlay,
     onContext: (x, y) => setCtxPos({ x, y }),
     onSwipeLeft: () => {
-      void handlePlayNext();
+      void handleSwipePlayNext();
     },
   });
 
@@ -570,6 +604,26 @@ function PreviewEpisodeRow({
             )}
           </div>
         </div>
+        {inlineUndo && (
+          <div
+            className="m-inline-undo m-inline-undo--overlay"
+            role="status"
+            aria-live="polite"
+            data-testid={`inline-undo-${epKey}`}
+          >
+            <span className="m-inline-undo__text">{t('detail.addedPlayNext')}</span>
+            <button
+              type="button"
+              className="m-inline-undo__btn"
+              data-testid={`inline-undo-btn-${epKey}`}
+              onClick={() => {
+                void handleRunInlineUndo();
+              }}
+            >
+              {t('common.undo')}
+            </button>
+          </div>
+        )}
       </div>
 
       <ContextMenu

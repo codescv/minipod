@@ -16,7 +16,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type TouchEvent as ReactTouchEvent,
 } from 'react';
-import type { EpisodeRow as EpisodeRowModel, Feed, FeedKey } from '@minipod/core';
+import type { EpisodeKey, EpisodeRow as EpisodeRowModel, Feed, FeedKey } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
@@ -177,6 +177,7 @@ export function SubscriptionsGrid() {
 
   const pullStartYRef = useRef<number | null>(null);
   const loadSeqRef = useRef(0);
+  const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
 
   const loadFeedsAndTimeline = useCallback(async () => {
     const seq = ++loadSeqRef.current;
@@ -221,7 +222,11 @@ export function SubscriptionsGrid() {
       setDownloadedCount(dlCount);
 
       const mergedUnplayed = allItems
-        .filter((item) => item.row.progress?.state !== 'PLAYED')
+        .filter(
+          (item) =>
+            item.row.progress?.state !== 'PLAYED' ||
+            inlineUndoKeysRef.current.has(item.row.episode.episodeKey),
+        )
         .sort((a, b) => {
           const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
           if (pubDiff !== 0) return pubDiff;
@@ -466,10 +471,17 @@ export function SubscriptionsGrid() {
                         allowDownloads={item.allowDownloads}
                         showPodcastInfo
                         onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
+                        onStartInlineRemove={(epKey) => {
+                          inlineUndoKeysRef.current.add(epKey);
+                        }}
                         onRemove={(epKey) => {
+                          inlineUndoKeysRef.current.delete(epKey);
                           setTimelineItems((prev) =>
                             prev.filter((entry) => entry.row.episode.episodeKey !== epKey),
                           );
+                        }}
+                        onUndoRemove={(epKey) => {
+                          inlineUndoKeysRef.current.delete(epKey);
                         }}
                         onChanged={() => {
                           void loadFeedsAndTimeline();

@@ -1,13 +1,13 @@
 /**
- * Minimalist gesture-driven episode row (`v0.1.5`):
+ * Minimalist gesture-driven episode row (`v0.1.8`):
  * - Strictly 4 visual elements: `44×44` cover icon, 2-line clamped title, publish date, and remaining time
  * - Zero inline action buttons
  * - Tap / click directly plays (or toggles pause if current)
  * - Long-press (~450ms) / right-click / keyboard (`ContextMenu` / `Shift+F10`) opens viewport-clamped `<ContextMenu>`
- * - Swipe left (`deltaX < -64px`): Play next (`queue.playNext`) + Undo snackbar
- * - Swipe right (`deltaX > +64px`): Mark played (`progress.markPlayed(key, true)`) & remove + Undo snackbar
+ * - Swipe left (`deltaX < -64px`): Play next (`queue.playNext`) + in-place row Undo (no bottom snackbar)
+ * - Swipe right (`deltaX > +64px`): Mark played (`progress.markPlayed(key, true)`) & remove + in-place row Undo (no bottom snackbar)
  */
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { EpisodeKey, EpisodeRow as EpisodeRowModel } from '@minipod/core';
 import {
   ArtworkImage,
@@ -23,7 +23,11 @@ import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
-import { showSnackbar } from '../../stores/snackbar';
+import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
+
+type InlineUndoState =
+  | { readonly kind: 'play-next' }
+  | { readonly kind: 'marked-played'; readonly wasInQueue: boolean };
 
 export interface EpisodeRowProps {
   readonly row: EpisodeRowModel;
@@ -32,6 +36,7 @@ export interface EpisodeRowProps {
   readonly allowDownloads: boolean;
   readonly showPodcastInfo?: boolean | undefined;
   readonly onOpenPodcast?: (() => void) | undefined;
+  readonly onStartInlineRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onUndoRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onSwipeLeftOverride?: (() => void) | undefined;
@@ -47,6 +52,7 @@ export function EpisodeRow({
   feedImageUrl,
   allowDownloads,
   onOpenPodcast,
+  onStartInlineRemove,
   onRemove,
   onUndoRemove,
   onSwipeLeftOverride,
@@ -62,6 +68,17 @@ export function EpisodeRow({
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
+  const [inlineUndo, setInlineUndo] = useState<InlineUndoState | null>(null);
+  const inlineUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearInlineUndoTimer = useCallback(() => {
+    if (inlineUndoTimerRef.current !== null) {
+      clearTimeout(inlineUndoTimerRef.current);
+      inlineUndoTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearInlineUndoTimer, [clearInlineUndoTimer]);
 
   const { episode, progress, inQueue } = row;
   const isCurrent = player.episode?.episodeKey === episode.episodeKey;
@@ -151,18 +168,67 @@ export function EpisodeRow({
     });
   };
 
+  const handleSwipePlayNext = async () => {
+    useSnackbarStore.getState().clear();
+    clearInlineUndoTimer();
+    await host.queue.playNext(episode.episodeKey);
+    onChanged();
+    setInlineUndo({ kind: 'play-next' });
+    inlineUndoTimerRef.current = setTimeout(() => {
+      inlineUndoTimerRef.current = null;
+      setInlineUndo(null);
+    }, 4000);
+  };
+
+  const handleSwipeMarkPlayedAndRemove = async () => {
+    useSnackbarStore.getState().clear();
+    clearInlineUndoTimer();
+    const wasInQueue = inQueue;
+    onStartInlineRemove?.(episode.episodeKey);
+    setInlineUndo({ kind: 'marked-played', wasInQueue });
+    inlineUndoTimerRef.current = setTimeout(() => {
+      inlineUndoTimerRef.current = null;
+      setInlineUndo(null);
+      onRemove?.(episode.episodeKey);
+    }, 4500);
+    await host.progress.markPlayed(episode.episodeKey, true);
+    if (wasInQueue) {
+      await host.queue.remove(episode.episodeKey);
+    }
+    onChanged();
+  };
+
+  const handleRunInlineUndo = async () => {
+    const currentUndo = inlineUndo;
+    if (!currentUndo) return;
+    clearInlineUndoTimer();
+    setInlineUndo(null);
+    if (currentUndo.kind === 'play-next') {
+      await host.queue.remove(episode.episodeKey);
+      onChanged();
+    } else {
+      await host.progress.markPlayed(episode.episodeKey, false);
+      if (currentUndo.wasInQueue) {
+        await host.queue.add(episode.episodeKey);
+      }
+      onUndoRemove?.(episode.episodeKey);
+      onChanged();
+    }
+  };
+
   const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
     onTap: handlePlayToggle,
     onContext: (x, y) => setCtxPos({ x, y }),
     onSwipeLeft: () => {
       if (onSwipeLeftOverride) {
+        useSnackbarStore.getState().clear();
         onSwipeLeftOverride();
       } else {
-        void handlePlayNextWithUndo();
+        void handleSwipePlayNext();
       }
     },
     onSwipeRight: () => {
-      void handleMarkPlayedAndRemove();
+      void handleSwipeMarkPlayedAndRemove();
     },
   });
 
@@ -259,80 +325,121 @@ export function EpisodeRow({
 
   return (
     <>
-      <div className="m-swipe-container">
-        {swipeDirection === 'right' && (
-          <div
-            aria-hidden="true"
-            className={cx('m-swipe-hint', 'm-swipe-hint--right', swipeArmed && 'is-armed')}
-            data-testid={`swipe-hint-right-${episode.episodeKey}`}
-            data-swipe-armed={swipeArmed ? 'true' : 'false'}
-          >
-            <Icon name="check" size={18} />
-            <span>{t('detail.swipeHintMarkPlayed')}</span>
-          </div>
-        )}
-        {swipeDirection === 'left' && (
-          <div
-            aria-hidden="true"
-            className={cx(
-              'm-swipe-hint',
-              'm-swipe-hint--left',
-              `m-swipe-hint--${leftHintTone}`,
-              swipeArmed && 'is-armed',
-            )}
-            data-testid={`swipe-hint-left-${episode.episodeKey}`}
-            data-swipe-armed={swipeArmed ? 'true' : 'false'}
-          >
-            <Icon name={leftHintIcon} size={18} />
-            <span>{leftHintLabel}</span>
-          </div>
-        )}
+      {inlineUndo?.kind === 'marked-played' ? (
         <div
-          className={cx(
-            'm-episode-row',
-            isPlayed && 'is-played',
-            isCurrent && 'is-current',
-            isPlaying && 'is-playing',
-          )}
-          role="button"
-          tabIndex={0}
-          aria-haspopup="menu"
-          aria-label={episode.title}
-          data-testid={`episode-row-${episode.episodeKey}`}
-          style={
-            swipeOffsetX !== 0
-              ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
-              : undefined
-          }
-          {...handlers}
+          className="m-inline-undo"
+          role="status"
+          aria-live="polite"
+          data-testid={`inline-undo-${episode.episodeKey}`}
         >
-          <div
-            className="m-episode-row__thumb"
-            data-testid={`ep-thumb-${episode.episodeKey}`}
+          <span className="m-inline-undo__text">{t('detail.markedPlayedRemovedSnack')}</span>
+          <button
+            type="button"
+            className="m-inline-undo__btn"
+            data-testid={`inline-undo-btn-${episode.episodeKey}`}
+            onClick={() => {
+              void handleRunInlineUndo();
+            }}
           >
-            <ArtworkImage
-              src={episode.imageUrl}
-              fallbackSrc={feedImageUrl}
-              allowProxyFallback={allowProxy}
-              className="m-episode-row__thumb-img"
-              loading="lazy"
-              draggable={false}
-              placeholder={<Icon name="podcasts" size={20} />}
-            />
-          </div>
-
-          <div className="m-episode-row__body">
-            <div className="m-episode-row__title">{episode.title}</div>
-            {(dateStr || remStr) && (
-              <div className="m-episode-row__meta">
-                {dateStr && <span>{dateStr}</span>}
-                {dateStr && remStr && <span>·</span>}
-                {remStr && <span>{remStr}</span>}
-              </div>
-            )}
-          </div>
+            {t('common.undo')}
+          </button>
         </div>
-      </div>
+      ) : (
+        <div className="m-swipe-container">
+          {swipeDirection === 'right' && (
+            <div
+              aria-hidden="true"
+              className={cx('m-swipe-hint', 'm-swipe-hint--right', swipeArmed && 'is-armed')}
+              data-testid={`swipe-hint-right-${episode.episodeKey}`}
+              data-swipe-armed={swipeArmed ? 'true' : 'false'}
+            >
+              <Icon name="check" size={18} />
+              <span>{t('detail.swipeHintMarkPlayed')}</span>
+            </div>
+          )}
+          {swipeDirection === 'left' && (
+            <div
+              aria-hidden="true"
+              className={cx(
+                'm-swipe-hint',
+                'm-swipe-hint--left',
+                `m-swipe-hint--${leftHintTone}`,
+                swipeArmed && 'is-armed',
+              )}
+              data-testid={`swipe-hint-left-${episode.episodeKey}`}
+              data-swipe-armed={swipeArmed ? 'true' : 'false'}
+            >
+              <Icon name={leftHintIcon} size={18} />
+              <span>{leftHintLabel}</span>
+            </div>
+          )}
+          <div
+            className={cx(
+              'm-episode-row',
+              isPlayed && 'is-played',
+              isCurrent && 'is-current',
+              isPlaying && 'is-playing',
+            )}
+            role="button"
+            tabIndex={0}
+            aria-haspopup="menu"
+            aria-label={episode.title}
+            data-testid={`episode-row-${episode.episodeKey}`}
+            style={
+              swipeOffsetX !== 0
+                ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
+                : undefined
+            }
+            {...handlers}
+          >
+            <div
+              className="m-episode-row__thumb"
+              data-testid={`ep-thumb-${episode.episodeKey}`}
+            >
+              <ArtworkImage
+                src={episode.imageUrl}
+                fallbackSrc={feedImageUrl}
+                allowProxyFallback={allowProxy}
+                className="m-episode-row__thumb-img"
+                loading="lazy"
+                draggable={false}
+                placeholder={<Icon name="podcasts" size={20} />}
+              />
+            </div>
+
+            <div className="m-episode-row__body">
+              <div className="m-episode-row__title">{episode.title}</div>
+              {(dateStr || remStr) && (
+                <div className="m-episode-row__meta">
+                  {dateStr && <span>{dateStr}</span>}
+                  {dateStr && remStr && <span>·</span>}
+                  {remStr && <span>{remStr}</span>}
+                </div>
+              )}
+            </div>
+          </div>
+          {inlineUndo?.kind === 'play-next' && (
+            <div
+              className="m-inline-undo m-inline-undo--overlay"
+              role="status"
+              aria-live="polite"
+              data-testid={`inline-undo-${episode.episodeKey}`}
+            >
+              <span className="m-inline-undo__text">{t('detail.addedPlayNext')}</span>
+              <button
+                type="button"
+                className="m-inline-undo__btn"
+                data-testid={`inline-undo-btn-${episode.episodeKey}`}
+                onClick={() => {
+                  void handleRunInlineUndo();
+                }}
+              >
+                {t('common.undo')}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       <ContextMenu
         open={ctxPos !== null}

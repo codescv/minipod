@@ -8,7 +8,7 @@
  * - Compact `20×36` drag handle (`queue-handle-*`) with live item-following Pointer/Touch drag-to-reorder
  *   and real-time neighbor slot shifting (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
  */
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, Fragment } from 'react';
 import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
 import {
   ArtworkImage,
@@ -26,7 +26,14 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
-import { showSnackbar } from '../../stores/snackbar';
+import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
+
+interface PendingQueueInlineUndo {
+  readonly epKey: EpisodeKey;
+  readonly title: string;
+  readonly idx: number;
+  readonly nextNeighborKey: EpisodeKey | null;
+}
 
 interface QueueSlotSnapshot {
   readonly idx: number;
@@ -66,9 +73,20 @@ export function QueueList() {
     readonly x: number;
     readonly y: number;
   } | null>(null);
+  const [pendingUndo, setPendingUndo] = useState<PendingQueueInlineUndo | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<ActiveHandleDrag | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearUndoTimer = useCallback(() => {
+    if (undoTimerRef.current !== null) {
+      clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearUndoTimer, [clearUndoTimer]);
 
   const loadQueue = useCallback(async () => {
     const [q, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
@@ -328,6 +346,41 @@ export function QueueList() {
     [host, loadQueue, rows, t],
   );
 
+  const handleSwipeRemoveWithInlineUndo = useCallback(
+    async (idx: number) => {
+      const target = rows[idx];
+      if (!target) return;
+      useSnackbarStore.getState().clear();
+      clearUndoTimer();
+      const nextNeighborKey: EpisodeKey | null = rows[idx + 1]?.episode.episodeKey ?? null;
+      setPendingUndo({
+        epKey: target.episode.episodeKey,
+        title: target.episode.title,
+        idx,
+        nextNeighborKey,
+      });
+      undoTimerRef.current = setTimeout(() => {
+        undoTimerRef.current = null;
+        setPendingUndo(null);
+      }, 4500);
+      await host.queue.remove(target.episode.episodeKey);
+      await loadQueue();
+    },
+    [clearUndoTimer, host, loadQueue, rows],
+  );
+
+  const handleRunInlineUndo = useCallback(async () => {
+    const current = pendingUndo;
+    if (!current) return;
+    clearUndoTimer();
+    setPendingUndo(null);
+    await host.queue.add(current.epKey);
+    if (current.nextNeighborKey !== null) {
+      await host.queue.move(current.epKey, current.nextNeighborKey);
+    }
+    await loadQueue();
+  }, [clearUndoTimer, host, loadQueue, pendingUndo]);
+
   const handleMarkPlayedAndRemoveWithUndo = useCallback(
     async (idx: number) => {
       const target = rows[idx];
@@ -438,7 +491,7 @@ export function QueueList() {
         </h1>
       </header>
 
-      {rows.length === 0 ? (
+      {rows.length === 0 && !pendingUndo ? (
         <div className="m-empty" data-testid="queue-empty">
           <Icon name="queue" size={44} />
           <div>{t('queue.empty')}</div>
@@ -475,49 +528,96 @@ export function QueueList() {
                   : '';
 
             return (
-              <QueueRowItem
-                key={epKey}
-                row={r}
-                idx={idx}
-                primaryCoverUrl={primaryCoverUrl}
-                feedCoverUrl={feedCoverUrl}
-                allowProxy={allowProxy}
-                dateStr={dateStr}
-                remStr={remStr}
-                isCurrent={isCurrent}
-                isPlaying={isPlaying}
-                draggingIdx={draggingIdx}
-                dropTargetIdx={dropTargetIdx}
-                dragDeltaY={dragDeltaY}
-                dragRowHeight={dragRowHeight}
-                dragHandleLabel={`${t('queue.dragHandle')} ${r.episode.title}`}
-                dragHandleTitle={t('queue.dragHandle')}
-                swipeLeftHintLabel={t('queue.swipeHintRemove')}
-                onPlay={() => {
-                  if (isCurrent) {
-                    void player.togglePlayPause();
-                  } else {
-                    void player.playEpisode(r.episode, {
-                      feedTitle: podcastName,
-                      feedImageUrl: feedCoverUrl,
-                    });
-                  }
-                }}
-                onContext={(x, y) => setActiveContextMenu({ idx, x, y })}
-                onSwipeLeftRemove={() => {
-                  void handleRemoveWithUndo(idx);
-                }}
-                onMoveIndex={(from, to) => {
-                  void moveIndexTo(from, to);
-                }}
-                onSetDragging={setDraggingIdx}
-                onSetDropTarget={setDropTargetIdx}
-                onStartHandleDrag={startHandleDrag}
-                onUpdateHandleDrag={updateHandleDrag}
-                onFinishHandleDrag={finishHandleDrag}
-              />
+              <Fragment key={epKey}>
+                {pendingUndo && pendingUndo.idx === idx && (
+                  <div
+                    className="m-inline-undo"
+                    role="status"
+                    aria-live="polite"
+                    data-testid={`inline-undo-${pendingUndo.epKey}`}
+                    data-queue-undo-idx={pendingUndo.idx}
+                  >
+                    <span className="m-inline-undo__text">
+                      {t('queue.removedSnack', { title: pendingUndo.title })}
+                    </span>
+                    <button
+                      type="button"
+                      className="m-inline-undo__btn"
+                      data-testid={`inline-undo-btn-${pendingUndo.epKey}`}
+                      onClick={() => {
+                        void handleRunInlineUndo();
+                      }}
+                    >
+                      {t('common.undo')}
+                    </button>
+                  </div>
+                )}
+                <QueueRowItem
+                  row={r}
+                  idx={idx}
+                  primaryCoverUrl={primaryCoverUrl}
+                  feedCoverUrl={feedCoverUrl}
+                  allowProxy={allowProxy}
+                  dateStr={dateStr}
+                  remStr={remStr}
+                  isCurrent={isCurrent}
+                  isPlaying={isPlaying}
+                  draggingIdx={draggingIdx}
+                  dropTargetIdx={dropTargetIdx}
+                  dragDeltaY={dragDeltaY}
+                  dragRowHeight={dragRowHeight}
+                  dragHandleLabel={`${t('queue.dragHandle')} ${r.episode.title}`}
+                  dragHandleTitle={t('queue.dragHandle')}
+                  swipeLeftHintLabel={t('queue.swipeHintRemove')}
+                  onPlay={() => {
+                    if (isCurrent) {
+                      void player.togglePlayPause();
+                    } else {
+                      void player.playEpisode(r.episode, {
+                        feedTitle: podcastName,
+                        feedImageUrl: feedCoverUrl,
+                      });
+                    }
+                  }}
+                  onContext={(x, y) => setActiveContextMenu({ idx, x, y })}
+                  onSwipeLeftRemove={() => {
+                    void handleSwipeRemoveWithInlineUndo(idx);
+                  }}
+                  onMoveIndex={(from, to) => {
+                    void moveIndexTo(from, to);
+                  }}
+                  onSetDragging={setDraggingIdx}
+                  onSetDropTarget={setDropTargetIdx}
+                  onStartHandleDrag={startHandleDrag}
+                  onUpdateHandleDrag={updateHandleDrag}
+                  onFinishHandleDrag={finishHandleDrag}
+                />
+              </Fragment>
             );
           })}
+          {pendingUndo && pendingUndo.idx >= rows.length && (
+            <div
+              className="m-inline-undo"
+              role="status"
+              aria-live="polite"
+              data-testid={`inline-undo-${pendingUndo.epKey}`}
+              data-queue-undo-idx={pendingUndo.idx}
+            >
+              <span className="m-inline-undo__text">
+                {t('queue.removedSnack', { title: pendingUndo.title })}
+              </span>
+              <button
+                type="button"
+                className="m-inline-undo__btn"
+                data-testid={`inline-undo-btn-${pendingUndo.epKey}`}
+                onClick={() => {
+                  void handleRunInlineUndo();
+                }}
+              >
+                {t('common.undo')}
+              </button>
+            </div>
+          )}
         </div>
       )}
 

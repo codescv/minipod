@@ -98,8 +98,23 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     // Every timeline row has 0 inline buttons
     expect(renderedRows[0]!.querySelectorAll('button')).toHaveLength(0);
 
-    // Opening podcast from timeline episode's context menu (`Go to podcast`) navigates to PodcastDetail
+    // Swipe right on first timeline row replaces it in-place with inline Undo (no bottom snackbar), and Undo restores it
     const firstEp = expectedOrder[0]!;
+    const firstTimelineRowEl = screen.getByTestId(`episode-row-${firstEp.episodeKey}`);
+    fireEvent.touchStart(firstTimelineRowEl, { touches: [{ clientX: 80, clientY: 160 }] });
+    fireEvent.touchMove(firstTimelineRowEl, { touches: [{ clientX: 190, clientY: 161 }] });
+    fireEvent.touchEnd(firstTimelineRowEl, { changedTouches: [{ clientX: 200, clientY: 161 }] });
+
+    expect(await screen.findByTestId(`inline-undo-${firstEp.episodeKey}`)).toHaveTextContent(
+      'Marked played and removed',
+    );
+    expect(screen.queryByTestId(`episode-row-${firstEp.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+
+    fireEvent.click(screen.getByTestId(`inline-undo-btn-${firstEp.episodeKey}`));
+    expect(await screen.findByTestId(`episode-row-${firstEp.episodeKey}`)).toBeInTheDocument();
+
+    // Opening podcast from timeline episode's context menu (`Go to podcast`) navigates to PodcastDetail
     fireEvent.contextMenu(screen.getByTestId(`episode-row-${firstEp.episodeKey}`), {
       clientX: 200,
       clientY: 240,
@@ -172,6 +187,7 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     await waitFor(() => {
       expect(screen.getByTestId('downloads-count')).toHaveTextContent('1');
     });
+    expect(screen.queryByTestId('snackbar')).toBeNull();
 
     // Click `全部删除` (`downloads-delete-all-btn`) -> deletes remaining download and shows empty state
     fireEvent.click(screen.getByTestId('downloads-delete-all-btn'));

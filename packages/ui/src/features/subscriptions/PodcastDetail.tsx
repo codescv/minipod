@@ -5,7 +5,7 @@
  * - Strictly 3 filter chips: `All` / `Unplayed` / `Downloaded`
  * - Gesture-driven `EpisodeRow` items + immediate swipe-right dismiss (with Undo) + RFC 5005 *Load older episodes*
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   EpisodeFilter,
   EpisodeKey,
@@ -52,19 +52,31 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const [credsDialogOpen, setCredsDialogOpen] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
 
   useEffect(() => {
+    inlineUndoKeysRef.current.clear();
     setDismissedKeys(new Set());
   }, [feedKey, filter]);
 
   const reload = useCallback(async () => {
     try {
+      const fetchFilter: EpisodeFilter =
+        filter === 'unplayed' && inlineUndoKeysRef.current.size > 0 ? 'all' : filter;
       const [loadedFeed, page] = await Promise.all([
         host.feeds.get(feedKey),
-        host.episodes.list(feedKey, filter),
+        host.episodes.list(feedKey, fetchFilter),
       ]);
+      const nextRows =
+        filter === 'unplayed' && fetchFilter === 'all'
+          ? page.items.filter(
+              (r) =>
+                r.progress?.state !== 'PLAYED' ||
+                inlineUndoKeysRef.current.has(r.episode.episodeKey),
+            )
+          : page.items;
       setFeed(loadedFeed);
-      setRows(page.items);
+      setRows(nextRows);
       preloadArtworkUrls(
         [
           loadedFeed.imageUrl,
@@ -291,7 +303,11 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
               feedTitle={feed?.title}
               feedImageUrl={feed?.imageUrl}
               allowDownloads={allowDownloads}
+              onStartInlineRemove={(epKey) => {
+                inlineUndoKeysRef.current.add(epKey);
+              }}
               onRemove={(epKey) => {
+                inlineUndoKeysRef.current.delete(epKey);
                 setDismissedKeys((prev) => {
                   const next = new Set(prev);
                   next.add(epKey);
@@ -299,6 +315,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
                 });
               }}
               onUndoRemove={(epKey) => {
+                inlineUndoKeysRef.current.delete(epKey);
                 setDismissedKeys((prev) => {
                   if (!prev.has(epKey)) return prev;
                   const next = new Set(prev);

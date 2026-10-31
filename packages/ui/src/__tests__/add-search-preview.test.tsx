@@ -63,6 +63,13 @@ describe('Unified Add / Search / Top Charts / FeedPreview / 401 / Multi-Feed / O
     expect(await screen.findByTestId('snackbar')).toHaveTextContent('Added to queue');
     expect((await host.feeds.list()).length).toBe(initialSubCount);
 
+    // Swipe-left on episode 0 in FeedPreview triggers Play Next with in-place row Undo (no snackbar)
+    fireEvent.touchStart(previewRow0, { touches: [{ clientX: 260, clientY: 120 }] });
+    fireEvent.touchMove(previewRow0, { touches: [{ clientX: 150, clientY: 121 }] });
+    fireEvent.touchEnd(previewRow0, { changedTouches: [{ clientX: 140, clientY: 121 }] });
+    expect(await screen.findByTestId(/^inline-undo-(?!btn)/)).toHaveTextContent('Playing next');
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+
     // Now click Subscribe -> navigates to PodcastDetail and adds to Subscriptions
     fireEvent.click(screen.getByTestId('preview-subscribe-btn'));
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
