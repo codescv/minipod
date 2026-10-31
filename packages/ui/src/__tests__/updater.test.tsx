@@ -211,10 +211,10 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
     fireEvent.click(screen.getByTestId('nav-rail-settings'));
 
     const settingsScreen = await screen.findByTestId('settings-screen');
-    expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(9);
+    expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(8);
     expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.0');
 
-    // Click inline "Check for updates" button inside Row 9 without opening About dialog
+    // Click inline "Check for updates" button inside Row 8 without opening About dialog
     const updateBtn = screen.getByTestId('settings-update-btn');
     expect(updateBtn).toHaveTextContent('Check for updates');
     fireEvent.click(updateBtn);
@@ -224,8 +224,8 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
       'Update available: v0.1.2',
     );
     expect(screen.getByTestId('settings-update-btn')).toHaveTextContent('Update to v0.1.2');
-    // Still strictly 9 rows!
-    expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(9);
+    // Still strictly 8 rows!
+    expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(8);
 
     // Trigger 1-click PC self-update
     fireEvent.click(screen.getByTestId('settings-update-btn'));

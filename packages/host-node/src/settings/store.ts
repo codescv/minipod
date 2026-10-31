@@ -42,7 +42,7 @@ export interface SecretsFile {
 export function defaultAppSettings(deviceName: string, defaultCountry: CountryCode = COUNTRY_CODE_UNSET): AppSettings {
   return {
     schemaVersion: 1,
-    deleteDownloadWhenPlayed: false,
+    deleteDownloadWhenPlayed: true,
     backgroundRefreshHours: 0,
     sync: {
       provider: null,
@@ -83,7 +83,8 @@ function sanitizeSettings(raw: Partial<AppSettings> | undefined, fallbackDeviceN
 
   return {
     schemaVersion: 1,
-    deleteDownloadWhenPlayed: Boolean(raw.deleteDownloadWhenPlayed),
+    deleteDownloadWhenPlayed:
+      raw.deleteDownloadWhenPlayed === undefined ? true : Boolean(raw.deleteDownloadWhenPlayed),
     backgroundRefreshHours: refreshHours,
     sync,
     playbackSpeed: speed,

@@ -96,7 +96,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.13';
+export const CAPACITOR_HOST_VERSION = '0.1.14';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -213,7 +213,16 @@ export async function createCapacitorPlatformHost(
 
   const readSettings = async (): Promise<AppSettings> => {
     const rec = await db.get('settings', 'app');
-    return rec?.value ?? createDefaultAndroidAppSettings(bootSyncState.deviceName);
+    if (!rec?.value) {
+      return createDefaultAndroidAppSettings(bootSyncState.deviceName);
+    }
+    return {
+      ...rec.value,
+      deleteDownloadWhenPlayed:
+        rec.value.deleteDownloadWhenPlayed === undefined
+          ? true
+          : Boolean(rec.value.deleteDownloadWhenPlayed),
+    };
   };
 
   const writeSettings = async (patch: Partial<AppSettings>): Promise<AppSettings> => {

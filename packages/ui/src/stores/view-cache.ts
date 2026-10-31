@@ -23,6 +23,8 @@ import type {
 
 export const DEFAULT_TIMELINE_LIMIT = 30;
 
+export type EpisodeSortOrder = 'desc' | 'asc';
+
 export interface TimelineEpisodeItem {
   readonly row: EpisodeRowModel;
   readonly feed: Feed;
@@ -39,6 +41,7 @@ export interface HostViewCache {
   feedsLoaded: boolean;
   feedsByKey: ReadonlyMap<FeedKey, Feed>;
   readonly episodesByFeed: Map<FeedKey, readonly EpisodeRowModel[]>;
+  readonly feedSortOrder: Map<FeedKey, EpisodeSortOrder>;
   timelineItems: readonly TimelineEpisodeItem[];
   timelineLoaded: boolean;
   downloadedCount: number;
@@ -62,6 +65,7 @@ function createEmptyHostViewCache(): HostViewCache {
     feedsLoaded: false,
     feedsByKey: new Map(),
     episodesByFeed: new Map(),
+    feedSortOrder: new Map(),
     timelineItems: [],
     timelineLoaded: false,
     downloadedCount: 0,

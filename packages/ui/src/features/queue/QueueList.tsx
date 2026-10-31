@@ -1,6 +1,7 @@
 /**
- * Unified Queue screen (`DESIGN.md` §4.5 + `v0.1.6`):
- * - Header `Queue · N episodes · Xh Ym` (no top-right overflow menu)
+ * Unified Queue screen (`DESIGN.md` §4.5 + `v0.1.14`):
+ * - Header `Queue · N episodes · Xh Ym` + top-right `⋮` menu (`Download all` + `Manage downloads` when non-empty)
+ * - Per-row cache status icon right of remaining time (`check` when downloaded, dashed+solid progress circle when downloading)
  * - Zero inline play or `⋮` row buttons:
  *   - Tap / click row directly plays (or pauses if current)
  *   - Long-press (~450ms) / right-click / `ContextMenu` opens `<ContextMenu testId="queue-context-menu">`
@@ -10,16 +11,19 @@
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, Fragment } from 'react';
 import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
+import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
   ContextMenu,
   cx,
   Icon,
+  Menu,
   nonEmptyUrl,
   preloadArtworkUrls,
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
+import { useDownloadedCount } from '../../hooks/useDownloadedCount';
 import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
@@ -61,6 +65,8 @@ export function QueueList() {
   const locale = useLocale();
   const t = useT();
   const player = usePlayer();
+  const openDownloads = useRouteStore((s) => s.openDownloads);
+  const downloadedCount = useDownloadedCount();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const [rows, setRows] = useState<readonly QueueRow[]>(() => getHostViewCache(host).queueRows);
@@ -68,6 +74,9 @@ export function QueueList() {
     () => getHostViewCache(host).feedsByKey,
   );
   const [loading, setLoading] = useState(() => !getHostViewCache(host).queueLoaded);
+  const [downloadProgressByKey, setDownloadProgressByKey] = useState<
+    ReadonlyMap<EpisodeKey, number>
+  >(() => new Map());
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
   const [dragDeltaY, setDragDeltaY] = useState(0);
@@ -124,6 +133,39 @@ export function QueueList() {
   }, [loadQueue]);
 
   useHostEvents((ev) => {
+    if (ev.type === 'download-updated') {
+      setDownloadProgressByKey((prev) => {
+        if (ev.state === 'RUNNING' || ev.state === 'QUEUED') {
+          const next = new Map(prev);
+          next.set(ev.episodeKey, ev.progress ?? (prev.get(ev.episodeKey) ?? 0));
+          return next;
+        }
+        if (!prev.has(ev.episodeKey)) return prev;
+        const next = new Map(prev);
+        next.delete(ev.episodeKey);
+        return next;
+      });
+      setRows((prev) => {
+        if (!prev.some((r) => r.episode.episodeKey === ev.episodeKey)) return prev;
+        const next = prev.map((r) =>
+          r.episode.episodeKey === ev.episodeKey
+            ? {
+                ...r,
+                episode: {
+                  ...r.episode,
+                  downloadState: ev.state,
+                },
+              }
+            : r,
+        );
+        getHostViewCache(host).queueRows = next;
+        return next;
+      });
+      if (ev.state === 'DONE' || ev.state === 'NONE' || ev.state === 'FAILED') {
+        void loadQueue();
+      }
+      return;
+    }
     if (
       ev.type === 'queue-changed' ||
       ev.type === 'progress-changed' ||
@@ -215,6 +257,9 @@ export function QueueList() {
 
   const startHandleDrag = useCallback(
     (idx: number, pointerId: number | null, clientY: number) => {
+      if (dragStateRef.current !== null && pointerId === null) {
+        return;
+      }
       setActiveContextMenu(null);
       const slots: QueueSlotSnapshot[] = [];
       const container = listRef.current;
@@ -439,6 +484,47 @@ export function QueueList() {
         ? t('queue.headerMeta', { count: rows.length, duration: durationLabel })
         : t('queue.headerCountOnly', { count: rows.length });
 
+  const canDownload = Boolean(host.info.capabilities.downloads);
+  const downloadableRows = canDownload
+    ? rows.filter(
+        (r) =>
+          !r.episode.feedKey.startsWith('l_') &&
+          Boolean(r.episode.enclosureUrl ?? r.entry.stub?.enclosureUrl) &&
+          (r.episode.downloadState === 'NONE' || r.episode.downloadState === 'FAILED'),
+      )
+    : [];
+
+  const handleDownloadAll = useCallback(async () => {
+    if (!canDownload || downloadableRows.length === 0) return;
+    const keys = downloadableRows.map((r) => r.episode.episodeKey);
+    await Promise.allSettled(keys.map((key) => host.episodes.download(key)));
+    await loadQueue();
+  }, [canDownload, downloadableRows, host.episodes, loadQueue]);
+
+  const headerMenuItems: MenuEntry[] = [
+    {
+      key: 'download-all',
+      label: t('queue.downloadAll'),
+      icon: 'download',
+      disabled: downloadableRows.length === 0,
+      testId: 'queue-download-all',
+      onSelect: () => {
+        void handleDownloadAll();
+      },
+    },
+    ...(downloadedCount > 0
+      ? [
+          {
+            key: 'manage-downloads',
+            label: t('subs.manageDownloads', { count: downloadedCount }),
+            icon: 'downloaded' as const,
+            testId: 'queue-manage-downloads',
+            onSelect: () => openDownloads(),
+          },
+        ]
+      : []),
+  ];
+
   const contextTargetRow = activeContextMenu ? rows[activeContextMenu.idx] : undefined;
   const contextMenuItems: MenuEntry[] =
     activeContextMenu && contextTargetRow
@@ -504,6 +590,7 @@ export function QueueList() {
         <h1 className="m-appbar__title" data-testid="queue-header-title">
           {headerText}
         </h1>
+        <Menu label={t('common.more')} items={headerMenuItems} testId="queue-overflow-btn" />
       </header>
 
       {!loading && rows.length === 0 && !pendingUndo ? (
@@ -541,6 +628,15 @@ export function QueueList() {
                 : dur
                   ? formatHumanDuration(dur)
                   : '';
+            const rawProgress = downloadProgressByKey.get(epKey);
+            const progressPercent =
+              rawProgress !== undefined
+                ? Math.round(Math.max(0, Math.min(1, rawProgress)) * 100)
+                : undefined;
+            const cachingLabel =
+              progressPercent !== undefined && progressPercent > 0
+                ? t('queue.cachingProgress', { percent: progressPercent })
+                : t('queue.caching');
 
             return (
               <Fragment key={epKey}>
@@ -575,6 +671,9 @@ export function QueueList() {
                   allowProxy={allowProxy}
                   dateStr={dateStr}
                   remStr={remStr}
+                  downloadProgress={rawProgress}
+                  cachedLabel={t('queue.cached')}
+                  cachingLabel={cachingLabel}
                   isCurrent={isCurrent}
                   isPlaying={isPlaying}
                   draggingIdx={draggingIdx}
@@ -656,6 +755,9 @@ function QueueRowItem({
   allowProxy,
   dateStr,
   remStr,
+  downloadProgress,
+  cachedLabel,
+  cachingLabel,
   isCurrent,
   isPlaying,
   draggingIdx,
@@ -682,6 +784,9 @@ function QueueRowItem({
   readonly allowProxy: boolean;
   readonly dateStr: string;
   readonly remStr: string;
+  readonly downloadProgress?: number | undefined;
+  readonly cachedLabel: string;
+  readonly cachingLabel: string;
   readonly isCurrent: boolean;
   readonly isPlaying: boolean;
   readonly draggingIdx: number | null;
@@ -715,6 +820,11 @@ function QueueRowItem({
   const isDragging = draggingIdx === idx;
   const isAnyDragging = draggingIdx !== null;
   const isDropTarget = dropTargetIdx === idx && draggingIdx !== null && draggingIdx !== idx;
+  const dlState = row.episode.downloadState;
+  const isCacheDone = dlState === 'DONE';
+  const isCacheDownloading = dlState === 'RUNNING' || dlState === 'QUEUED';
+  const progressRatio = Math.max(0, Math.min(1, downloadProgress ?? 0));
+  const progressPercent = Math.round(progressRatio * 100);
 
   let shiftY = 0;
   if (
@@ -736,7 +846,8 @@ function QueueRowItem({
   if (isDragging) {
     rowStyle = {
       transform: `translate3d(0, ${roundedDragDeltaY}px, 0) scale(1.015)`,
-      zIndex: 20,
+      opacity: 1,
+      zIndex: 30,
       position: 'relative',
       boxShadow: 'var(--md-sys-elevation-3)',
       background: 'var(--md-sys-color-surface-container-high)',
@@ -745,6 +856,8 @@ function QueueRowItem({
   } else if (isAnyDragging) {
     rowStyle = {
       transform: `translate3d(0, ${shiftY}px, 0)`,
+      zIndex: 1,
+      position: 'relative',
       transition: 'transform 180ms cubic-bezier(0.2, 0, 0, 1)',
     };
   } else if (swipeOffsetX !== 0) {
@@ -755,7 +868,20 @@ function QueueRowItem({
   }
 
   return (
-    <div className="m-swipe-container">
+    <div
+      className={cx(
+        'm-swipe-container',
+        isAnyDragging && 'is-drag-active',
+        isDragging && 'is-dragging-container',
+      )}
+      style={
+        isDragging
+          ? { overflow: 'visible', zIndex: 30 }
+          : isAnyDragging
+            ? { overflow: 'visible', zIndex: 1 }
+            : undefined
+      }
+    >
       {swipeDirection === 'left' && !isAnyDragging && (
         <div
           aria-hidden="true"
@@ -856,9 +982,11 @@ function QueueRowItem({
             onStartHandleDrag(idx, e.pointerId, e.clientY);
           }}
           onPointerMove={(e) => {
+            e.stopPropagation();
             onUpdateHandleDrag(e.pointerId, e.clientY);
           }}
           onPointerUp={(e) => {
+            e.stopPropagation();
             try {
               e.currentTarget.releasePointerCapture?.(e.pointerId);
             } catch {
@@ -867,6 +995,7 @@ function QueueRowItem({
             onFinishHandleDrag(e.pointerId, e.clientY, false);
           }}
           onPointerCancel={(e) => {
+            e.stopPropagation();
             try {
               e.currentTarget.releasePointerCapture?.(e.pointerId);
             } catch {
@@ -893,6 +1022,10 @@ function QueueRowItem({
             const touch = e.changedTouches[0];
             onFinishHandleDrag(null, touch?.clientY, false);
           }}
+          onTouchCancel={(e) => {
+            e.stopPropagation();
+            onFinishHandleDrag(null, undefined, true);
+          }}
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -917,11 +1050,66 @@ function QueueRowItem({
 
         <div className="m-episode-row__body">
           <div className="m-episode-row__title">{row.episode.title}</div>
-          {(dateStr || remStr) && (
+          {(dateStr || remStr || isCacheDone || isCacheDownloading) && (
             <div className="m-episode-row__meta">
               {dateStr && <span>{dateStr}</span>}
               {dateStr && remStr && <span>·</span>}
               {remStr && <span>{remStr}</span>}
+              {isCacheDone && (
+                <span
+                  className="m-queue-cache-status is-done"
+                  role="img"
+                  aria-label={cachedLabel}
+                  title={cachedLabel}
+                  data-testid={`queue-cache-status-${epKey}`}
+                  data-cache-state="done"
+                >
+                  <Icon name="check" size={14} />
+                </span>
+              )}
+              {isCacheDownloading && (
+                <span
+                  className="m-queue-cache-status is-downloading"
+                  role="img"
+                  aria-label={cachingLabel}
+                  title={cachingLabel}
+                  data-testid={`queue-cache-status-${epKey}`}
+                  data-cache-state="downloading"
+                  data-cache-progress={progressPercent}
+                >
+                  <svg
+                    width={14}
+                    height={14}
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <circle
+                      cx="7"
+                      cy="7"
+                      r="5.25"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeDasharray="2.1 2.1"
+                      opacity="0.45"
+                    />
+                    <circle
+                      cx="7"
+                      cy="7"
+                      r="5.25"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeDasharray={32.99}
+                      strokeDashoffset={Number(
+                        (32.99 * (1 - Math.max(0.12, progressRatio))).toFixed(2),
+                      )}
+                      transform="rotate(-90 7 7)"
+                    />
+                  </svg>
+                </span>
+              )}
             </div>
           )}
         </div>

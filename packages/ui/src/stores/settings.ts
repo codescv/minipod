@@ -6,7 +6,7 @@ import { COUNTRY_CODE_UNSET, type AppSettings, type PlatformHost } from '@minipo
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   schemaVersion: 1,
-  deleteDownloadWhenPlayed: false,
+  deleteDownloadWhenPlayed: true,
   backgroundRefreshHours: 3,
   sync: {
     provider: null,

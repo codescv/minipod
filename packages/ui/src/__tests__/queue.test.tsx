@@ -29,14 +29,75 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     expect(screen.getByTestId('queue-list')).toBeInTheDocument();
     expect(screen.getByTestId('queue-row-0')).toBeInTheDocument();
     expect(screen.queryByTestId('queue-empty')).not.toBeInTheDocument();
-    // Top-right queue overflow menu is removed in v0.1.6
-    expect(screen.queryByTestId('queue-overflow-btn')).not.toBeInTheDocument();
+    // Top-right queue overflow menu is present in v0.1.14 (`Download all` + `Manage downloads` when non-empty)
+    expect(screen.getByTestId('queue-overflow-btn')).toBeInTheDocument();
 
     const initialQueue = await host.queue.list();
     expect(initialQueue).toHaveLength(3);
     const firstKey = initialQueue[0]!.episode.episodeKey;
     const secondKey = initialQueue[1]!.episode.episodeKey;
     const thirdKey = initialQueue[2]!.episode.episodeKey;
+
+    // Per-row cache status indicator right of remaining time:
+    // - firstKey (`ep42`) is `DONE` -> check icon (`data-cache-state="done"`)
+    // - secondKey (`kt-18`) and thirdKey (`mdr-09`) are `NONE` -> no status indicator
+    expect(screen.getByTestId(`queue-cache-status-${firstKey}`)).toHaveAttribute(
+      'data-cache-state',
+      'done',
+    );
+    expect(screen.queryByTestId(`queue-cache-status-${secondKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
+
+    // Live downloading progress indicator (`RUNNING` -> dashed+solid circle SVG)
+    act(() => {
+      host.emit({
+        type: 'download-updated',
+        episodeKey: secondKey,
+        state: 'RUNNING',
+        progress: 0.45,
+      });
+    });
+    const cachingBadge = screen.getByTestId(`queue-cache-status-${secondKey}`);
+    expect(cachingBadge).toHaveAttribute('data-cache-state', 'downloading');
+    expect(cachingBadge).toHaveAttribute('data-cache-progress', '45');
+    expect(cachingBadge.querySelectorAll('circle')).toHaveLength(2);
+
+    act(() => {
+      host.emit({
+        type: 'download-updated',
+        episodeKey: secondKey,
+        state: 'NONE',
+      });
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${secondKey}`)).not.toBeInTheDocument();
+    });
+
+    // Top-right queue menu: shows `Download all` and `Manage downloads (2)` when downloads > 0
+    await waitFor(() => {
+      fireEvent.click(screen.getByTestId('queue-overflow-btn'));
+      expect(screen.getByTestId('queue-manage-downloads')).toHaveTextContent(
+        'Manage downloads (2)',
+      );
+    });
+    expect(screen.getByTestId('queue-download-all')).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId('queue-download-all'));
+
+    // `Download all` downloads all un-downloaded queue episodes so all 3 rows show `done` checkmarks
+    await waitFor(() => {
+      expect(screen.getByTestId(`queue-cache-status-${firstKey}`)).toHaveAttribute(
+        'data-cache-state',
+        'done',
+      );
+      expect(screen.getByTestId(`queue-cache-status-${secondKey}`)).toHaveAttribute(
+        'data-cache-state',
+        'done',
+      );
+      expect(screen.getByTestId(`queue-cache-status-${thirdKey}`)).toHaveAttribute(
+        'data-cache-state',
+        'done',
+      );
+    });
 
     // Zero inline Play or `⋮` buttons on queue rows
     const row0Initial = screen.getByTestId('queue-row-0');
@@ -124,10 +185,20 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     );
 
     // Live item-following drag: dragged row follows pointer (+120px) while rows 1 & 2 shift UP (-60px)
-    expect(screen.getByTestId('queue-row-0').getAttribute('data-drag-offset-y')).toBe('120');
-    expect(screen.getByTestId('queue-row-0').style.transform).toContain('translate3d(0, 120px, 0)');
-    expect(screen.getByTestId('queue-row-1').getAttribute('data-shift-y')).toBe('-60');
-    expect(screen.getByTestId('queue-row-2').getAttribute('data-shift-y')).toBe('-60');
+    // and outer `.m-swipe-container`s have `overflow: visible` + elevated z-index so rows never disappear/clip!
+    const draggedRowEl = screen.getByTestId('queue-row-0');
+    const shiftedRow1El = screen.getByTestId('queue-row-1');
+    const shiftedRow2El = screen.getByTestId('queue-row-2');
+    expect(draggedRowEl.getAttribute('data-drag-offset-y')).toBe('120');
+    expect(draggedRowEl.style.transform).toContain('translate3d(0, 120px, 0)');
+    expect(draggedRowEl.style.opacity).toBe('1');
+    expect(draggedRowEl.parentElement).toHaveClass('m-swipe-container', 'is-dragging-container');
+    expect(draggedRowEl.parentElement?.style.overflow).toBe('visible');
+    expect(draggedRowEl.parentElement?.style.zIndex).toBe('30');
+    expect(shiftedRow1El.getAttribute('data-shift-y')).toBe('-60');
+    expect(shiftedRow1El.parentElement).toHaveClass('m-swipe-container', 'is-drag-active');
+    expect(shiftedRow1El.parentElement?.style.overflow).toBe('visible');
+    expect(shiftedRow2El.getAttribute('data-shift-y')).toBe('-60');
 
     fireEvent(
       handle0,

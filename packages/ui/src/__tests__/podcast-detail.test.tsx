@@ -40,6 +40,33 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
     expect(screen.getByText(/39: SQLite WAL Mode/)).toBeInTheDocument();
     expect(screen.getByText(/41: Parsing 15 Years/)).toBeInTheDocument();
 
+    // Sort order button right of `Downloaded` chip toggles between newest-first (`desc`) and oldest-first (`asc`) and persists in view cache
+    const sortBtn = screen.getByTestId('detail-sort-order-btn');
+    expect(sortBtn).toHaveAttribute('data-sort-order', 'desc');
+    const getRenderedTitles = () =>
+      Array.from(
+        screen.getByTestId('detail-episode-list').querySelectorAll('.m-episode-row__title'),
+      ).map((el) => el.textContent ?? '');
+    expect(getRenderedTitles()[0]).toMatch(/^42:/);
+    expect(getRenderedTitles()[3]).toMatch(/^39:/);
+
+    fireEvent.click(sortBtn);
+    expect(screen.getByTestId('detail-sort-order-btn')).toHaveAttribute('data-sort-order', 'asc');
+    expect(getRenderedTitles()[0]).toMatch(/^39:/);
+    expect(getRenderedTitles()[3]).toMatch(/^42:/);
+
+    // Navigating back to Subscriptions and reopening PodcastDetail preserves sortOrder (`asc`) on frame 0
+    fireEvent.click(screen.getByTestId('detail-back-btn'));
+    expect(screen.getByTestId('subs-grid')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Syntax & Signal'));
+    expect(screen.getByTestId('detail-sort-order-btn')).toHaveAttribute('data-sort-order', 'asc');
+    expect(getRenderedTitles()[0]).toMatch(/^39:/);
+
+    // Toggle back to `desc` for the rest of the test
+    fireEvent.click(screen.getByTestId('detail-sort-order-btn'));
+    expect(screen.getByTestId('detail-sort-order-btn')).toHaveAttribute('data-sort-order', 'desc');
+    expect(getRenderedTitles()[0]).toMatch(/^42:/);
+
     const feeds = await host.feeds.list();
     const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
     const page = await host.episodes.list(syntax.feedKey, 'all');
@@ -194,6 +221,8 @@ describe('Podcast Detail, Gesture-Driven EpisodeRow & RFC 5005 Pagination', () =
       const updated = await host.episodes.get(ep39.episodeKey);
       expect(updated.progress?.state).toBe('PLAYED');
       expect(updated.inQueue).toBe(false);
+      // Because deleteDownloadWhenPlayed is true by default, marking played auto-deletes the download
+      expect(updated.episode.downloadState).toBe('NONE');
     });
 
     // Inline Undo restores ep 39 to unplayed AND puts it back in the visible list & queue!

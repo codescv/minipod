@@ -223,7 +223,7 @@ export async function openMiniPodDb(
 export function createDefaultAndroidAppSettings(deviceName: string): AppSettings {
   return {
     schemaVersion: 1,
-    deleteDownloadWhenPlayed: false,
+    deleteDownloadWhenPlayed: true,
     backgroundRefreshHours: 0,
     sync: {
       provider: null,

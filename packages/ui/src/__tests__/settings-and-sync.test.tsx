@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { buildM3Tokens } from '../theme/m3-theme';
 import { renderMiniPod } from './test-helpers';
 
-describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Theme', () => {
-  it('renders strictly 9 settings rows, updates settings, exports OPML, and configures WebDAV & Drive sync on desktop', async () => {
+describe('Minimalist Settings (8 Rows), Cloud Sync Capability Gating & i18n/Theme', () => {
+  it('renders strictly 8 settings rows (auto-delete played downloads enabled by default without UI toggle), updates settings, exports OPML, and configures WebDAV & Drive sync on desktop', async () => {
     const { host } = renderMiniPod({ width: 1024 });
 
     await screen.findByText('Syntax & Signal');
@@ -12,13 +12,10 @@ describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Them
 
     const settingsScreen = await screen.findByTestId('settings-screen');
     const rows = settingsScreen.querySelectorAll('[data-settings-row]');
-    expect(rows).toHaveLength(9);
-
-    // Toggle Delete download when played
-    fireEvent.click(screen.getByTestId('settings-switch-delete-played'));
-    await waitFor(async () => {
-      expect((await host.settings.get()).deleteDownloadWhenPlayed).toBe(true);
-    });
+    expect(rows).toHaveLength(8);
+    expect(screen.queryByTestId('settings-row-delete-played')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('settings-switch-delete-played')).not.toBeInTheDocument();
+    expect((await host.settings.get()).deleteDownloadWhenPlayed).toBe(true);
 
     // Export OPML
     fireEvent.click(screen.getByTestId('settings-row-export-opml'));

@@ -39,6 +39,7 @@ import {
   filterCachedEpisodeRows,
   getHostViewCache,
   recomputeHostTimelineAndDownloads,
+  type EpisodeSortOrder,
 } from '../../stores/view-cache';
 import { EpisodeRow } from './EpisodeRow';
 
@@ -58,6 +59,9 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     () => getHostViewCache(host).episodesByFeed.get(feedKey) ?? [],
   );
   const [filter, setFilter] = useState<EpisodeFilter>('all');
+  const [sortOrder, setSortOrder] = useState<EpisodeSortOrder>(
+    () => getHostViewCache(host).feedSortOrder.get(feedKey) ?? 'desc',
+  );
   const [rows, setRows] = useState<readonly EpisodeRowModel[]>(
     () => getHostViewCache(host).episodesByFeed.get(feedKey) ?? [],
   );
@@ -80,6 +84,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     const cachedAll = viewCache.episodesByFeed.get(feedKey) ?? [];
     inlineUndoKeysRef.current.clear();
     setFeed(viewCache.feedsByKey.get(feedKey) ?? null);
+    setSortOrder(viewCache.feedSortOrder.get(feedKey) ?? 'desc');
     setAllRows(cachedAll);
     setRows(filterCachedEpisodeRows(cachedAll, filter, inlineUndoKeysRef.current));
     setDismissedKeys(new Set());
@@ -246,7 +251,9 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
 
   const plainDesc = stripHtmlToText(feed?.description);
   const allowDownloads = Boolean(host.info.capabilities.downloads && feed?.kind !== 'LOCAL');
-  const visibleRows = rows.filter((r) => !dismissedKeys.has(r.episode.episodeKey));
+  const filteredVisibleRows = rows.filter((r) => !dismissedKeys.has(r.episode.episodeKey));
+  const visibleRows =
+    sortOrder === 'asc' ? [...filteredVisibleRows].reverse() : filteredVisibleRows;
 
   const menuItems: MenuEntry[] = [
     ...(downloadedCount > 0
@@ -392,6 +399,20 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         >
           {t('detail.filterDownloaded')}
         </Chip>
+        <IconButton
+          icon={sortOrder === 'desc' ? 'sortDesc' : 'sortAsc'}
+          label={sortOrder === 'desc' ? t('detail.sortDescLabel') : t('detail.sortAscLabel')}
+          data-testid="detail-sort-order-btn"
+          data-sort-order={sortOrder}
+          style={{ marginLeft: 'auto' }}
+          onClick={() => {
+            setSortOrder((prev) => {
+              const next: EpisodeSortOrder = prev === 'desc' ? 'asc' : 'desc';
+              getHostViewCache(host).feedSortOrder.set(feedKey, next);
+              return next;
+            });
+          }}
+        />
       </div>
 
       {!loading && visibleRows.length === 0 ? (

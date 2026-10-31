@@ -1,6 +1,6 @@
 /**
  * Minimalist Settings screen (`DESIGN.md` §4.7):
- * Strictly 9 rows — Downloads (1), Cloud sync (4), Subscriptions (3), About (1).
+ * Strictly 8 rows — Cloud sync (4), Subscriptions (3), About (1).
  */
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings, SyncProviderConfig, SyncStatus } from '@minipod/core';
@@ -161,30 +161,11 @@ export function SettingsPage() {
         <h1 className="m-appbar__title">{t('settings.title')}</h1>
       </header>
 
-      {/* Section 1: Downloads (Row 1) */}
-      <section className="m-settings-section">
-        <h2 className="m-settings-heading">{t('settings.sectionDownloads')}</h2>
-
-        <div className="m-settings-row" data-settings-row="1" data-testid="settings-row-delete-played">
-          <div className="m-settings-row__text">
-            <span className="m-settings-row__title">{t('settings.deleteWhenPlayed')}</span>
-          </div>
-          <Switch
-            checked={settings.deleteDownloadWhenPlayed}
-            label={t('settings.deleteWhenPlayed')}
-            testId="settings-switch-delete-played"
-            onChange={(next) => {
-              void updateSettings(host, { deleteDownloadWhenPlayed: next });
-            }}
-          />
-        </div>
-      </section>
-
-      {/* Section 2: Cloud sync (Rows 2..5) */}
+      {/* Section 1: Cloud sync (Rows 1..4) */}
       <section className="m-settings-section">
         <h2 className="m-settings-heading">{t('settings.sectionSync')}</h2>
 
-        <div className="m-settings-row" data-settings-row="2" data-testid="settings-row-sync-status">
+        <div className="m-settings-row" data-settings-row="1" data-testid="settings-row-sync-status">
           <div className="m-settings-row__text">
             <span className="m-settings-row__title">{t('settings.syncStatusLabel')}</span>
             <span className="m-settings-row__subtitle" data-testid="settings-sync-status-text">
@@ -206,7 +187,7 @@ export function SettingsPage() {
         <button
           type="button"
           className="m-settings-row m-settings-row--clickable"
-          data-settings-row="3"
+          data-settings-row="2"
           data-testid="settings-row-provider"
           onClick={openCloudSync}
         >
@@ -219,7 +200,7 @@ export function SettingsPage() {
           <span aria-hidden="true">›</span>
         </button>
 
-        <div className="m-settings-row" data-settings-row="4" data-testid="settings-row-wifi-only">
+        <div className="m-settings-row" data-settings-row="3" data-testid="settings-row-wifi-only">
           <div className="m-settings-row__text">
             <span className="m-settings-row__title">{t('settings.wifiOnly')}</span>
           </div>
@@ -236,7 +217,7 @@ export function SettingsPage() {
         <button
           type="button"
           className="m-settings-row m-settings-row--clickable"
-          data-settings-row="5"
+          data-settings-row="4"
           data-testid="settings-row-device-name"
           onClick={() => {
             setDeviceDraft(settings.sync.deviceName);
@@ -251,14 +232,14 @@ export function SettingsPage() {
         </button>
       </section>
 
-      {/* Section 3: Subscriptions (Rows 6..8) */}
+      {/* Section 2: Subscriptions (Rows 5..7) */}
       <section className="m-settings-section">
         <h2 className="m-settings-heading">{t('settings.sectionSubscriptions')}</h2>
 
         <button
           type="button"
           className="m-settings-row m-settings-row--clickable"
-          data-settings-row="6"
+          data-settings-row="5"
           data-testid="settings-row-import-opml"
           onClick={() => setOpmlImportOpen(true)}
         >
@@ -270,7 +251,7 @@ export function SettingsPage() {
         <button
           type="button"
           className="m-settings-row m-settings-row--clickable"
-          data-settings-row="7"
+          data-settings-row="6"
           data-testid="settings-row-export-opml"
           onClick={() => {
             void handleExportOpml();
@@ -281,7 +262,7 @@ export function SettingsPage() {
           </div>
         </button>
 
-        <div className="m-settings-row" data-settings-row="8" data-testid="settings-row-refresh">
+        <div className="m-settings-row" data-settings-row="7" data-testid="settings-row-refresh">
           <div className="m-settings-row__text">
             <span className="m-settings-row__title">{t('settings.refreshInterval')}</span>
           </div>
@@ -305,13 +286,13 @@ export function SettingsPage() {
         </div>
       </section>
 
-      {/* Section 4: About (Row 9) */}
+      {/* Section 3: About (Row 8) */}
       <section className="m-settings-section">
         <h2 className="m-settings-heading">{t('settings.sectionAbout')}</h2>
 
         <div
           className="m-settings-row m-settings-row--clickable"
-          data-settings-row="9"
+          data-settings-row="8"
           data-testid="settings-row-about"
           onClick={() => setAboutOpen(true)}
         >
