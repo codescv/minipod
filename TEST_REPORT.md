@@ -1,10 +1,10 @@
 # Podcasts (`codescv/minipod`) — Integration, E2E, Cloud Sync, Auto-Updater & Android APK Test Report
 
 - **Date**: 2026-10-31
-- **Version Verified**: `0.1.12` (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 13`)
+- **Version Verified**: `0.1.13` (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 14`)
 - **Live Repository & Release**:
-  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.12`)
-  - Release `v0.1.12`: <https://github.com/codescv/minipod/releases/tag/v0.1.12>
+  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.13`)
+  - Release `v0.1.13`: <https://github.com/codescv/minipod/releases/tag/v0.1.13>
   - Release API: `https://api.github.com/repos/codescv/minipod/releases/latest` (`200 OK`)
 - **Environment**:
   - OS: Linux (`x86_64`)
@@ -24,8 +24,8 @@
 | **3. Zero-Native-Addon Gate (`pnpm check:native`)** | **PASS** | **0** `.node` binaries, **0** `binding.gyp`, **0** native build scripts across runtime tree |
 | **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` + `dist/web` with `favicon.svg`, `icon-light-192.png`, `icon-dark-192.png`) & `@minipod/host-android` (`www` with adaptive icons) |
 | **5. Live Server & Playwright Browser E2E** | **PASS** | **118 / 118 end-to-end checks passed** (`39` core/UI/sync/updater E2E + `11` `v0.1.3` Timeline/Background/Artwork E2E + `12` `v0.1.4` `Podcasts` branding & 7A/7B adaptive icon E2E + `21` `v0.1.5` gesture `EpisodeRow`, pointer-drag `QueueList`, & conditional `Manage downloads` E2E + `15` `v0.1.6` swipe edge hints, live item-following queue drag reorder, removed queue overflow menu, grid-only Subscriptions + `subs-settings-btn`, & 3-layer artwork cache E2E + `9` `v0.1.7` / `v0.1.8` 3-preset speed control & in-place row undo E2E + `11` `v0.1.9` instant SWR tab/filter/source switching & Google Drive SAF fallback E2E checks; `[data-settings-row]` strictly `9`) |
-| **6. Standalone Android APK (`v0.1.12`) & OAuth / SAF Cloud Sync / Adaptive Icon / Background Playback / Native Artwork Cache** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.12.apk` (`7,132,584` bytes, `application-label:'Podcasts'`, `versionCode='13'`, `versionName='0.1.12'`, APK Signature v2 with pinned keystore `SHA-1: f5d0cccfda49440bbb5422cb880fc8c68166a654`, `google_oauth_client_id='304560912778-cqrmg9l6ua7dhpvvr40sviie0ir9sjp3.apps.googleusercontent.com'`, direct `AccountManager` + `GoogleAuthUtil.getToken` flow, `MiniPodPlugin.writeSafBytes` (`ContentResolver.openOutputStream` `"wt"`/`"rwt"` cloud `DocumentsProvider` write compatibility) + 0-byte SAF document creation & `markAllDirty()` initial sync, `BridgeWebViewClient.shouldInterceptRequest` native disk artwork cache, day/night `ic_launcher_background` `#F4F1EA` / `#18181B`, `ic_launcher_arcs` `#1C1917` / `#F4F4F5`, `ic_launcher_dot` `#FF4F00`, `ic_launcher_foreground_vector`, `ic_launcher_monochrome`, `mipmap-*` & `mipmap-night-*`) |
-| **7. Live Public GitHub Repository & Release (`v0.1.12`)** | **PASS** | Published `main` + annotated tag `v0.1.12` + GitHub Release `v0.1.12` with `minipod-v0.1.12.apk`, `app-release.apk`, and `minipod-v0.1.12-pc.tar.gz` |
+| **6. Standalone Android APK (`v0.1.13`) & OAuth / SAF Cloud Sync / Adaptive Icon / Background Playback / Native Artwork Cache** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.13.apk` (`7,131,984` bytes, `application-label:'Podcasts'`, `versionCode='14'`, `versionName='0.1.13'`, APK Signature v2 with pinned keystore `SHA-1: f5d0cccfda49440bbb5422cb880fc8c68166a654`, direct `AccountManager.newChooseAccountIntent` + `GoogleAuthUtil.getToken` flow without `google_oauth_client_id` / `hasConfiguredOAuthClient()` gate, `MiniPodPlugin.writeSafBytes` (`ContentResolver.openOutputStream` `"wt"`/`"rwt"` cloud `DocumentsProvider` write compatibility) + 0-byte SAF document creation & `markAllDirty()` initial sync, `BridgeWebViewClient.shouldInterceptRequest` native disk artwork cache, day/night `ic_launcher_background` `#F4F1EA` / `#18181B`, `ic_launcher_arcs` `#1C1917` / `#F4F4F5`, `ic_launcher_dot` `#FF4F00`, `ic_launcher_foreground_vector`, `ic_launcher_monochrome`, `mipmap-*` & `mipmap-night-*`) |
+| **7. Live Public GitHub Repository & Release (`v0.1.13`)** | **PASS** | Published `main` + annotated tag `v0.1.13` + GitHub Release `v0.1.13` with `minipod-v0.1.13.apk`, `app-release.apk`, and `minipod-v0.1.13-pc.tar.gz` |
 
 ---
 
@@ -263,22 +263,22 @@ Executed against a live `v0.1.9` `@minipod/host-node` server (`node:sqlite` WAL 
 
 ---
 
-## 3. Standalone Android APK (`v0.1.12`) & Google OAuth 2.0 / SAF Cloud Sync / Adaptive Icon / Background Playback / Native Artwork Cache Verification
+## 3. Standalone Android APK (`v0.1.13`) & Google OAuth 2.0 / SAF Cloud Sync / Adaptive Icon / Background Playback / Native Artwork Cache Verification
 
-Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.12`:
+Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.13`:
 
-- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.12.apk`)**:
+- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.13.apk`)**:
   - Local Path: `packages/host-android/android/app/build/outputs/apk/release/app-release.apk`
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.12/minipod-v0.1.12.apk`
-  - Size: `7,132,584` bytes (`6.80 MiB`)
-  - SHA-256: `f3a9087385ed9e212a8da84fb267724ef631a17227a062c521e19719e4fb10b6`
-- **PC Standalone Release Bundle (`minipod-v0.1.12-pc.tar.gz`)**:
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.12/minipod-v0.1.12-pc.tar.gz`
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.13/minipod-v0.1.13.apk`
+  - Size: `7,131,984` bytes (`6.80 MiB`)
+  - SHA-256: `8e073f4ab1624c481d960b9e6d7d2530271e30dc6e1d03238159de08f2726522`
+- **PC Standalone Release Bundle (`minipod-v0.1.13-pc.tar.gz`)**:
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.13/minipod-v0.1.13-pc.tar.gz`
 - **Manifest, Adaptive Day/Night Icon, `PlaybackService`, `FileProvider`, Native WebView Artwork Cache & DEX Verification (`aapt2 dump badging`, `aapt2 dump resources`, `aapt2 dump xmltree`)**:
-  - Package & Display Label: `dev.minipod.app` (**`application-label:'Podcasts'`**, **`versionCode='13'`**, **`versionName='0.1.12'`**, `minSdkVersion='26'`, `targetSdkVersion='36'`), `assets/capacitor.config.json` `appName: "Podcasts"`
-  - Native WebView Artwork Cache (`MainActivity.java`): `BridgeWebViewClient.shouldInterceptRequest` intercepts remote artwork and `/api/image-proxy?url=...` requests, caching image bytes on disk under `getCacheDir()/artwork-cache/<sha256>.{bin,mime}` with per-hash lock deduplication, OkHttp (`User-Agent: Podcasts/0.1.12`), and `Cache-Control: public, max-age=31536000, immutable`
+  - Package & Display Label: `dev.minipod.app` (**`application-label:'Podcasts'`**, **`versionCode='14'`**, **`versionName='0.1.13'`**, `minSdkVersion='26'`, `targetSdkVersion='36'`), `assets/capacitor.config.json` `appName: "Podcasts"`
+  - Native WebView Artwork Cache (`MainActivity.java`): `BridgeWebViewClient.shouldInterceptRequest` intercepts remote artwork and `/api/image-proxy?url=...` requests, caching image bytes on disk under `getCacheDir()/artwork-cache/<sha256>.{bin,mime}` with per-hash lock deduplication, OkHttp (`User-Agent: Podcasts/0.1.13`), and `Cache-Control: public, max-age=31536000, immutable`
   - Direct Android Google OAuth 2.0 Token Flow, Deterministic Keystore & SAF 0-Byte Cloud `DocumentsProvider` Sync (`MiniPodPlugin.java`, `HostFileProvider.ts`, `SafFileProvider.ts`, `IdbSyncStore.ts`, `strings.xml`, `build.gradle`):
-    - Configured `string/google_oauth_client_id = "304560912778-cqrmg9l6ua7dhpvvr40sviie0ir9sjp3.apps.googleusercontent.com"` (`strings.xml`).
+    - Removed unused `string/google_oauth_client_id` from `strings.xml` and `hasConfiguredOAuthClient()` gate from `MiniPodPlugin.java` so `launchGoogleAccountChooser` proceeds directly to `AccountManager.newChooseAccountIntent`.
     - Pinned `packages/host-android/android/app/minipod-release.keystore` across both `debug` and `release` `signingConfigs` (`SHA-1: f5d0cccfda49440bbb5422cb880fc8c68166a654`, `SHA-256: a2be41f8d6d8ade3f4c4cc618259114bc1c50a98f94032ea5ac94c310628dcf5`).
     - Upgraded `MiniPodPlugin.authGoogleSignIn` to use `AccountManager.newChooseAccountIntent` + `GoogleAuthUtil.getToken` with `SharedPreferences("minipod_auth")` (`"google_account_email"`) and `pendingConsentAccount` so tokens are minted immediately upon `UserRecoverableAuthException` consent approval without re-prompting for the account, while persisting `accountHint` in `AndroidDriveAuthManager` / `CapacitorPlatformHost` and retaining `launchGoogleDriveSafFallback` as a zero-dead-end fallback.
     - Fixed newly created 0-byte SAF sync files (`Intent.ACTION_CREATE_DOCUMENT`) by treating 0-byte / blank documents as `{ kind: 'missing' }` in `HostFileProvider.read()`, allowing initial overwrites when `ifMatch === null` in `HostFileProvider.write()`, writing via `ContentResolver.openOutputStream` (`"wt"` -> `"rwt"` -> `"w"` -> default) in `MiniPodPlugin.writeSafBytes()` so cloud `DocumentsProvider`s (Google Drive, OneDrive, Nextcloud) commit uploads on `close()`, and calling `syncStore.markAllDirty()` + resetting `floors` when switching sync providers so all local subscriptions, queue entries, and progress records are pushed immediately.
@@ -313,3 +313,5 @@ Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) 
 5. **Latest Episodes (`最新单集`) Timeline Queued/Started Filtering & Flexible 2-Row Subscriptions Cover Grid (`v0.1.12`, `versionCode 13`)**:
    - Updated `recomputeHostTimelineAndDownloads` (`packages/ui/src/stores/view-cache.ts`), `SubscriptionsGrid.tsx`, and `EpisodeRow.tsx` so `最新单集` excludes episodes that are `PLAYED`, `IN_PROGRESS` / `positionMs > 0`, currently playing (`activeEpisodeKey`), or already in the queue (`inQueue` / `queueRows`), immediately removing episodes on tap-to-play or replacing swiped-left (`Play next`) rows in-place with `.m-inline-undo` (`inline-undo-*`, restoring to `最新单集` on `Undo`).
    - Replaced the fixed 3-column mobile / 6-item collapse threshold with `computeSubscriptionsGridCols` (`MAX_SUBS_COLLAPSED_ROWS = 2`, `ResizeObserver` + `window` resize), rendering `4` covers per row on `360px–440px` phones (collapsing after `8` feeds) and `6` covers per row on `1024px` desktop (collapsing after `12` feeds).
+6. **Removed Unused `google_oauth_client_id` Resource & `hasConfiguredOAuthClient()` Gate (`v0.1.13`, `versionCode 14`)**:
+   - Removed `<string name="google_oauth_client_id">` from `packages/host-android/android/app/src/main/res/values/strings.xml` and removed `hasConfiguredOAuthClient()` from `MiniPodPlugin.java` (`launchGoogleAccountChooser`), allowing Android Google Drive sign-in to proceed directly to `AccountManager.newChooseAccountIntent` without checking for a client ID string resource.
