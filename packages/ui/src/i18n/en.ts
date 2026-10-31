@@ -36,6 +36,11 @@ export const en: Messages = {
   'subs.copyUrl': 'Copy feed URL',
   'subs.needsAuth': 'Needs sign-in',
   'subs.localBadge': 'Local folder',
+  'subs.timelineTitle': 'Latest episodes',
+  'subs.expandAll': 'Show all ({count})',
+  'subs.collapse': 'Show less',
+  'subs.loadMoreTimeline': 'Load more',
+  'subs.longPressHint': 'Long-press or right-click for options',
 
   'detail.filterAll': 'All',
   'detail.filterUnplayed': 'Unplayed',

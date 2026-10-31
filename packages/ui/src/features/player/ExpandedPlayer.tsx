@@ -4,7 +4,7 @@
 import { useRef, useState } from 'react';
 import { SPEED_MAX, SPEED_MIN } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
-import { BottomSheet, Button, Icon, IconButton } from '../../components/m3';
+import { ArtworkImage, BottomSheet, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { formatClock, formatRemainingClock, formatSpeed } from '../../lib/format';
@@ -131,16 +131,15 @@ export function ExpandedPlayer() {
             />
           ) : (
             <div className="m-expanded-player__artwork-wrap">
-              {player.artworkUrl ? (
-                <img
-                  className="m-expanded-player__artwork"
-                  src={player.artworkUrl}
-                  alt=""
-                  data-testid="expanded-artwork-img"
-                />
-              ) : (
-                <Icon name="podcasts" size={72} />
-              )}
+              <ArtworkImage
+                src={player.artworkUrl}
+                extraFallbackSrc={player.episodeArtworkUrl}
+                fallbackSrc={player.fallbackArtworkUrl}
+                allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+                className="m-expanded-player__artwork"
+                testId="expanded-artwork-img"
+                placeholder={<Icon name="podcasts" size={72} />}
+              />
             </div>
           )}
 

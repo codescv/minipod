@@ -8,7 +8,18 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { EpisodeFilter, EpisodeRow as EpisodeRowModel, Feed, FeedKey } from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
-import { Button, Chip, cx, Dialog, Icon, IconButton, Menu, type MenuEntry } from '../../components/m3';
+import {
+  ArtworkImage,
+  Button,
+  Chip,
+  cx,
+  Dialog,
+  Icon,
+  IconButton,
+  Menu,
+  shouldUseImageProxy,
+  type MenuEntry,
+} from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
@@ -170,13 +181,16 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
 
       {feed && (
         <section className="m-feed-hero">
-          {feed.imageUrl ? (
-            <img className="m-feed-hero__cover" src={feed.imageUrl} alt="" />
-          ) : (
-            <div className="m-feed-hero__cover" style={{ display: 'grid', placeItems: 'center' }}>
-              <Icon name="podcasts" size={32} />
-            </div>
-          )}
+          <ArtworkImage
+            src={feed.imageUrl}
+            allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+            className="m-feed-hero__cover"
+            placeholder={
+              <div className="m-feed-hero__cover" style={{ display: 'grid', placeItems: 'center' }}>
+                <Icon name="podcasts" size={32} />
+              </div>
+            }
+          />
           <div className="m-feed-hero__info">
             <div style={{ font: 'var(--md-sys-typescale-title-medium)' }}>{feed.title ?? feed.url}</div>
             {feed.author && <div className="m-feed-hero__author">{feed.author}</div>}
