@@ -4,4 +4,5 @@
     <string name="title_activity_main">Podcasts</string>
     <string name="package_name">dev.minipod.app</string>
     <string name="custom_url_scheme">dev.minipod.app</string>
+    <string name="google_oauth_client_id" translatable="false"></string>
 </resources>

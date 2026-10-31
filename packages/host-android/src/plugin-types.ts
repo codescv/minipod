@@ -60,6 +60,8 @@ export interface SafPickOptions {
   readonly mode: 'open' | 'create' | 'tree';
   readonly mime?: string;
   readonly suggestedName?: string;
+  readonly initialUri?: string;
+  readonly preferGoogleDrive?: boolean;
 }
 
 export interface SafPickResult {
@@ -160,6 +162,7 @@ export interface GoogleSignInOptions {
   readonly scopes: readonly string[];
   readonly accountHint?: string;
   readonly forceRefresh?: boolean;
+  readonly safMode?: 'create' | 'open';
 }
 
 export interface GoogleSignInResult {
@@ -167,6 +170,8 @@ export interface GoogleSignInResult {
   readonly accessToken?: string;
   readonly expiresAt?: EpochMs;
   readonly accountEmail?: string;
+  readonly safUri?: string;
+  readonly displayName?: string;
 }
 
 export interface ApkDownloadProgressPayload {

@@ -3,7 +3,8 @@
  * Strictly 9 rows — Downloads (1), Cloud sync (4), Subscriptions (3), About (1).
  */
 import { useCallback, useEffect, useState } from 'react';
-import type { AppSettings, ProviderId, SyncStatus } from '@minipod/core';
+import type { AppSettings, SyncProviderConfig, SyncStatus } from '@minipod/core';
+import { isGoogleDriveSafUri } from './CloudSyncSetup';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
 import { Button, Dialog, IconButton, Switch } from '../../components/m3';
@@ -71,12 +72,15 @@ export function SettingsPage() {
     }
   });
 
-  const providerLabel = (id: ProviderId | undefined): string => {
-    if (!id) return t('settings.providerOff');
-    switch (id) {
+  const providerLabel = (provider: SyncProviderConfig | null | undefined): string => {
+    if (!provider) return t('settings.providerOff');
+    switch (provider.id) {
       case 'local-folder':
-      case 'saf':
         return t('settings.providerCloudFolder');
+      case 'saf':
+        return isGoogleDriveSafUri(provider.documentUri)
+          ? t('settings.providerDrive')
+          : t('settings.providerCloudFolder');
       case 'drive-appdata':
       case 'drive-file':
         return t('settings.providerDrive');
@@ -209,7 +213,7 @@ export function SettingsPage() {
           <div className="m-settings-row__text">
             <span className="m-settings-row__title">{t('settings.providerLabel')}</span>
             <span className="m-settings-row__subtitle" data-testid="settings-provider-value">
-              {providerLabel(settings.sync.provider?.id)}
+              {providerLabel(settings.sync.provider)}
             </span>
           </div>
           <span aria-hidden="true">›</span>

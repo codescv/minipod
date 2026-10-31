@@ -28,6 +28,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.google.android.gms.auth.GoogleAuthException;
 import com.google.android.gms.auth.GoogleAuthUtil;
 import com.google.android.gms.auth.UserRecoverableAuthException;
 import com.google.android.gms.auth.api.signin.GoogleSignIn;
@@ -36,6 +37,7 @@ import com.google.android.gms.auth.api.signin.GoogleSignInClient;
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
 import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.GoogleApiAvailability;
+import com.google.android.gms.common.api.ApiException;
 import com.google.android.gms.common.api.Scope;
 import com.google.android.gms.tasks.Tasks;
 import java.io.ByteArrayOutputStream;
@@ -816,6 +818,19 @@ public class MiniPodPlugin extends Plugin {
             );
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            String initialUri = call.getString("initialUri");
+            boolean preferGoogleDrive = Boolean.TRUE.equals(call.getBoolean("preferGoogleDrive", false));
+            if (initialUri != null && !initialUri.isEmpty()) {
+                intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri.parse(initialUri));
+            } else if (preferGoogleDrive) {
+                intent.putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    Uri.parse("content://com.google.android.apps.docs.storage/root")
+                );
+            }
+        }
+
         startActivityForResult(call, intent, "onSafPickResult");
     }
 
@@ -1251,6 +1266,21 @@ public class MiniPodPlugin extends Plugin {
     // Google Sign-In (`auth.*`) for Google Drive Sync
     // -------------------------------------------------------------------------
 
+    private boolean hasConfiguredOAuthClient() {
+        try {
+            int resId = getContext().getResources().getIdentifier(
+                "google_oauth_client_id",
+                "string",
+                getContext().getPackageName()
+            );
+            if (resId == 0) return false;
+            String clientId = getContext().getString(resId);
+            return clientId != null && !clientId.trim().isEmpty();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     @PluginMethod
     public void authStatus(PluginCall call) {
         int code = GoogleApiAvailability.getInstance()
@@ -1305,6 +1335,10 @@ public class MiniPodPlugin extends Plugin {
                     call.reject("Sign-in required in foreground", "sync-auth", silentErr);
                     return;
                 }
+                if (!hasConfiguredOAuthClient()) {
+                    activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
+                    return;
+                }
                 activity.runOnUiThread(() ->
                     startActivityForResult(call, signInClient.getSignInIntent(), "onGoogleSignInResult")
                 );
@@ -1315,10 +1349,21 @@ public class MiniPodPlugin extends Plugin {
     @ActivityCallback
     private void onGoogleSignInResult(PluginCall call, ActivityResult result) {
         if (call == null) return;
-        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
-            call.reject("Google Sign-In cancelled", "cancelled");
+        Intent data = result.getData();
+        if (data == null) {
+            if (result.getResultCode() == Activity.RESULT_CANCELED) {
+                call.reject("Google Sign-In cancelled", "cancelled");
+            } else {
+                Activity activity = getActivity();
+                if (activity != null) {
+                    activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
+                } else {
+                    call.reject("Google Sign-In failed", "sync-auth");
+                }
+            }
             return;
         }
+
         JSArray scopesArr = call.getArray("scopes");
         List<String> scopes = new ArrayList<>();
         if (scopesArr != null) {
@@ -1334,12 +1379,82 @@ public class MiniPodPlugin extends Plugin {
         ioPool.execute(() -> {
             try {
                 GoogleSignInAccount account =
-                    Tasks.await(GoogleSignIn.getSignedInAccountFromIntent(result.getData()));
+                    GoogleSignIn.getSignedInAccountFromIntent(data).getResult(ApiException.class);
                 resolveAccessTokenForAccount(call, account, scopes);
+            } catch (ApiException e) {
+                int statusCode = e.getStatusCode();
+                if (statusCode == 12501 || statusCode == 16) {
+                    call.reject("Google Sign-In cancelled", "cancelled", e);
+                    return;
+                }
+                if (statusCode == 10 || statusCode == 12500) {
+                    Activity activity = getActivity();
+                    if (activity != null) {
+                        activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
+                        return;
+                    }
+                }
+                call.reject("Google Sign-In failed (code " + statusCode + "): " + e.getMessage(), "sync-auth", e);
             } catch (Exception e) {
+                if (result.getResultCode() == Activity.RESULT_CANCELED) {
+                    call.reject("Google Sign-In cancelled", "cancelled", e);
+                    return;
+                }
                 call.reject("Google Sign-In failed: " + e.getMessage(), "sync-auth", e);
             }
         });
+    }
+
+    private void launchGoogleDriveSafFallback(PluginCall call) {
+        String safMode = call.getString("safMode", "create");
+        boolean isOpen = "open".equalsIgnoreCase(safMode);
+        Intent intent = new Intent(isOpen ? Intent.ACTION_OPEN_DOCUMENT : Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/json");
+        if (!isOpen) {
+            intent.putExtra(Intent.EXTRA_TITLE, "minipod-sync-v1.json");
+        }
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        );
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            intent.putExtra(
+                DocumentsContract.EXTRA_INITIAL_URI,
+                Uri.parse("content://com.google.android.apps.docs.storage/root")
+            );
+        }
+        startActivityForResult(call, intent, "onGoogleDriveSafFallbackResult");
+    }
+
+    @ActivityCallback
+    private void onGoogleDriveSafFallbackResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        Intent data = result.getData();
+        if (result.getResultCode() != Activity.RESULT_OK || data == null || data.getData() == null) {
+            call.reject("Google Drive file selection cancelled", "cancelled");
+            return;
+        }
+
+        Uri uri = data.getData();
+        int takeFlags = data.getFlags()
+            & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        if (takeFlags == 0) {
+            takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        }
+        try {
+            getContext().getContentResolver().takePersistableUriPermission(uri, takeFlags);
+        } catch (SecurityException ignored) {
+            // Proceed with session grant if provider does not support persistable URI permissions
+        }
+
+        String displayName = resolveSafDisplayName(uri, false);
+        JSObject out = new JSObject();
+        out.put("supported", true);
+        out.put("safUri", uri.toString());
+        out.put("displayName", displayName);
+        call.resolve(out);
     }
 
     private void resolveAccessTokenForAccount(
@@ -1378,6 +1493,13 @@ public class MiniPodPlugin extends Plugin {
             } else {
                 call.reject("User consent required for Google Drive", "sync-auth", recoverable);
             }
+        } catch (GoogleAuthException | SecurityException authErr) {
+            Activity activity = getActivity();
+            if (activity != null) {
+                activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
+                return;
+            }
+            call.reject("Failed to obtain Google OAuth token: " + authErr.getMessage(), "sync-auth", authErr);
         } catch (Exception e) {
             call.reject("Failed to obtain Google OAuth token: " + e.getMessage(), "sync-auth", e);
         }

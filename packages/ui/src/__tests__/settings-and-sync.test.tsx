@@ -121,4 +121,43 @@ describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Them
     expect(dark['--md-sys-color-primary']).toMatch(/^#[0-9a-f]{6}$/);
     expect(light['--md-sys-color-surface']).not.toBe(dark['--md-sys-color-surface']);
   });
+
+  it('displays Google Drive SAF document URI as Google Drive in SettingsPage and keeps sync-card-drive selected in CloudSyncSetup', async () => {
+    const driveSafUri =
+      'content://com.google.android.apps.docs.storage/document/acc%3D1%3Bdoc%3Dminipod-sync-v1.json';
+    renderMiniPod({
+      width: 390,
+      hostOptions: {
+        platform: 'android',
+        capabilities: {
+          syncProviders: ['saf', 'drive-appdata', 'drive-file', 'webdav', 'gist'],
+          backgroundSync: false,
+        },
+        initialSettings: {
+          sync: {
+            provider: {
+              id: 'saf',
+              documentUri: driveSafUri,
+            },
+            wifiOnly: true,
+            deviceName: 'Pixel 9',
+          },
+        },
+      },
+    });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('subs-settings-btn'));
+    expect(await screen.findByTestId('settings-screen')).toBeInTheDocument();
+
+    expect(screen.getByTestId('settings-provider-value')).toHaveTextContent('Google Drive');
+
+    fireEvent.click(screen.getByTestId('settings-row-provider'));
+    expect(await screen.findByTestId('cloud-sync-screen')).toBeInTheDocument();
+
+    expect(screen.getByTestId('sync-card-drive')).toHaveClass('is-selected');
+    expect(screen.getByTestId('sync-radio-drive')).toBeChecked();
+    expect(screen.getByTestId('sync-drive-connected-uri')).toHaveTextContent(driveSafUri);
+    expect(screen.getByTestId('sync-drive-open-existing-btn')).toBeInTheDocument();
+  });
 });

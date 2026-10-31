@@ -18,6 +18,7 @@ interface CachedToken {
 export class AndroidDriveAuthManager {
   private readonly plugin: Pick<MiniPodPlugin, 'auth'>;
   private readonly tokenByScope = new Map<string, CachedToken>();
+  private lastSafFallbackUri: string | undefined;
 
   constructor(plugin: Pick<MiniPodPlugin, 'auth'>) {
     this.plugin = plugin;
@@ -25,6 +26,16 @@ export class AndroidDriveAuthManager {
 
   static scopeFor(mode: 'drive-appdata' | 'drive-file'): string {
     return mode === 'drive-appdata' ? DRIVE_APPDATA_SCOPE : DRIVE_FILE_SCOPE;
+  }
+
+  getSafFallbackUri(): string | undefined {
+    return this.lastSafFallbackUri;
+  }
+
+  consumeSafFallbackUri(): string | undefined {
+    const uri = this.lastSafFallbackUri;
+    this.lastSafFallbackUri = undefined;
+    return uri;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -52,9 +63,14 @@ export class AndroidDriveAuthManager {
         'Google Play Services Sign-In is not available on this device',
       );
     }
+    if (res.safUri) {
+      this.lastSafFallbackUri = res.safUri;
+      return res.displayName ?? res.accountEmail;
+    }
     if (!res.accessToken) {
       throw new MiniPodError('sync-auth', 'Google Drive authorization did not return an access token');
     }
+    this.lastSafFallbackUri = undefined;
     this.tokenByScope.set(scope, {
       accessToken: res.accessToken,
       expiresAt: res.expiresAt ?? Date.now() + 50 * 60_000,
@@ -111,5 +127,6 @@ export class AndroidDriveAuthManager {
 
   clearCache(): void {
     this.tokenByScope.clear();
+    this.lastSafFallbackUri = undefined;
   }
 }

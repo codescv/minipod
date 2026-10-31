@@ -13,12 +13,17 @@ import { showSnackbar } from '../../stores/snackbar';
 
 type ProviderChoice = 'off' | 'cloud-folder' | 'drive' | 'webdav' | 'gist';
 
+export function isGoogleDriveSafUri(uri: string | undefined): boolean {
+  return Boolean(uri && /com\.google\.android\.apps\.docs/i.test(uri));
+}
+
 function initialChoiceFromConfig(cfg: SyncProviderConfig | null): ProviderChoice {
   if (!cfg) return 'off';
   switch (cfg.id) {
     case 'local-folder':
-    case 'saf':
       return 'cloud-folder';
+    case 'saf':
+      return isGoogleDriveSafUri(cfg.documentUri) ? 'drive' : 'cloud-folder';
     case 'drive-appdata':
     case 'drive-file':
       return 'drive';
@@ -81,6 +86,9 @@ export function CloudSyncSetup() {
 
   useEffect(() => {
     setChoice(initialChoiceFromConfig(currentProvider));
+    if (currentProvider?.id === 'saf') {
+      setSafUri(currentProvider.documentUri);
+    }
   }, [currentProvider]);
 
   const handleBrowseFolders = async () => {
@@ -400,7 +408,15 @@ export function CloudSyncSetup() {
                   </label>
                 </div>
               )}
-              <div>
+              {currentProvider?.id === 'saf' && isGoogleDriveSafUri(currentProvider.documentUri) && (
+                <div
+                  style={{ font: 'var(--md-sys-typescale-label-small)', overflowWrap: 'anywhere' }}
+                  data-testid="sync-drive-connected-uri"
+                >
+                  {currentProvider.documentUri}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button
                   disabled={busy}
                   data-testid="sync-drive-signin-btn"
@@ -410,6 +426,18 @@ export function CloudSyncSetup() {
                 >
                   {t('sync.driveSignIn')}
                 </Button>
+                {canSaf && Boolean(host.files.pickSyncFile) && (
+                  <Button
+                    variant="outlined"
+                    disabled={busy}
+                    data-testid="sync-drive-open-existing-btn"
+                    onClick={() => {
+                      void handlePickSaf('open');
+                    }}
+                  >
+                    {t('sync.safOpen')}
+                  </Button>
+                )}
               </div>
             </div>
           )}

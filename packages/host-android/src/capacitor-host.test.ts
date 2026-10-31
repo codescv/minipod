@@ -521,4 +521,56 @@ describe('CapacitorPlatformHost', () => {
 
     await host.dispose();
   });
+
+  it('seamlessly falls back to Google Drive SAF DocumentsProvider when googleSignIn returns a safUri on self-signed APK', async () => {
+    const driveSafUri =
+      'content://com.google.android.apps.docs.storage/document/acc%3D1%3Bdoc%3Dminipod-sync-v1.json';
+    const harness = createTestPluginHarness();
+    harness.plugin.auth.isGoogleSignInAvailable = vi.fn(async () => ({ available: true }));
+    harness.plugin.auth.googleSignIn = vi.fn(async () => ({
+      supported: true,
+      safUri: driveSafUri,
+      displayName: 'minipod-sync-v1.json',
+    }));
+
+    const { host } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-drive-saf-fallback-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    await host.feeds.subscribe('https://pod.example.com/rss.xml');
+
+    await expect(host.sync.authorize('drive-appdata')).resolves.toBeUndefined();
+    const status = await host.sync.configure({
+      provider: { id: 'drive-appdata' },
+      wifiOnly: false,
+      deviceName: 'Pixel 9',
+    });
+
+    expect(status.enabled).toBe(true);
+    expect(status.provider).toBe('saf');
+
+    const savedSettings = await host.settings.get();
+    expect(savedSettings.sync.provider).toEqual({
+      id: 'saf',
+      documentUri: driveSafUri,
+    });
+
+    const syncedEntry = harness.safFiles.get(driveSafUri);
+    expect(syncedEntry).toBeDefined();
+    const syncedDoc = JSON.parse(new TextDecoder().decode(syncedEntry!.bytes)) as {
+      schemaVersion: number;
+      subscriptions: { items: Record<string, { url: string }> };
+    };
+    expect(syncedDoc.schemaVersion).toBe(1);
+    expect(
+      Object.values(syncedDoc.subscriptions.items).some(
+        (f) => f.url === 'https://pod.example.com/rss.xml',
+      ),
+    ).toBe(true);
+
+    await host.dispose();
+  });
 });

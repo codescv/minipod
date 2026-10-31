@@ -1720,12 +1720,21 @@ export async function createCapacitorPlatformHost(
           await secretsStore.saveSyncSecret(secret);
         }
 
+        const effectiveSettings: SyncSettings =
+          (settings.provider?.id === 'drive-appdata' || settings.provider?.id === 'drive-file') &&
+          driveAuth.getSafFallbackUri()
+            ? {
+                ...settings,
+                provider: { id: 'saf', documentUri: driveAuth.consumeSafFallbackUri()! },
+              }
+            : settings;
+
         const prevSettings = await readSettings();
         const providerChanged =
-          JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(settings.provider);
+          JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(effectiveSettings.provider);
 
         await syncStore.setSyncState({
-          deviceName: settings.deviceName,
+          deviceName: effectiveSettings.deviceName,
           ...(providerChanged
             ? {
                 remoteEtag: null,
@@ -1735,9 +1744,9 @@ export async function createCapacitorPlatformHost(
             : {}),
         });
 
-        if (!settings.provider) {
+        if (!effectiveSettings.provider) {
           syncEngine.setProvider(null);
-          const updated = await writeSettings({ sync: settings });
+          const updated = await writeSettings({ sync: effectiveSettings });
           syncScheduler.setWifiOnly(updated.sync.wifiOnly);
           syncScheduler.rebindProviderWatcher();
           emit({ type: 'settings-changed', settings: updated });
@@ -1746,7 +1755,7 @@ export async function createCapacitorPlatformHost(
           return status;
         }
 
-        const candidate = await instantiateSyncProvider(settings.provider);
+        const candidate = await instantiateSyncProvider(effectiveSettings.provider);
         const probe = await candidate.probe();
         if (!probe.ok) {
           throw probe.error
@@ -1754,7 +1763,7 @@ export async function createCapacitorPlatformHost(
             : new MiniPodError('sync-auth', 'Sync provider probe failed');
         }
 
-        const updated = await writeSettings({ sync: settings });
+        const updated = await writeSettings({ sync: effectiveSettings });
         syncScheduler.setWifiOnly(updated.sync.wifiOnly);
         syncEngine.setProvider(candidate);
         syncScheduler.rebindProviderWatcher();
