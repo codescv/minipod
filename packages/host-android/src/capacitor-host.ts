@@ -96,7 +96,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.17';
+export const CAPACITOR_HOST_VERSION = '0.1.18';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;

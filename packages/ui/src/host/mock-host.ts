@@ -186,7 +186,7 @@ export class MockPlatformHost implements PlatformHost {
     this.info = {
       platform,
       os: platform === 'android' ? 'Android 15' : 'Linux x86_64',
-      appVersion: options?.appVersion ?? '0.1.17',
+      appVersion: options?.appVersion ?? '0.1.18',
       capabilities,
       deviceId: 'd_0123456789abcdef0123456789abcdef',
       deviceName,

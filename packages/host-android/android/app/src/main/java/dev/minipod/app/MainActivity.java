@@ -54,7 +54,7 @@ import okhttp3.ResponseBody;
  */
 public class MainActivity extends BridgeActivity {
     private static final int REQ_POST_NOTIFICATIONS = 1001;
-    private static final String ARTWORK_USER_AGENT = "Podcasts/0.1.17";
+    private static final String ARTWORK_USER_AGENT = "Podcasts/0.1.18";
     private static final OkHttpClient ARTWORK_HTTP_CLIENT = new OkHttpClient.Builder()
         .followRedirects(true)
         .followSslRedirects(true)
