@@ -154,7 +154,7 @@ export interface UpdateStoreState {
 
 export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
   status: 'idle',
-  currentVersion: '0.1.2',
+  currentVersion: '0.1.3',
   release: undefined,
   progressPercent: 0,
   downloadedBytes: 0,
@@ -368,7 +368,7 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
   reset() {
     set({
       status: 'idle',
-      currentVersion: '0.1.2',
+      currentVersion: '0.1.3',
       release: undefined,
       progressPercent: 0,
       downloadedBytes: 0,

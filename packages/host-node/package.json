@@ -1,6 +1,6 @@
 {
   "name": "@minipod/host-node",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MiniPod PC Web App runtime (macOS / Linux / Windows): pure Node.js loopback server (Hono, node:sqlite, HTTP 206 Range media proxy, feed fetcher, cloud-file SyncScheduler) + browser REST client implementing PlatformHost.",
   "license": "MIT",
   "type": "module",
