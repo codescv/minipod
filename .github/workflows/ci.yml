@@ -105,6 +105,6 @@ jobs:
             echo "Release ${TAG} already exists; skipping asset overwrite to preserve release signatures."
           else
             gh release create "$TAG" "minipod-${TAG}.apk" "$APK_SRC" "minipod-${TAG}-pc.tar.gz" \
-              --title "MiniPod ${TAG}" \
+              --title "Podcasts ${TAG}" \
               --generate-notes
           fi

@@ -1,13 +1,13 @@
-# MiniPod
+# Podcasts
 
-**MiniPod** is an ultra-minimalist, open-source podcast player that ships as both a **standalone Android APK** and a **cross-platform PC Web App** (macOS, Linux, Windows).
+**Podcasts** (`codescv/minipod`) is an ultra-minimalist, open-source podcast player that ships as both a **standalone Android APK** and a **cross-platform PC Web App** (macOS, Linux, Windows).
 
 It preserves **100% of AntennaPod's podcast discovery, feed parsing, authentication, local folder, OPML, and 5-format chapter capabilities**, strips away every non-essential screen and setting, and syncs subscriptions, playback queue, and millisecond episode progress across all your devices through a **single JSON file (`minipod-sync.v1.json`) in your own cloud storage** — with **zero backend servers**, **zero accounts**, and **zero native `.node` C++/Rust addons**.
 
 - **GitHub Repository**: <https://github.com/codescv/minipod>
-- **Latest Release (`v0.1.3`)**: <https://github.com/codescv/minipod/releases/tag/v0.1.3>
-  - **Android APK (`dev.minipod.app`, `versionCode 4`)**: [`minipod-v0.1.3.apk`](https://github.com/codescv/minipod/releases/download/v0.1.3/minipod-v0.1.3.apk) (`6.68 MiB`, APK Signature v2)
-  - **PC Web App Bundle**: [`minipod-v0.1.3-pc.tar.gz`](https://github.com/codescv/minipod/releases/download/v0.1.3/minipod-v0.1.3-pc.tar.gz) (Node.js `>= 22.5.0`)
+- **Latest Release (`v0.1.4`)**: <https://github.com/codescv/minipod/releases/tag/v0.1.4>
+  - **Android APK (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 5`)**: [`minipod-v0.1.4.apk`](https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4.apk) (`6.79 MiB`, APK Signature v2)
+  - **PC Web App Bundle**: [`minipod-v0.1.4-pc.tar.gz`](https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4-pc.tar.gz) (Node.js `>= 22.5.0`)
 
 ---
 
@@ -17,7 +17,8 @@ It preserves **100% of AntennaPod's podcast discovery, feed parsing, authenticat
   - **Discovery**: Apple Podcasts / iTunes Search + Country Top Charts + `/lookup` URL translation (with `CombinedSearcher` title+author fallback when Apple omits `feedUrl`), PodcastIndex.org (SHA-1 signed headers), fyyd, gpodder.net, and parallel harmonic-ranked `CombinedSearcher` with scheme-less canonical `feedKey` deduplication.
   - **Syndication & Discovery**: RSS 2.0 / 0.91 / 0.92 (with `<itunes:*>`, `<podcast:*>`, `<psc:chapters>`, `<content:encoded>`), Atom 1.0 (including RFC 5005 `<link rel="next">` paged archive loading), RDF / RSS 1.0, HTML `<link rel="alternate">` single-feed auto-follow & multi-feed picker, custom schemes (`itpc://`, `pcast://`, `feed://`, `antennapod-subscribe://`, `subscribeonandroid.com`), HTTP `301`/`308` permanent redirect updating, HTTP `401` Basic Auth (ISO-8859-1 -> UTF-8 challenge retry + cross-host redirect re-injection), OPML 2.0 import/export, and **Local Folder virtual podcasts** (Desktop path or Android SAF `content://` tree).
   - **5-Format Chapter Merger**: Podlove Simple Chapters (`<psc:chapters>`), Podcasting 2.0 JSON Chapters (`<podcast:chapters>`), ID3v2.3/2.4 `CHAP`/`CTOC` (including on-demand `APIC` chapter artwork byte-slicing), Vorbis Comments (`CHAPTERxxx` in Ogg Opus/Vorbis & native FLAC), and MP4/M4A QuickTime/Nero `moov.udta.chpl`.
-- **Ultra-Minimalist Material Design 3 UI**:
+- **Ultra-Minimalist Material Design 3 UI & System-Theme-Adaptive Identity**:
+  - **Nordic Dot & Arcs Adaptive Icon**: Automatically switches between **7A Light** (`#F4F1EA` warm paper / `#1C1917` charcoal arcs / `#FF4F00` signal dot) and **7B Dark** (`#18181B` obsidian / `#F4F4F5` off-white arcs / `#FF4F00` signal dot) across Android Adaptive Icons (`values` & `values-night` + Android 13+ monochrome themed icon + `mipmap-night-*` raster fallbacks) and Web/Desktop (`favicon.svg` `@media (prefers-color-scheme: dark)` + `icon-light-192.png` / `icon-dark-192.png`).
   - Strictly **2 primary tabs on mobile** (`Subscriptions`, `Queue`) and a **3-item `NavRail` on desktop** (`Subscriptions`, `Queue`, `Settings` + `+ Add` FAB), with **zero unread counter badges**, **strictly 9 Settings rows**, dynamic seed-color M3 theming (Light / Dark / System), and full **English + Simplified Chinese (`zh-CN`) + Japanese (`ja`)** localization.
   - **Subscriptions Timeline & Collapsible Grid**: Expandable subscription cover grid (`> 6` feeds) with viewport-clamped long-press/right-click context menus (`8px` safe margin, zero cluttering `⋮` buttons on covers) and an integrated **Latest Episodes Timeline (`最新单集`)** below Subscriptions merging episodes across all subscribed podcasts sorted by `pubDate` DESC.
   - **Streamlined Episode Actions & Resilient Artwork**: Inline `▶/⏸` play/pause, inline `Add to Queue` toggle, and minimal `⋮` overflow (`Download` + `Mark played` only), paired with `<ArtworkImage>` multi-stage fallback (`<itunes:image>` / `<podcast:images>` / `<item><image>` -> `/api/image-proxy` CORS/hotlink bypass -> podcast cover -> M3 icon).

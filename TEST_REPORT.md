@@ -1,10 +1,10 @@
-# MiniPod — Integration, E2E, Cloud Sync, Auto-Updater & Android APK Test Report
+# Podcasts (`codescv/minipod`) — Integration, E2E, Cloud Sync, Auto-Updater & Android APK Test Report
 
 - **Date**: 2026-10-31
-- **Version Verified**: `0.1.3` (`dev.minipod.app`, `versionCode 4`)
+- **Version Verified**: `0.1.4` (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 5`)
 - **Live Repository & Release**:
-  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.3`)
-  - Release `v0.1.3`: <https://github.com/codescv/minipod/releases/tag/v0.1.3>
+  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.4`)
+  - Release `v0.1.4`: <https://github.com/codescv/minipod/releases/tag/v0.1.4>
   - Release API: `https://api.github.com/repos/codescv/minipod/releases/latest` (`200 OK`)
 - **Environment**:
   - OS: Linux (`x86_64`)
@@ -20,12 +20,12 @@
 | Verification Gate | Result | Summary |
 | :--- | :---: | :--- |
 | **1. Static Typecheck (`pnpm typecheck`)** | **PASS** | `0` errors across `@minipod/core`, `@minipod/ui`, `@minipod/host-node`, `@minipod/host-android` (`strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`) |
-| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **28 / 28 test files**, **114 / 114 tests passed** (incl. randomized multi-device CRDT property tests, `<podcast:images>` / `<item><image>` artwork parsing, `/api/image-proxy`, timeline/collapsible grid/clamped context menu, & cross-platform auto-updater suites) |
+| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **28 / 28 test files**, **114 / 114 tests passed** (incl. randomized multi-device CRDT property tests, `<podcast:images>` / `<item><image>` artwork parsing, `/api/image-proxy`, timeline/collapsible grid/clamped context menu, `Podcasts` branding across `en` / `zh-CN` / `ja`, & cross-platform auto-updater suites) |
 | **3. Zero-Native-Addon Gate (`pnpm check:native`)** | **PASS** | **0** `.node` binaries, **0** `binding.gyp`, **0** native build scripts across runtime tree |
-| **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` `538 KB` + `dist/web`) & `@minipod/host-android` (`www`) |
-| **5. Live Server & Playwright Browser E2E** | **PASS** | **50 / 50 end-to-end checks passed** (`39` core/UI/sync/updater E2E + `11` `v0.1.3` Timeline, Clamped Long-Press Menu, Background Playback, 4-Scenario Artwork Proxy/Fallback, & EpisodeRow Actions E2E checks; `[data-settings-row]` strictly `9`) |
-| **6. Standalone Android APK (`v0.1.3`) & Background Playback / Auto-Installer** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.3.apk` (`6,999,411` bytes, `versionCode='4'`, APK Signature v2, `ACCESS_WIFI_STATE`, `ACCESS_NETWORK_STATE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `POST_NOTIFICATIONS`, `stopWithTask=false`, `PlaybackService.addSession` / `startForeground` / `onTaskRemoved`, `WebSettings.setMixedContentMode`) |
-| **7. Live Public GitHub Repository & Release (`v0.1.3`)** | **PASS** | Published `main` + annotated tag `v0.1.3` + GitHub Release `v0.1.3` with `minipod-v0.1.3.apk`, `app-release.apk`, and `minipod-v0.1.3-pc.tar.gz` |
+| **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` + `dist/web` with `favicon.svg`, `icon-light-192.png`, `icon-dark-192.png`) & `@minipod/host-android` (`www` with adaptive icons) |
+| **5. Live Server & Playwright Browser E2E** | **PASS** | **62 / 62 end-to-end checks passed** (`39` core/UI/sync/updater E2E + `11` `v0.1.3` Timeline/Background/Artwork/EpisodeRow E2E + `12` `v0.1.4` `Podcasts` branding & 7A/7B adaptive `favicon.svg` / PNG E2E checks; `[data-settings-row]` strictly `9`) |
+| **6. Standalone Android APK (`v0.1.4`) & Adaptive Icon / Background Playback** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.4.apk` (`7,116,168` bytes, `application-label:'Podcasts'`, `versionCode='5'`, `versionName='0.1.4'`, APK Signature v2, day/night `ic_launcher_background` `#F4F1EA` / `#18181B`, `ic_launcher_arcs` `#1C1917` / `#F4F4F5`, `ic_launcher_dot` `#FF4F00`, `ic_launcher_foreground_vector`, `ic_launcher_monochrome`, `mipmap-*` & `mipmap-night-*`) |
+| **7. Live Public GitHub Repository & Release (`v0.1.4`)** | **PASS** | Published `main` + annotated tag `v0.1.4` + GitHub Release `v0.1.4` with `minipod-v0.1.4.apk`, `app-release.apk`, and `minipod-v0.1.4-pc.tar.gz` |
 
 ---
 
@@ -158,28 +158,50 @@ Executed against a live `v0.1.3` `@minipod/host-node` server (`appVersion: "0.1.
 | 10 | **Req #1d — Desktop (`1280x800`) Expandable Grid & Edge-Clamped `ContextMenu`** | Verified `Show all (8)` / `Show less` toggle; 6th-column rightmost tile ~450ms long-press clamped to `right=1272` (`<= 1280`), and `(1279, 799)` bottom-right `contextmenu` clamped to `left=1082, top=692, right=1272, bottom=792` (`100%` inside `1280x800` with `8px` margin) | **PASS** |
 | 11 | **Req #3b — `DesktopPlayerBar` Artwork (4/4 Scenarios)** | Verified `img[data-testid="desktop-cover-btn"]` rendered `naturalWidth === 64` across direct, absent->feed, broken `404`->feed, and hotlink->`/api/image-proxy` scenarios | **PASS** |
 
+### 2.7 `v0.1.4` System-Theme-Adaptive Icon (`7A` Light / `7B` Dark) & `"Podcasts"` Brand E2E Matrix (12 / 12 Passed)
+
+Executed against a live `v0.1.4` `@minipod/host-node` loopback server in **Playwright Headless Chromium** across Light (`prefers-color-scheme: light`) and Dark (`prefers-color-scheme: dark`) color schemes and `en-US` / `zh-CN` viewports:
+
+| # | `v0.1.4` E2E Verification Check | Verification Result | Status |
+| :---: | :--- | :--- | :---: |
+| 1 | **`GET /api/info` Version** | Returned `200 OK` with `data.appVersion === "0.1.4"` | **PASS** |
+| 2 | **`GET /favicon.svg`** | Returned `200 OK` (`image/svg+xml`, `6,264` bytes) with `@media (prefers-color-scheme: dark)` rules | **PASS** |
+| 3 | **`GET /icon-light-192.png`** | Returned `200 OK` (`image/png`, `192×192`, `12,478` bytes) | **PASS** |
+| 4 | **`GET /icon-dark-192.png`** | Returned `200 OK` (`image/png`, `192×192`, `12,788` bytes) | **PASS** |
+| 5 | **Page `<title>`** | Verified `document.title === "Podcasts"` across Desktop (`1280×800`) and Mobile (`390×844`) | **PASS** |
+| 6 | **HTML Adaptive `<link rel="icon">` Tags** | Verified `/favicon.svg` (`image/svg+xml`), `/icon-light-192.png` (`(prefers-color-scheme: light)` + `apple-touch-icon`), and `/icon-dark-192.png` (`(prefers-color-scheme: dark)`) | **PASS** |
+| 7 | **Decoded 192px PNG Pixels** | Canvas pixel verification confirmed `icon-light-192.png` (`#F4F1EA` bg + `#FF4F00` dot) and `icon-dark-192.png` (`#18181B` bg + `#FF4F00` dot) | **PASS** |
+| 8 | **Desktop `en-US` Settings & About Dialog** | Verified `[data-settings-row]` count === `9`, `"Up to date (v0.1.4)"`, and `settings-about-dialog` displaying `"Podcasts"` + `"0.1.4"` | **PASS** |
+| 9 | **`/favicon.svg` Light Mode (`7A`)** | `color_scheme="light"` computed styles: `.bg = #F4F1EA`, `.dot = #FF4F00`, `.arc = [#1C1917, #1C1917]` | **PASS** |
+| 10 | **`/favicon.svg` Dynamic Dark Switch (`7B`)** | `emulate_media(color_scheme="dark")` computed styles: `.bg = #18181B`, `.dot = #FF4F00`, `.arc = [#F4F4F5, #F4F4F5]` | **PASS** |
+| 11 | **Mobile `zh-CN` Branding & `<UpdateBanner />`** | Verified `document.title === "Podcasts"` and localized `<UpdateBanner />` rendering `"Podcasts v0.1.5 已发布"` | **PASS** |
+| 12 | **Fresh Dark `BrowserContext` `/favicon.svg` (`7B`)** | Native dark-scheme context immediately resolved `.bg = #18181B` and `.arc = #F4F4F5` | **PASS** |
+
 ---
 
-## 3. Standalone Android APK (`v0.1.3`) & Native Background Playback / Auto-Installer Verification
+## 3. Standalone Android APK (`v0.1.4`) & Adaptive Icon / Background Playback Verification
 
-Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.3`:
+Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.4`:
 
-- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.3.apk`)**:
+- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.4.apk`)**:
   - Local Path: `packages/host-android/android/app/build/outputs/apk/release/app-release.apk`
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.3/minipod-v0.1.3.apk`
-  - Size: `6,999,411` bytes (`6.68 MiB`)
-  - SHA-256: `f3b25e90cf888ca836872bc2248aac92071f29f1994f4ef5edecd89696ed61c4`
-- **PC Standalone Release Bundle (`minipod-v0.1.3-pc.tar.gz`)**:
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.3/minipod-v0.1.3-pc.tar.gz`
-- **Manifest, `PlaybackService`, `FileProvider` & DEX Verification (`aapt2 dump badging`, `aapt2 dump xmltree`, `dexdump`)**:
-  - Package: `dev.minipod.app` (`versionCode='4'`, `versionName='0.1.3'`, `minSdkVersion='26'`, `targetSdkVersion='36'`)
-  - Permissions: `INTERNET`, **`ACCESS_NETWORK_STATE`**, **`ACCESS_WIFI_STATE`**, `WAKE_LOCK`, `FOREGROUND_SERVICE`, **`FOREGROUND_SERVICE_MEDIA_PLAYBACK`**, **`POST_NOTIFICATIONS`**, **`REQUEST_INSTALL_PACKAGES`**
-  - `PlaybackService` Manifest Entry: `dev.minipod.app.PlaybackService` (`android:exported="true"`, **`android:stopWithTask="false"`**, `android:foregroundServiceType="0x00000002"` / `mediaPlayback`)
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4.apk`
+  - Size: `7,116,168` bytes (`6.79 MiB`)
+  - SHA-256: `7ce8b90ddb7ef7f856d997fda950c2d0172f43154e2611a9db1abb93e1f8309b`
+- **PC Standalone Release Bundle (`minipod-v0.1.4-pc.tar.gz`)**:
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4-pc.tar.gz`
+- **Manifest, Adaptive Day/Night Icon, `PlaybackService`, `FileProvider` & DEX Verification (`aapt2 dump badging`, `aapt2 dump resources`, `aapt2 dump xmltree`)**:
+  - Package & Display Label: `dev.minipod.app` (**`application-label:'Podcasts'`**, **`versionCode='5'`**, **`versionName='0.1.4'`**, `minSdkVersion='26'`, `targetSdkVersion='36'`), `assets/capacitor.config.json` `appName: "Podcasts"`
+  - System-Theme-Adaptive Launcher Icon (**7A Light / 7B Dark**):
+    - `color/ic_launcher_background`: default `() #fff4f1ea` (**7A `#F4F1EA`**), `(night) #ff18181b` (**7B `#18181B`**)
+    - `color/ic_launcher_arcs`: default `() #ff1c1917` (**7A `#1C1917`**), `(night) #fff4f4f5` (**7B `#F4F4F5`**)
+    - `color/ic_launcher_dot`: `() #ffff4f00` (**`#FF4F00`**)
+    - `mipmap-anydpi-v26/ic_launcher{,_round}.xml`: `<adaptive-icon>` wiring `@color/ic_launcher_background`, `@drawable/ic_launcher_foreground_vector` (`108dp × 108dp`, `0.66` safe-zone group scale), and `@drawable/ic_launcher_monochrome` (`#ffffffff` Android 13+ themed icon)
+    - Raster Mipmap Fallbacks: both default (`mdpi`..`xxxhdpi`, **7A**) and night (`night-mdpi`..`night-xxxhdpi`, **7B**) PNG sets present across `mipmap/ic_launcher`, `mipmap/ic_launcher_round`, and `mipmap/ic_launcher_foreground`
+    - Bundled Capacitor Web Assets: `assets/public/favicon.svg`, `assets/public/icon-light-192.png`, and `assets/public/icon-dark-192.png`
+  - Permissions: `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `WAKE_LOCK`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `POST_NOTIFICATIONS`, `REQUEST_INSTALL_PACKAGES`
+  - `PlaybackService` Manifest Entry: `dev.minipod.app.PlaybackService` (`android:exported="true"`, `android:stopWithTask="false"`, `android:foregroundServiceType="0x00000002"` / `mediaPlayback`, channel `"Podcasts Playback"`)
   - `FileProvider` Manifest Entry: `androidx.core.content.FileProvider` (`android:authorities="dev.minipod.app.fileprovider"`, `android:exported="false"`, `android:grantUriPermissions="true"`) backed by `@xml/file_paths` (`<cache-path name="apk_updates" path="updates/" />`)
-  - Compiled Native Classes & Methods Verified in `classes.dex`:
-    - `Ldev/minipod/app/PlaybackService;`: `setMediaNotificationProvider` (`minipod_playback`), `MediaSession$Builder.setSessionActivity`, **`addSession`**, **`onStartCommand` -> `startForeground`** (3-arg `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` + 2-arg fallback), and **`onTaskRemoved`** (`isPlaying` / `getPlayWhenReady` background continuation check)
-    - `Ldev/minipod/app/MainActivity;`: `WebSettings.setMixedContentMode` (`MIXED_CONTENT_ALWAYS_ALLOW`), Android 13+ `POST_NOTIFICATIONS` `ActivityCompat.requestPermissions`, and `onResume` -> `MiniPodPlugin.resumePendingApkInstall`
-    - `Ldev/minipod/app/MiniPodPlugin;`: `downloadAndInstallApk`, `installApkFile`, `resumePendingApkInstall`, `verifyApkArchive`, `launchApkInstaller`, `startPackageInstallViewIntent`
 - **Signature Verification (`apksigner verify --verbose`)**:
   - `Verifies` — `Verified using v2 scheme (APK Signature Scheme v2): true`, `Number of signers: 1`
 
@@ -191,3 +213,5 @@ Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) 
    - Updated `cachePreviewResult` in `packages/host-node/src/server/context.ts`, `packages/host-android/src/capacitor-host.ts`, and `packages/host-android/src/storage/IdbSyncStore.ts` so previewing an unsubscribed feed (`feeds.preview` / `search.resolveUrl`, including `401` Basic Auth retries) materializes a hidden `subscribed: false` (`markSyncDirty: false`) feed + episode stub in SQLite/IndexedDB.
 2. **GitHub Actions Android SDK Package Configuration (`.github/workflows/ci.yml`)**:
    - Configured `android-actions/setup-android@v3` with explicit `packages: 'platform-tools platforms;android-36 build-tools;35.0.0'` so `sdkmanager` on `ubuntu-latest` (`cmdline-tools/16.0`) does not request the deprecated `tools` package during CI APK builds.
+3. **Android Capacitor Vite `publicDir` Precedence (`packages/host-android/web/vite.config.ts`)**:
+   - Prioritized `packages/host-android/web/public` over the empty `packages/ui/public` directory so `favicon.svg`, `icon-light-192.png`, and `icon-dark-192.png` are copied into `packages/host-android/www` and `assets/public/` inside `app-release.apk`.
