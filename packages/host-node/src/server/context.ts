@@ -83,7 +83,7 @@ import { SettingsStore } from '../settings/store';
 import { NodeSyncService } from '../sync/scheduler-host';
 import { applyNodeUpdate, checkNodeUpdate } from '../updater/self-updater';
 
-export const MINIPOD_VERSION = '0.1.16';
+export const MINIPOD_VERSION = '0.1.17';
 
 const DESKTOP_CAPABILITIES: HostCapabilities = {
   nativeAudio: false,

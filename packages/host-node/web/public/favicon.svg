@@ -4,7 +4,7 @@
     .dot { fill: #FF4F00; }
     .arc { stroke: #1C1917; }
     @media (prefers-color-scheme: dark) {
-      .bg { fill: #000000; }
+      .bg { fill: #202124; }
       .dot { fill: #FF4F00; }
       .arc { stroke: #F4F4F5; }
     }

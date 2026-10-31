@@ -79,6 +79,26 @@ export function buildM3Tokens(seed: string, dark: boolean, contrast = 0): M3Toke
   for (const [name, color] of Object.entries(ROLES)) {
     tokens[`--md-sys-color-${name}`] = hexFromArgb(color.getArgb(scheme));
   }
+  if (dark) {
+    // Raw SchemeTonalSpot dark surface/background is Tone 6 (near-black). Align
+    // with standard Android / Google / Discord charcoal dark by promoting the
+    // Tone 12 surface-container as the base surface and elevating the
+    // container hierarchy one step.
+    const rawSurface = tokens['--md-sys-color-surface']!;
+    const rawContainer = tokens['--md-sys-color-surface-container']!;
+    const rawContainerHigh = tokens['--md-sys-color-surface-container-high']!;
+    const rawContainerHighest = tokens['--md-sys-color-surface-container-highest']!;
+    const rawBright = tokens['--md-sys-color-surface-bright']!;
+    tokens['--md-sys-color-background'] = rawContainer;
+    tokens['--md-sys-color-surface'] = rawContainer;
+    tokens['--md-sys-color-surface-container-lowest'] = rawSurface;
+    tokens['--md-sys-color-surface-container-low'] = rawContainerHigh;
+    tokens['--md-sys-color-surface-container'] = rawContainerHighest;
+    tokens['--md-sys-color-surface-container-high'] = rawBright;
+    // Keep the hierarchy strictly monotonic: the raw `highest` (Tone 22) now
+    // equals the promoted `surface-container`, so lift it to neutral Tone 30.
+    tokens['--md-sys-color-surface-container-highest'] = hexFromArgb(scheme.neutralPalette.tone(30));
+  }
   const result = tokens as M3Tokens;
   cache.set(key, result);
   return result;

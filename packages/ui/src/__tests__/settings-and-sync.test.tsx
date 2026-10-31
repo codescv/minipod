@@ -117,6 +117,22 @@ describe('Minimalist Settings (8 Rows), Cloud Sync Capability Gating & i18n/Them
     expect(light['--md-sys-color-primary']).toMatch(/^#[0-9a-f]{6}$/);
     expect(dark['--md-sys-color-primary']).toMatch(/^#[0-9a-f]{6}$/);
     expect(light['--md-sys-color-surface']).not.toBe(dark['--md-sys-color-surface']);
+
+    // v0.1.17 charcoal dark: base surface is the Tone 12 container (not Tone 6
+    // near-black) and the container hierarchy brightens monotonically.
+    const lum = (hex: string) => parseInt(hex.slice(1, 3), 16) + parseInt(hex.slice(3, 5), 16) + parseInt(hex.slice(5, 7), 16);
+    expect(dark['--md-sys-color-background']).toBe(dark['--md-sys-color-surface']);
+    const darkLadder = [
+      dark['--md-sys-color-surface-container-lowest'],
+      dark['--md-sys-color-surface'],
+      dark['--md-sys-color-surface-container-low'],
+      dark['--md-sys-color-surface-container'],
+      dark['--md-sys-color-surface-container-high'],
+      dark['--md-sys-color-surface-container-highest'],
+    ].map(lum);
+    for (let i = 1; i < darkLadder.length; i++) {
+      expect(darkLadder[i]!).toBeGreaterThan(darkLadder[i - 1]!);
+    }
   });
 
   it('displays Google Drive SAF document URI as Google Drive in SettingsPage and keeps sync-card-drive selected in CloudSyncSetup', async () => {
