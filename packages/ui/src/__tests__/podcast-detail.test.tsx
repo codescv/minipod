@@ -41,6 +41,7 @@ describe('Podcast Detail, Episode Actions & RFC 5005 Pagination', () => {
     const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
     const page = await host.episodes.list(syntax.feedKey, 'all');
     const ep42 = page.items[0]!.episode;
+    const ep40Video = page.items[2]!.episode;
     const ep39 = page.items[3]!.episode;
 
     // Playing IN_PROGRESS ep 42 (saved at 480_000 ms) resumes at 477_000 ms (3s rewind)
@@ -50,21 +51,55 @@ describe('Podcast Detail, Episode Actions & RFC 5005 Pagination', () => {
     });
     expect(engine.loadedItem?.startMs).toBe(477_000);
 
-    // Download ep 39 manually (`NONE` -> `DONE`)
+    // Inline row actions on ep 39: Play + Add-to-Queue + Overflow Menu (download is inside menu, not inline)
+    expect(screen.getByTestId(`ep-play-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-queue-btn-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-menu-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-download-${ep39.episodeKey}`)).not.toBeInTheDocument();
+
+    // Inline Add-to-Queue toggles queue membership and shows snackbar
+    fireEvent.click(screen.getByTestId(`ep-queue-btn-${ep39.episodeKey}`));
+    expect(await screen.findByTestId('snackbar')).toHaveTextContent('Added to queue');
+    await waitFor(async () => {
+      const q = await host.queue.list();
+      expect(q.some((r) => r.episode.episodeKey === ep39.episodeKey)).toBe(true);
+    });
+
+    // Clicking inline queue button again removes from queue
+    fireEvent.click(screen.getByTestId(`ep-queue-btn-${ep39.episodeKey}`));
+    await waitFor(async () => {
+      const q = await host.queue.list();
+      expect(q.some((r) => r.episode.episodeKey === ep39.episodeKey)).toBe(false);
+    });
+
+    // Overflow menu on ep 39: contains ONLY Download + Mark played (NO Play next, NO Share link)
+    fireEvent.click(screen.getByTestId(`ep-menu-${ep39.episodeKey}`));
+    expect(screen.getByTestId(`ep-download-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-mark-played-${ep39.episodeKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-play-next-${ep39.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-share-${ep39.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByText(/play next/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/share/i)).not.toBeInTheDocument();
+
+    // Download ep 39 from inside overflow menu (`NONE` -> `DONE`) and verify downloaded badge
     fireEvent.click(screen.getByTestId(`ep-download-${ep39.episodeKey}`));
     await waitFor(async () => {
       const updated = await host.episodes.get(ep39.episodeKey);
       expect(updated.episode.downloadState).toBe('DONE');
     });
+    expect(await screen.findByTestId(`ep-downloaded-badge-${ep39.episodeKey}`)).toBeInTheDocument();
 
-    // Overflow menu on ep 39: Add to queue + Undo snackbar, then Mark played
-    fireEvent.click(screen.getByTestId(`ep-menu-${ep39.episodeKey}`));
-    fireEvent.click(screen.getByTestId(`ep-queue-toggle-${ep39.episodeKey}`));
-    expect(await screen.findByTestId('snackbar')).toHaveTextContent('Added to queue');
-
+    // Mark ep 39 played via overflow menu
     fireEvent.click(screen.getByTestId(`ep-menu-${ep39.episodeKey}`));
     fireEvent.click(screen.getByTestId(`ep-mark-played-${ep39.episodeKey}`));
     expect(await screen.findByTestId(`ep-played-badge-${ep39.episodeKey}`)).toBeInTheDocument();
+
+    // Audio-only VIDEO episode overflow menu includes `ep-open-video-*` and still NO Play next / Share
+    fireEvent.click(screen.getByTestId(`ep-menu-${ep40Video.episodeKey}`));
+    expect(screen.getByTestId(`ep-open-video-${ep40Video.episodeKey}`)).toBeInTheDocument();
+    expect(screen.queryByText(/play next/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/share/i)).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
 
     // RFC 5005 `Load older episodes` appends archived episodes 38 & 37 and removes footer button
     const loadOlderBtn = screen.getByTestId('detail-load-older-btn');

@@ -4,12 +4,13 @@
  * 2. Multi-feed HTML `<link rel="alternate">` radio selector (`choices`).
  * 3. Full feed preview with `[ Subscribe ]` AND direct `▶` episode streaming without subscribing.
  */
-import { useEffect, useState } from 'react';
-import type { DiscoveredFeedLink, FeedPreview as FeedPreviewModel } from '@minipod/core';
+import { useCallback, useEffect, useState } from 'react';
+import type { DiscoveredFeedLink, EpisodeKey, FeedPreview as FeedPreviewModel } from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
-import { Button, cx, Icon, IconButton } from '../../components/m3';
+import { ArtworkImage, Button, cx, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
+import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, stripHtmlToText } from '../../lib/format';
 import { deriveEpisodeKey } from '../../lib/identity';
@@ -38,6 +39,26 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
   const [selectedChoiceUrl, setSelectedChoiceUrl] = useState(choices?.items[0]?.url ?? '');
   const [busy, setBusy] = useState(false);
   const [descExpanded, setDescExpanded] = useState(false);
+  const [queuedKeys, setQueuedKeys] = useState<ReadonlySet<EpisodeKey>>(() => new Set());
+
+  const loadQueuedKeys = useCallback(async () => {
+    try {
+      const list = await host.queue.list();
+      setQueuedKeys(new Set(list.map((r) => r.episode.episodeKey)));
+    } catch {
+      // ignore
+    }
+  }, [host]);
+
+  useEffect(() => {
+    void loadQueuedKeys();
+  }, [loadQueuedKeys, preview?.feedKey]);
+
+  useHostEvents((ev) => {
+    if (ev.type === 'queue-changed') {
+      void loadQueuedKeys();
+    }
+  });
 
   useEffect(() => {
     if (choices?.items[0]) {
@@ -301,13 +322,16 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
       {preview && (
         <>
           <section className="m-feed-hero">
-            {preview.parsed.imageUrl ? (
-              <img className="m-feed-hero__cover" src={preview.parsed.imageUrl} alt="" />
-            ) : (
-              <div className="m-feed-hero__cover" style={{ display: 'grid', placeItems: 'center' }}>
-                <Icon name="podcasts" size={32} />
-              </div>
-            )}
+            <ArtworkImage
+              src={preview.parsed.imageUrl}
+              allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+              className="m-feed-hero__cover"
+              placeholder={
+                <div className="m-feed-hero__cover" style={{ display: 'grid', placeItems: 'center' }}>
+                  <Icon name="podcasts" size={32} />
+                </div>
+              }
+            />
             <div className="m-feed-hero__info">
               <div style={{ font: 'var(--md-sys-typescale-title-medium)' }}>
                 {preview.parsed.title ?? preview.url}
@@ -346,6 +370,7 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
           <div className="m-episode-list" data-testid="preview-episode-list">
             {preview.parsed.episodes.map((ep, idx) => {
               const epKey = deriveEpisodeKey(preview.feedKey, ep.identity);
+              const inQueue = queuedKeys.has(epKey);
               const isCurrent = player.episode?.episodeKey === epKey;
               const isPlaying = isCurrent && player.snapshot.playing;
               const dateStr = formatShortDate(ep.pubDate, locale);
@@ -372,6 +397,34 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
                         } else {
                           void player.playPreviewEpisode(preview, ep);
                         }
+                      }}
+                    />
+                    <IconButton
+                      icon={inQueue ? 'queueMusic' : 'playlistAdd'}
+                      variant={inQueue ? 'tonal' : 'standard'}
+                      label={`${inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')} ${ep.title}`}
+                      data-testid={`preview-ep-queue-${idx}`}
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            if (inQueue) {
+                              await host.queue.remove(epKey);
+                            } else {
+                              await host.queue.add(epKey);
+                              showSnackbar(t('detail.addedToQueue'), {
+                                action: {
+                                  label: t('common.undo'),
+                                  run: () => {
+                                    void host.queue.remove(epKey).then(loadQueuedKeys);
+                                  },
+                                },
+                              });
+                            }
+                            await loadQueuedKeys();
+                          } catch (err) {
+                            showSnackbar(err instanceof Error ? err.message : String(err));
+                          }
+                        })();
                       }}
                     />
                   </div>

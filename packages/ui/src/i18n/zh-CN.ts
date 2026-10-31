@@ -34,6 +34,11 @@ export const zhCN = {
   'subs.copyUrl': '复制订阅源地址',
   'subs.needsAuth': '需要身份验证',
   'subs.localBadge': '本地文件夹',
+  'subs.timelineTitle': '最新单集',
+  'subs.expandAll': '展开全部 ({count})',
+  'subs.collapse': '收起',
+  'subs.loadMoreTimeline': '加载更多',
+  'subs.longPressHint': '长按或右键打开操作菜单',
 
   'detail.filterAll': '全部',
   'detail.filterUnplayed': '未播',

@@ -10,7 +10,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ResolveResult, SearchResult, SourceId } from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
-import { Chip, Icon, IconButton, Menu, type MenuEntry } from '../../components/m3';
+import { ArtworkImage, Chip, Icon, IconButton, Menu, shouldUseImageProxy, type MenuEntry } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { looksLikeUrlInput } from '../../lib/identity';
@@ -271,13 +271,17 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
                     void handleResolveUrl(item.feedUrl);
                   }}
                 >
-                  {item.imageUrl ? (
-                    <img className="m-result-row__cover" src={item.imageUrl} alt="" loading="lazy" />
-                  ) : (
-                    <div className="m-result-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
-                      <Icon name="podcasts" size={22} />
-                    </div>
-                  )}
+                  <ArtworkImage
+                    src={item.imageUrl}
+                    allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+                    className="m-result-row__cover"
+                    loading="lazy"
+                    placeholder={
+                      <div className="m-result-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
+                        <Icon name="podcasts" size={22} />
+                      </div>
+                    }
+                  />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div
                       style={{

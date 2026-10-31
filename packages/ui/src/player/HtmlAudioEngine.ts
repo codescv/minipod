@@ -38,6 +38,8 @@ export class HtmlAudioEngine implements PlayerEngine {
   private videoEl: HTMLVideoElement | null = null;
   private activeEl: HTMLMediaElement | null = null;
   private videoContainer: HTMLElement | null = null;
+  private hiddenMediaPark: HTMLDivElement | null = null;
+  private reparenting = false;
 
   private episodeKey: EpisodeKey | undefined;
   private durationHintMs: number | undefined;
@@ -239,11 +241,54 @@ export class HtmlAudioEngine implements PlayerEngine {
     this.sleepController.set(timer, this.positionMs);
   }
 
-  attachVideoSurface(element: HTMLElement): void {
+  attachVideoSurface(element: HTMLElement | null): void {
     this.videoContainer = element;
-    if (this.videoEl && this.videoEl.parentElement !== element) {
-      element.replaceChildren(this.videoEl);
+    if (!this.videoEl) return;
+
+    if (element) {
+      if (this.videoEl.parentElement !== element) {
+        const shouldStayPlaying = this.playing;
+        this.reparentMediaElement(this.videoEl, element, shouldStayPlaying);
+      }
+    } else {
+      const park = this.ensureHiddenMediaPark();
+      if (park && this.videoEl.parentElement !== park) {
+        this.reparentMediaElement(this.videoEl, park, this.playing);
+      }
     }
+  }
+
+  private reparentMediaElement(
+    el: HTMLMediaElement,
+    container: HTMLElement,
+    keepPlaying: boolean,
+  ): void {
+    this.reparenting = true;
+    try {
+      if (container === this.hiddenMediaPark) {
+        container.appendChild(el);
+      } else {
+        container.replaceChildren(el);
+      }
+      if (keepPlaying && el.paused && !el.ended) {
+        void el.play().catch(() => undefined);
+      }
+    } finally {
+      this.reparenting = false;
+    }
+  }
+
+  private ensureHiddenMediaPark(): HTMLDivElement | null {
+    if (typeof document === 'undefined' || !document.body) return null;
+    if (!this.hiddenMediaPark || !this.hiddenMediaPark.isConnected) {
+      const div = document.createElement('div');
+      div.setAttribute('data-minipod-media-park', 'true');
+      div.setAttribute('aria-hidden', 'true');
+      div.style.display = 'none';
+      document.body.appendChild(div);
+      this.hiddenMediaPark = div;
+    }
+    return this.hiddenMediaPark;
   }
 
   getSnapshot(): PlayerSnapshot {
@@ -271,15 +316,23 @@ export class HtmlAudioEngine implements PlayerEngine {
       window.removeEventListener('pagehide', this.boundPageHide);
     }
     this.stop();
+    if (this.hiddenMediaPark) {
+      this.hiddenMediaPark.remove();
+      this.hiddenMediaPark = null;
+    }
     this.listeners.clear();
   }
 
   private ensureAudioElement(): HTMLAudioElement {
+    const park = this.ensureHiddenMediaPark();
     if (!this.audioEl) {
       const el = document.createElement('audio');
       el.preload = 'metadata';
       this.bindMediaElementEvents(el);
       this.audioEl = el;
+    }
+    if (park && !this.audioEl.isConnected) {
+      park.appendChild(this.audioEl);
     }
     return this.audioEl;
   }
@@ -293,8 +346,15 @@ export class HtmlAudioEngine implements PlayerEngine {
       this.bindMediaElementEvents(el);
       this.videoEl = el;
     }
-    if (this.videoContainer && this.videoEl.parentElement !== this.videoContainer) {
-      this.videoContainer.replaceChildren(this.videoEl);
+    if (this.videoContainer && this.videoContainer.isConnected) {
+      if (this.videoEl.parentElement !== this.videoContainer) {
+        this.reparentMediaElement(this.videoEl, this.videoContainer, this.playing);
+      }
+    } else {
+      const park = this.ensureHiddenMediaPark();
+      if (park && this.videoEl.parentElement !== park) {
+        this.reparentMediaElement(this.videoEl, park, this.playing);
+      }
     }
     return this.videoEl;
   }
@@ -309,7 +369,16 @@ export class HtmlAudioEngine implements PlayerEngine {
     });
 
     el.addEventListener('pause', () => {
-      if (el !== this.activeEl || el.ended) return;
+      if (el !== this.activeEl || el.ended || this.reparenting) return;
+      // If a detached container briefly caused a browser auto-pause before park reparenting,
+      // re-attach to hidden park and keep playing seamlessly.
+      if (!el.isConnected && this.playing) {
+        const park = this.ensureHiddenMediaPark();
+        if (park) {
+          this.reparentMediaElement(el, park, true);
+          return;
+        }
+      }
       this.playing = false;
       this.buffering = false;
       this.updateMediaSessionPlaybackState('paused');

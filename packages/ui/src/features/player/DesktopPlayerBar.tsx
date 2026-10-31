@@ -4,12 +4,14 @@
 import { useState } from 'react';
 import { SPEED_MAX, SPEED_MIN } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
-import { Button, Icon, IconButton } from '../../components/m3';
+import { ArtworkImage, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
+import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { formatClock, formatRemainingClock, formatSpeed } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 
 export function DesktopPlayerBar() {
+  const host = useHost();
   const t = useT();
   const player = usePlayer();
 
@@ -78,27 +80,28 @@ export function DesktopPlayerBar() {
 
       <footer className="m-desktop-bar">
         <div className="m-desktop-bar__meta">
-          {player.artworkUrl ? (
-            <img
-              className="m-desktop-bar__cover"
-              src={player.artworkUrl}
-              alt=""
-              title={t('player.shownotes')}
-              data-testid="desktop-cover-btn"
-              onClick={() => toggleSideSheet('shownotes')}
-            />
-          ) : (
-            <button
-              type="button"
-              className="m-desktop-bar__cover"
-              style={{ border: 0, display: 'grid', placeItems: 'center' }}
-              aria-label={t('player.shownotes')}
-              data-testid="desktop-cover-btn"
-              onClick={() => toggleSideSheet('shownotes')}
-            >
-              <Icon name="podcasts" size={22} />
-            </button>
-          )}
+          <ArtworkImage
+            src={player.artworkUrl}
+            extraFallbackSrc={player.episodeArtworkUrl}
+            fallbackSrc={player.fallbackArtworkUrl}
+            allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+            className="m-desktop-bar__cover"
+            title={t('player.shownotes')}
+            testId="desktop-cover-btn"
+            onClick={() => toggleSideSheet('shownotes')}
+            placeholder={
+              <button
+                type="button"
+                className="m-desktop-bar__cover"
+                style={{ border: 0, display: 'grid', placeItems: 'center' }}
+                aria-label={t('player.shownotes')}
+                data-testid="desktop-cover-btn"
+                onClick={() => toggleSideSheet('shownotes')}
+              >
+                <Icon name="podcasts" size={22} />
+              </button>
+            }
+          />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div
               style={{

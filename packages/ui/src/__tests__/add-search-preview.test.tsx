@@ -54,6 +54,11 @@ describe('Unified Add / Search / Top Charts / FeedPreview / 401 / Multi-Feed / O
     });
     expect((await host.feeds.list()).length).toBe(initialSubCount);
 
+    // Inline Add-to-Queue on episode 1 in FeedPreview also works without subscribing
+    fireEvent.click(screen.getByTestId('preview-ep-queue-1'));
+    expect(await screen.findByTestId('snackbar')).toHaveTextContent('Added to queue');
+    expect((await host.feeds.list()).length).toBe(initialSubCount);
+
     // Now click Subscribe -> navigates to PodcastDetail and adds to Subscriptions
     fireEvent.click(screen.getByTestId('preview-subscribe-btn'));
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();

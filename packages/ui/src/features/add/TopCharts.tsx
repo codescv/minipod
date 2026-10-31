@@ -3,7 +3,7 @@
  */
 import { useEffect, useState } from 'react';
 import type { CountryCode, SearchResult } from '@minipod/core';
-import { Icon } from '../../components/m3';
+import { ArtworkImage, Icon, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { useSettingsStore } from '../../stores/settings';
@@ -108,13 +108,17 @@ export function TopCharts({
               >
                 {idx + 1}
               </span>
-              {item.imageUrl ? (
-                <img className="m-result-row__cover" src={item.imageUrl} alt="" loading="lazy" />
-              ) : (
-                <div className="m-result-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
-                  <Icon name="podcasts" size={22} />
-                </div>
-              )}
+              <ArtworkImage
+                src={item.imageUrl}
+                allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+                className="m-result-row__cover"
+                loading="lazy"
+                placeholder={
+                  <div className="m-result-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
+                    <Icon name="podcasts" size={22} />
+                  </div>
+                }
+              />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ font: 'var(--md-sys-typescale-title-small)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {item.title}

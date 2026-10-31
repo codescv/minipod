@@ -7,7 +7,16 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
-import { cx, Icon, IconButton, Menu, type MenuEntry } from '../../components/m3';
+import {
+  ArtworkImage,
+  cx,
+  Icon,
+  IconButton,
+  Menu,
+  nonEmptyUrl,
+  shouldUseImageProxy,
+  type MenuEntry,
+} from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
@@ -153,8 +162,10 @@ export function QueueList() {
             const epKey = r.episode.episodeKey;
             const feed = feedsByKey.get(r.episode.feedKey);
             const podcastName = r.entry.stub?.feedTitle ?? feed?.title ?? '';
-            const coverUrl =
-              r.episode.imageUrl ?? r.entry.stub?.imageUrl ?? feed?.imageUrl;
+            const primaryCoverUrl =
+              nonEmptyUrl(r.episode.imageUrl) ?? nonEmptyUrl(r.entry.stub?.imageUrl);
+            const feedCoverUrl =
+              nonEmptyUrl(feed?.imageUrl) ?? nonEmptyUrl(r.entry.stub?.imageUrl);
             const isCurrent = player.episode?.episodeKey === epKey;
             const isPlaying = isCurrent && player.snapshot.playing;
             const dur = r.progress?.durationMs ?? r.episode.durationMs ?? r.entry.stub?.durationMs;
@@ -273,13 +284,18 @@ export function QueueList() {
                   <Icon name="drag" size={20} />
                 </button>
 
-                {coverUrl ? (
-                  <img className="m-queue-row__cover" src={coverUrl} alt="" loading="lazy" />
-                ) : (
-                  <div className="m-queue-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
-                    <Icon name="podcasts" size={20} />
-                  </div>
-                )}
+                <ArtworkImage
+                  src={primaryCoverUrl}
+                  fallbackSrc={feedCoverUrl}
+                  allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+                  className="m-queue-row__cover"
+                  loading="lazy"
+                  placeholder={
+                    <div className="m-queue-row__cover" style={{ display: 'grid', placeItems: 'center' }}>
+                      <Icon name="podcasts" size={20} />
+                    </div>
+                  }
+                />
 
                 <div
                   style={{ flex: 1, minWidth: 0, cursor: 'pointer' }}
@@ -289,7 +305,7 @@ export function QueueList() {
                     } else {
                       void player.playEpisode(r.episode, {
                         feedTitle: podcastName,
-                        feedImageUrl: coverUrl,
+                        feedImageUrl: feedCoverUrl,
                       });
                     }
                   }}
@@ -323,7 +339,7 @@ export function QueueList() {
                     } else {
                       void player.playEpisode(r.episode, {
                         feedTitle: podcastName,
-                        feedImageUrl: coverUrl,
+                        feedImageUrl: feedCoverUrl,
                       });
                     }
                   }}

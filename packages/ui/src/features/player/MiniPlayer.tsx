@@ -2,12 +2,14 @@
  * Docked mobile MiniPlayer bar (`DESIGN.md` §4.6).
  */
 import { useRouteStore } from '../../app/routes';
-import { Icon, IconButton } from '../../components/m3';
+import { ArtworkImage, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
+import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { formatClock } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 
 export function MiniPlayer() {
+  const host = useHost();
   const t = useT();
   const player = usePlayer();
   const setExpandedPlayerOpen = useRouteStore((s) => s.setExpandedPlayerOpen);
@@ -33,13 +35,19 @@ export function MiniPlayer() {
         }
       }}
     >
-      {player.artworkUrl ? (
-        <img className="m-mini-player__cover" src={player.artworkUrl} alt="" />
-      ) : (
-        <div className="m-mini-player__cover" style={{ display: 'grid', placeItems: 'center' }}>
-          <Icon name="podcasts" size={20} />
-        </div>
-      )}
+      <ArtworkImage
+        src={player.artworkUrl}
+        extraFallbackSrc={player.episodeArtworkUrl}
+        fallbackSrc={player.fallbackArtworkUrl}
+        allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+        className="m-mini-player__cover"
+        testId="mini-player-artwork-img"
+        placeholder={
+          <div className="m-mini-player__cover" style={{ display: 'grid', placeItems: 'center' }}>
+            <Icon name="podcasts" size={20} />
+          </div>
+        }
+      />
 
       <div className="m-mini-player__info">
         <div className="m-mini-player__title">{player.episode.title}</div>

@@ -28,6 +28,7 @@ import {
   type SleepTimer,
   type SleepTimerState,
 } from '@minipod/core';
+import { nonEmptyUrl } from '../components/m3';
 import { useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
 import { useT } from '../i18n';
@@ -56,6 +57,8 @@ export interface PlayerContextValue {
   readonly episode: Episode | null;
   readonly feedTitle: string;
   readonly artworkUrl: string | undefined;
+  readonly episodeArtworkUrl: string | undefined;
+  readonly fallbackArtworkUrl: string | undefined;
   readonly snapshot: PlayerSnapshot;
   readonly sleepTimer: SleepTimerState;
   readonly muted: boolean;
@@ -98,7 +101,8 @@ export function PlayerProvider({
 
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [feedTitle, setFeedTitle] = useState('');
-  const [baseArtworkUrl, setBaseArtworkUrl] = useState<string | undefined>(undefined);
+  const [episodeImageUrl, setEpisodeImageUrl] = useState<string | undefined>(undefined);
+  const [feedImageUrl, setFeedImageUrl] = useState<string | undefined>(undefined);
   const [chapterArtworkUrl, setChapterArtworkUrl] = useState<string | undefined>(undefined);
   const [snapshot, setSnapshot] = useState<PlayerSnapshot>(() => engine.getSnapshot());
   const [sleepTimer, setSleepTimerState] = useState<SleepTimerState>({ timer: { mode: 'off' } });
@@ -175,14 +179,14 @@ export function PlayerProvider({
         // Preview episode whose feed stub was not materialized in DB yet can still stream directly
       }
 
-      // Resolve feed metadata if not passed
-      let resolvedFeedTitle = options?.feedTitle ?? '';
-      let resolvedFeedImage = options?.feedImageUrl;
+      // Resolve feed metadata whenever feedTitle or feedImageUrl is missing/empty
+      let resolvedFeedTitle = nonEmptyUrl(options?.feedTitle) ?? '';
+      let resolvedFeedImage = nonEmptyUrl(options?.feedImageUrl);
       if (!resolvedFeedTitle || !resolvedFeedImage) {
         try {
           const feed = await host.feeds.get(target.feedKey);
-          resolvedFeedTitle = resolvedFeedTitle || feed.title || '';
-          resolvedFeedImage = resolvedFeedImage ?? feed.imageUrl;
+          resolvedFeedTitle = resolvedFeedTitle || nonEmptyUrl(feed.title) || '';
+          resolvedFeedImage = resolvedFeedImage ?? nonEmptyUrl(feed.imageUrl);
         } catch {
           // ignore for unpersisted preview stubs
         }
@@ -216,12 +220,14 @@ export function PlayerProvider({
       }
 
       const speed = clampSpeed(useSettingsStore.getState().settings.playbackSpeed || 1.0);
-      const artwork = target.imageUrl ?? resolvedFeedImage;
+      const epImage = nonEmptyUrl(target.imageUrl);
+      const artwork = epImage ?? resolvedFeedImage;
 
       episodeRef.current = target;
       setEpisode(target);
       setFeedTitle(resolvedFeedTitle);
-      setBaseArtworkUrl(artwork);
+      setEpisodeImageUrl(epImage);
+      setFeedImageUrl(resolvedFeedImage);
       setChapterArtworkUrl(undefined);
       setChapters(options?.inlineChapters ?? []);
       suppressAutoAdvanceForKeyRef.current = null;
@@ -263,10 +269,15 @@ export function PlayerProvider({
   const playPreviewEpisode = useCallback(
     async (preview: FeedPreview, parsed: ParsedEpisode): Promise<void> => {
       const epKey = deriveEpisodeKey(preview.feedKey, parsed.identity);
+      const parsedEpImage = nonEmptyUrl(parsed.imageUrl);
+      const previewFeedImage = nonEmptyUrl(preview.parsed.imageUrl);
       let epToPlay: Episode | undefined;
       try {
         const row = await host.episodes.get(epKey);
-        epToPlay = row.episode;
+        epToPlay =
+          !nonEmptyUrl(row.episode.imageUrl) && parsedEpImage
+            ? { ...row.episode, imageUrl: parsedEpImage }
+            : row.episode;
       } catch {
         epToPlay = {
           episodeKey: epKey,
@@ -276,10 +287,10 @@ export function PlayerProvider({
           title: parsed.title,
           ...(parsed.description !== undefined ? { description: parsed.description } : {}),
           ...(parsed.link !== undefined ? { link: parsed.link } : {}),
-          ...(parsed.imageUrl !== undefined
-            ? { imageUrl: parsed.imageUrl }
-            : preview.parsed.imageUrl !== undefined
-              ? { imageUrl: preview.parsed.imageUrl }
+          ...(parsedEpImage !== undefined
+            ? { imageUrl: parsedEpImage }
+            : previewFeedImage !== undefined
+              ? { imageUrl: previewFeedImage }
               : {}),
           ...(parsed.pubDate !== undefined ? { pubDate: parsed.pubDate } : {}),
           ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
@@ -295,8 +306,8 @@ export function PlayerProvider({
         };
       }
       await playEpisode(epToPlay, {
-        feedTitle: preview.parsed.title ?? preview.url,
-        feedImageUrl: preview.parsed.imageUrl,
+        feedTitle: nonEmptyUrl(preview.parsed.title) ?? preview.url,
+        feedImageUrl: previewFeedImage,
         inlineChapters: parsed.chapters,
       });
     },
@@ -375,20 +386,57 @@ export function PlayerProvider({
             const remainingQueue = await host.queue.list();
             const nextRow = remainingQueue.find((r) => r.episode.episodeKey !== ev.episodeKey);
             if (nextRow) {
-              await playEpisodeRef.current(nextRow.episode);
+              const stubTitle = nonEmptyUrl(nextRow.entry.stub?.feedTitle);
+              const stubImage = nonEmptyUrl(nextRow.entry.stub?.imageUrl);
+              let nextFeedTitle = stubTitle;
+              let nextFeedImage: string | undefined;
+              try {
+                const feed = await host.feeds.get(nextRow.episode.feedKey);
+                nextFeedTitle = nextFeedTitle ?? nonEmptyUrl(feed.title);
+                nextFeedImage = nonEmptyUrl(feed.imageUrl) ?? stubImage;
+              } catch {
+                nextFeedImage = stubImage;
+              }
+              await playEpisodeRef.current(nextRow.episode, {
+                feedTitle: nextFeedTitle,
+                feedImageUrl: nextFeedImage,
+              });
             }
           })
           .catch(() => undefined);
       } else if (ev.type === 'nativeAdvanced') {
-        void host.episodes
-          .get(ev.to)
-          .then(async (row) => {
+        void (async () => {
+          try {
+            const [row, qList] = await Promise.all([
+              host.episodes.get(ev.to),
+              host.queue.list().catch(() => [] as const),
+            ]);
+            const qMatch = qList.find((q) => q.episode.episodeKey === ev.to);
+            const stub = qMatch?.entry.stub;
+            let nextFeedTitle = nonEmptyUrl(stub?.feedTitle);
+            let nextFeedImage: string | undefined;
+            try {
+              const feed = await host.feeds.get(row.episode.feedKey);
+              nextFeedTitle = nextFeedTitle ?? nonEmptyUrl(feed.title);
+              nextFeedImage = nonEmptyUrl(feed.imageUrl) ?? nonEmptyUrl(stub?.imageUrl);
+            } catch {
+              nextFeedImage = nonEmptyUrl(stub?.imageUrl);
+            }
+            const epImage = nonEmptyUrl(row.episode.imageUrl);
             episodeRef.current = row.episode;
             setEpisode(row.episode);
+            setFeedTitle(nextFeedTitle ?? '');
+            setEpisodeImageUrl(epImage);
+            setFeedImageUrl(nextFeedImage);
+            setChapterArtworkUrl(undefined);
             const chs = await host.episodes.chapters(ev.to).catch(() => []);
-            setChapters(chs);
-          })
-          .catch(() => undefined);
+            if (episodeRef.current?.episodeKey === ev.to) {
+              setChapters(chs);
+            }
+          } catch {
+            // ignore
+          }
+        })();
       }
     });
   }, [engine, host, saveProgressSafe]);
@@ -467,10 +515,10 @@ export function PlayerProvider({
     void host.episodes
       .chapterImage(curEp.episodeKey, activeChapterIndex)
       .then((url) => {
-        if (alive) setChapterArtworkUrl(url ?? ch.imageUrl);
+        if (alive) setChapterArtworkUrl(nonEmptyUrl(url) ?? nonEmptyUrl(ch.imageUrl));
       })
       .catch(() => {
-        if (alive) setChapterArtworkUrl(ch.imageUrl);
+        if (alive) setChapterArtworkUrl(nonEmptyUrl(ch.imageUrl));
       });
     return () => {
       alive = false;
@@ -597,19 +645,28 @@ export function PlayerProvider({
 
   const attachVideoSurface = useCallback(
     (el: HTMLElement | null) => {
-      if (el && engine.attachVideoSurface) {
+      if (engine instanceof HtmlAudioEngine) {
+        engine.attachVideoSurface(el);
+      } else if (el && engine.attachVideoSurface) {
         engine.attachVideoSurface(el);
       }
     },
     [engine],
   );
 
+  const primaryArtworkUrl =
+    nonEmptyUrl(chapterArtworkUrl) ?? nonEmptyUrl(episodeImageUrl) ?? nonEmptyUrl(feedImageUrl);
+  const resolvedEpisodeArtworkUrl = nonEmptyUrl(episodeImageUrl);
+  const resolvedFallbackArtworkUrl = nonEmptyUrl(feedImageUrl);
+
   const value = useMemo<PlayerContextValue>(
     () => ({
       engine,
       episode,
       feedTitle,
-      artworkUrl: chapterArtworkUrl ?? baseArtworkUrl,
+      artworkUrl: primaryArtworkUrl,
+      episodeArtworkUrl: resolvedEpisodeArtworkUrl,
+      fallbackArtworkUrl: resolvedFallbackArtworkUrl,
       snapshot,
       sleepTimer,
       muted,
@@ -636,8 +693,9 @@ export function PlayerProvider({
       engine,
       episode,
       feedTitle,
-      chapterArtworkUrl,
-      baseArtworkUrl,
+      primaryArtworkUrl,
+      resolvedEpisodeArtworkUrl,
+      resolvedFallbackArtworkUrl,
       snapshot,
       sleepTimer,
       muted,

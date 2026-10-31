@@ -173,4 +173,149 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
 
     htmlEngine.dispose();
   });
+
+  it('displays feed artwork fallback on DesktopPlayerBar when episode.imageUrl is absent', async () => {
+    const desktop = renderMiniPod({ width: 1200 });
+    fireEvent.click(await screen.findByText('Syntax & Signal'));
+    expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    const feeds = await desktop.host.feeds.list();
+    const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
+    const page = await desktop.host.episodes.list(syntax.feedKey, 'all');
+    const ep39NoArt = page.items[3]!.episode;
+    fireEvent.click(await screen.findByTestId(`ep-play-${ep39NoArt.episodeKey}`));
+    await waitFor(() => expect(desktop.engine.getSnapshot().playing).toBe(true));
+
+    const desktopCover = screen.getByTestId('desktop-cover-btn') as HTMLImageElement;
+    expect(desktopCover.tagName).toBe('IMG');
+    expect(desktopCover.getAttribute('referrerpolicy')).toBe('no-referrer');
+    expect(desktopCover.getAttribute('src')).toBe(syntax.imageUrl);
+  });
+
+  it('displays episode artwork on ExpandedPlayer & MiniPlayer with proxy -> feed -> placeholder fallback on error and keeps playback alive across navigation', async () => {
+    const mobile = renderMiniPod({ width: 390 });
+    await screen.findByText('Syntax & Signal');
+
+    const feeds = await mobile.host.feeds.list();
+    const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
+    const brokenEpUrl = 'https://cdn.broken.example.org/ep-art.jpg';
+    const feedCoverUrl = 'https://cdn.feed.example.org/podcast-cover.jpg';
+
+    // Patch host.feeds.get & host.episodes.list for syntax.feedKey to return HTTP URLs so we exercise the full 4-step candidate chain
+    const origGetFeed = mobile.host.feeds.get.bind(mobile.host.feeds);
+    vi.spyOn(mobile.host.feeds, 'get').mockImplementation(async (fk) => {
+      if (fk === syntax.feedKey) {
+        return { ...syntax, feedKey: fk, imageUrl: feedCoverUrl };
+      }
+      return origGetFeed(fk);
+    });
+    const origListEpisodes = mobile.host.episodes.list.bind(mobile.host.episodes);
+    const page = await origListEpisodes(syntax.feedKey, 'all');
+    const epWithBrokenArt = {
+      ...page.items[3]!.episode,
+      imageUrl: brokenEpUrl,
+    };
+    vi.spyOn(mobile.host.episodes, 'list').mockImplementation(async (fk, filter, cursor) => {
+      if (fk === syntax.feedKey) {
+        return { items: [{ ...page.items[3]!, episode: epWithBrokenArt }] };
+      }
+      return origListEpisodes(fk, filter, cursor);
+    });
+
+    // Open Syntax & Signal and play the episode
+    fireEvent.click(screen.getByTestId(`feed-tile-${syntax.feedKey}`));
+    expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    fireEvent.click(await screen.findByTestId(`ep-play-${epWithBrokenArt.episodeKey}`));
+    await waitFor(() => expect(mobile.engine.getSnapshot().playing).toBe(true));
+
+    // MiniPlayer shows episode artwork with referrerPolicy="no-referrer"
+    const miniImg = (await screen.findByTestId('mini-player-artwork-img')) as HTMLImageElement;
+    expect(miniImg.getAttribute('referrerpolicy')).toBe('no-referrer');
+    expect(miniImg.getAttribute('src')).toBe(brokenEpUrl);
+
+    // Open ExpandedPlayer and step through error fallbacks
+    fireEvent.click(screen.getByTestId('mini-player'));
+    const expandedImg = (await screen.findByTestId('expanded-artwork-img')) as HTMLImageElement;
+    expect(expandedImg.getAttribute('referrerpolicy')).toBe('no-referrer');
+    expect(expandedImg.getAttribute('src')).toBe(brokenEpUrl);
+
+    // Error 1 -> falls back to `/api/image-proxy?url=<episode.imageUrl>`
+    fireEvent.error(expandedImg);
+    expect(screen.getByTestId('expanded-artwork-img').getAttribute('src')).toBe(
+      `/api/image-proxy?url=${encodeURIComponent(brokenEpUrl)}`,
+    );
+
+    // Error 2 -> falls back to `feed.imageUrl`
+    fireEvent.error(screen.getByTestId('expanded-artwork-img'));
+    expect(screen.getByTestId('expanded-artwork-img').getAttribute('src')).toBe(feedCoverUrl);
+
+    // Error 3 -> falls back to `/api/image-proxy?url=<feed.imageUrl>`
+    fireEvent.error(screen.getByTestId('expanded-artwork-img'));
+    expect(screen.getByTestId('expanded-artwork-img').getAttribute('src')).toBe(
+      `/api/image-proxy?url=${encodeURIComponent(feedCoverUrl)}`,
+    );
+
+    // Error 4 -> clean SVG placeholder (no broken <img> element left in ExpandedPlayer)
+    fireEvent.error(screen.getByTestId('expanded-artwork-img'));
+    expect(screen.queryByTestId('expanded-artwork-img')).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId('expanded-player').querySelector('.m-expanded-player__artwork-wrap svg'),
+    ).not.toBeNull();
+
+    // Closing ExpandedPlayer and navigating across screens keeps playback running uninterrupted
+    fireEvent.click(screen.getByTestId('expanded-collapse-btn'));
+    await waitFor(() => expect(screen.queryByTestId('expanded-player')).not.toBeInTheDocument());
+    expect(mobile.engine.getSnapshot().playing).toBe(true);
+
+    fireEvent.click(screen.getByTestId('detail-back-btn'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    expect(mobile.engine.getSnapshot().playing).toBe(true);
+
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    expect(await screen.findByTestId('queue-screen')).toBeInTheDocument();
+    expect(mobile.engine.getSnapshot().playing).toBe(true);
+
+    fireEvent.click(screen.getByTestId('nav-bar-subscriptions'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('subs-add-fab'));
+    expect(await screen.findByTestId('add-search-screen')).toBeInTheDocument();
+    expect(mobile.engine.getSnapshot().playing).toBe(true);
+
+    vi.restoreAllMocks();
+  });
+
+  it('HtmlAudioEngine keeps media elements attached inside hidden document.body park when video surface detaches on ExpandedPlayer close', async () => {
+    const htmlEngine = new HtmlAudioEngine();
+
+    await htmlEngine.load({
+      episodeKey: 'e_vid_bg',
+      source: { kind: 'url', url: 'https://cdn.example.org/40.mp4', mime: 'video/mp4' },
+      startMs: 0,
+      speed: 1,
+      mediaType: 'VIDEO',
+      metadata: { title: 'Video Ep', durationMs: 300_000 },
+    });
+
+    const park = document.body.querySelector('[data-minipod-media-park="true"]');
+    expect(park).not.toBeNull();
+    const videoEl = park!.querySelector('video')!;
+    expect(videoEl).not.toBeNull();
+    expect(document.body.contains(videoEl)).toBe(true);
+
+    // Attach visible surface (ExpandedPlayer opens)
+    const surface = document.createElement('div');
+    document.body.appendChild(surface);
+    htmlEngine.attachVideoSurface(surface);
+    expect(surface.contains(videoEl)).toBe(true);
+
+    // Detach visible surface (ExpandedPlayer closes -> ref callback passes `null`)
+    htmlEngine.attachVideoSurface(null);
+    surface.remove();
+
+    // `<video>` is reparented back into the hidden park inside `document.body`, NEVER detached from Document!
+    expect(park!.contains(videoEl)).toBe(true);
+    expect(document.body.contains(videoEl)).toBe(true);
+
+    htmlEngine.dispose();
+    expect(document.body.querySelector('[data-minipod-media-park="true"]')).toBeNull();
+  });
 });

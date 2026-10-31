@@ -1,15 +1,23 @@
 /**
  * Episode row (`DESIGN.md` §4.3):
- * - Date · human duration · `✓` played · `Audio only` badge for video on audio-only engines
+ * - Optional podcast cover thumbnail + clickable podcast title in timeline mode (`showPodcastInfo`)
+ * - Date · human duration · `✓` played · downloaded indicator · `Audio only` badge
  * - Linear progress bar + remaining time when `IN_PROGRESS`
- * - Swipe-right to add to queue + Undo snackbar
- * - `▶/⏸` play button (long-press / context-menu -> Play next)
- * - `⬇` manual download / delete toggle
- * - `⋮` overflow: Play next, Add/Remove queue, Mark played/unplayed, Share link, Open in video player
+ * - Swipe-right to toggle queue + Undo snackbar
+ * - Inline actions: `▶/⏸` play/pause, inline Add/Remove Queue (`ep-queue-btn-*`), and `⋮` overflow
+ *   (`Download / Delete download`, `Mark played / unplayed`, and `Open in video player` when needed)
  */
 import { useRef } from 'react';
 import type { EpisodeRow as EpisodeRowModel } from '@minipod/core';
-import { cx, Icon, IconButton, Menu, type MenuEntry } from '../../components/m3';
+import {
+  ArtworkImage,
+  cx,
+  Icon,
+  IconButton,
+  Menu,
+  shouldUseImageProxy,
+  type MenuEntry,
+} from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate } from '../../lib/format';
@@ -21,6 +29,8 @@ export interface EpisodeRowProps {
   readonly feedTitle?: string | undefined;
   readonly feedImageUrl?: string | undefined;
   readonly allowDownloads: boolean;
+  readonly showPodcastInfo?: boolean | undefined;
+  readonly onOpenPodcast?: (() => void) | undefined;
   readonly onChanged: () => void;
 }
 
@@ -29,12 +39,15 @@ export function EpisodeRow({
   feedTitle,
   feedImageUrl,
   allowDownloads,
+  showPodcastInfo = false,
+  onOpenPodcast,
   onChanged,
 }: EpisodeRowProps) {
   const host = useHost();
   const locale = useLocale();
   const t = useT();
   const player = usePlayer();
+  const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const { episode, progress, inQueue } = row;
   const isCurrent = player.episode?.episodeKey === episode.episodeKey;
@@ -51,10 +64,9 @@ export function EpisodeRow({
       ? formatHumanDuration(durationMs - positionMs)
       : '';
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
+  const isDownloading = episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED';
 
   const swipeStartXRef = useRef<number | null>(null);
-  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const longPressedRef = useRef(false);
 
   const handlePlayToggle = () => {
     if (isCurrent) {
@@ -77,10 +89,13 @@ export function EpisodeRow({
     });
   };
 
-  const handlePlayNext = async () => {
-    await host.queue.playNext(episode.episodeKey);
-    onChanged();
-    showSnackbar(t('detail.addedPlayNext'));
+  const handleToggleQueue = async () => {
+    if (inQueue) {
+      await host.queue.remove(episode.episodeKey);
+      onChanged();
+    } else {
+      await handleAddQueueWithUndo();
+    }
   };
 
   const handleDownloadToggle = async () => {
@@ -92,41 +107,26 @@ export function EpisodeRow({
     onChanged();
   };
 
-  const handleShare = async () => {
-    const shared = await host.episodes.share(episode.episodeKey);
-    try {
-      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(shared.url);
-      }
-    } catch {
-      // ignore
-    }
-    showSnackbar(t('common.copied'));
-  };
-
   const menuItems: MenuEntry[] = [
-    {
-      key: 'play-next',
-      label: t('detail.playNext'),
-      icon: 'play',
-      testId: `ep-play-next-${episode.episodeKey}`,
-      onSelect: () => {
-        void handlePlayNext();
-      },
-    },
-    {
-      key: 'toggle-queue',
-      label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
-      icon: inQueue ? 'delete' : 'queue',
-      testId: `ep-queue-toggle-${episode.episodeKey}`,
-      onSelect: () => {
-        if (inQueue) {
-          void host.queue.remove(episode.episodeKey).then(onChanged);
-        } else {
-          void handleAddQueueWithUndo();
-        }
-      },
-    },
+    ...(allowDownloads
+      ? [
+          {
+            key: 'download',
+            label:
+              episode.downloadState === 'DONE'
+                ? t('detail.deleteDownload')
+                : isDownloading
+                  ? t('detail.downloading')
+                  : t('detail.download'),
+            icon: (episode.downloadState === 'DONE' ? 'downloaded' : 'download') as 'downloaded' | 'download',
+            disabled: isDownloading,
+            testId: `ep-download-${episode.episodeKey}`,
+            onSelect: () => {
+              void handleDownloadToggle();
+            },
+          },
+        ]
+      : []),
     {
       key: 'mark-played',
       label: isPlayed ? t('detail.markUnplayed') : t('detail.markPlayed'),
@@ -134,15 +134,6 @@ export function EpisodeRow({
       testId: `ep-mark-played-${episode.episodeKey}`,
       onSelect: () => {
         void host.progress.markPlayed(episode.episodeKey, !isPlayed).then(onChanged);
-      },
-    },
-    {
-      key: 'share',
-      label: t('detail.shareLink'),
-      icon: 'share',
-      testId: `ep-share-${episode.episodeKey}`,
-      onSelect: () => {
-        void handleShare();
       },
     },
     ...(isAudioOnlyVideo && episode.enclosureUrl
@@ -178,10 +169,34 @@ export function EpisodeRow({
         swipeStartXRef.current = null;
         const touch = e.changedTouches[0];
         if (startX !== null && touch && touch.clientX - startX > 64) {
-          void handleAddQueueWithUndo();
+          void handleToggleQueue();
         }
       }}
     >
+      {showPodcastInfo && (
+        <button
+          type="button"
+          className="m-episode-row__podcast-thumb"
+          aria-label={feedTitle || episode.title}
+          title={feedTitle || episode.title}
+          data-testid={`ep-podcast-thumb-${episode.episodeKey}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenPodcast?.();
+          }}
+        >
+          <ArtworkImage
+            src={episode.imageUrl}
+            fallbackSrc={feedImageUrl}
+            allowProxyFallback={allowProxy}
+            className="m-episode-row__thumb-img"
+            loading="lazy"
+            draggable={false}
+            placeholder={<Icon name="podcasts" size={18} />}
+          />
+        </button>
+      )}
+
       <div
         className="m-episode-row__body"
         role="button"
@@ -195,12 +210,39 @@ export function EpisodeRow({
         }}
       >
         <div className="m-episode-row__meta">
+          {showPodcastInfo && feedTitle && (
+            <button
+              type="button"
+              className="m-episode-row__podcast-link"
+              data-testid={`ep-podcast-link-${episode.episodeKey}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenPodcast?.();
+              }}
+            >
+              {dateStr || durStr ? `${feedTitle} ·` : `${feedTitle} ›`}
+            </button>
+          )}
           {dateStr && <span>{dateStr}</span>}
           {dateStr && durStr && <span>·</span>}
           {durStr && <span>{durStr}</span>}
           {isPlayed && (
             <span title={t('detail.played')} data-testid={`ep-played-badge-${episode.episodeKey}`}>
               ✓
+            </span>
+          )}
+          {episode.downloadState === 'DONE' && (
+            <span
+              title={t('detail.filterDownloaded')}
+              data-testid={`ep-downloaded-badge-${episode.episodeKey}`}
+              style={{ display: 'inline-flex', alignItems: 'center', color: 'var(--md-sys-color-primary)' }}
+            >
+              <Icon name="downloaded" size={14} />
+            </span>
+          )}
+          {isDownloading && (
+            <span className="m-pill-badge" data-testid={`ep-downloading-badge-${episode.episodeKey}`}>
+              {t('detail.downloading')}
             </span>
           )}
           {isAudioOnlyVideo && (
@@ -230,53 +272,22 @@ export function EpisodeRow({
           variant={isPlaying ? 'filled' : 'tonal'}
           label={`${isPlaying ? t('detail.pause') : t('detail.play')} ${episode.title}`}
           data-testid={`ep-play-${episode.episodeKey}`}
-          onPointerDown={() => {
-            longPressedRef.current = false;
-            longPressTimerRef.current = setTimeout(() => {
-              longPressedRef.current = true;
-              void handlePlayNext();
-            }, 500);
-          }}
-          onPointerUp={() => {
-            if (longPressTimerRef.current) {
-              clearTimeout(longPressTimerRef.current);
-              longPressTimerRef.current = null;
-            }
-          }}
-          onPointerCancel={() => {
-            if (longPressTimerRef.current) {
-              clearTimeout(longPressTimerRef.current);
-              longPressTimerRef.current = null;
-            }
-          }}
           onClick={(e) => {
             e.stopPropagation();
-            if (longPressedRef.current) {
-              longPressedRef.current = false;
-              return;
-            }
             handlePlayToggle();
           }}
         />
 
-        {allowDownloads && (
-          <IconButton
-            icon={episode.downloadState === 'DONE' ? 'downloaded' : 'download'}
-            label={
-              episode.downloadState === 'DONE'
-                ? t('detail.deleteDownload')
-                : episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED'
-                  ? t('detail.downloading')
-                  : t('detail.download')
-            }
-            disabled={episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED'}
-            data-testid={`ep-download-${episode.episodeKey}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              void handleDownloadToggle();
-            }}
-          />
-        )}
+        <IconButton
+          icon={inQueue ? 'queueMusic' : 'playlistAdd'}
+          variant={inQueue ? 'tonal' : 'standard'}
+          label={`${inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')} ${episode.title}`}
+          data-testid={`ep-queue-btn-${episode.episodeKey}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            void handleToggleQueue();
+          }}
+        />
 
         <Menu
           label={`${t('common.more')} ${episode.title}`}
