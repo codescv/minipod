@@ -1335,21 +1335,6 @@ public class MiniPodPlugin extends Plugin {
     // Google Sign-In (`auth.*`) for Google Drive Sync
     // -------------------------------------------------------------------------
 
-    private boolean hasConfiguredOAuthClient() {
-        try {
-            int resId = getContext().getResources().getIdentifier(
-                "google_oauth_client_id",
-                "string",
-                getContext().getPackageName()
-            );
-            if (resId == 0) return false;
-            String clientId = getContext().getString(resId);
-            return clientId != null && !clientId.trim().isEmpty();
-        } catch (Exception ignored) {
-            return false;
-        }
-    }
-
     @Nullable
     private String getSavedGoogleAccountEmail() {
         try {
@@ -1395,10 +1380,6 @@ public class MiniPodPlugin extends Plugin {
         PluginCall call,
         @Nullable GoogleSignInClient fallbackSignInClient
     ) {
-        if (!hasConfiguredOAuthClient()) {
-            launchGoogleDriveSafFallback(call);
-            return;
-        }
         try {
             Intent chooseIntent = AccountManager.newChooseAccountIntent(
                 null,
