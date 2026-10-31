@@ -27,6 +27,7 @@ import { SubscriptionsGrid } from '../features/subscriptions/SubscriptionsGrid';
 import { UpdateBanner } from '../features/updater/UpdateBanner';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useT } from '../i18n';
+import { nextSpeedPreset, prevSpeedPreset } from '../player/PlayerEngine';
 import { usePlayer } from '../player/usePlayer';
 
 function isEditableElement(target: EventTarget | null): boolean {
@@ -95,11 +96,11 @@ export function Shell() {
           break;
         case '[':
           e.preventDefault();
-          player.setSpeed(Math.round((player.snapshot.speed - 0.1) * 100) / 100);
+          player.setSpeed(prevSpeedPreset(player.snapshot.speed));
           break;
         case ']':
           e.preventDefault();
-          player.setSpeed(Math.round((player.snapshot.speed + 0.1) * 100) / 100);
+          player.setSpeed(nextSpeedPreset(player.snapshot.speed));
           break;
         case 'q':
         case 'Q':

@@ -1,10 +1,34 @@
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { SPEED_MAX, SPEED_MIN, SPEED_PRESETS } from '@minipod/core';
 import { HtmlAudioEngine } from '../player/HtmlAudioEngine';
+import { clampSpeed, nextSpeedPreset, prevSpeedPreset } from '../player/PlayerEngine';
 import { renderMiniPod } from './test-helpers';
 
 describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & HtmlAudioEngine', () => {
-  it('supports desktop transport, speed presets + slider, keyboard shortcuts, active chapter highlight + seek, and sanitized shownotes', async () => {
+  it('enforces 3 playback speed presets (0.8, 1.0, 1.5) in clampSpeed, nextSpeedPreset, and prevSpeedPreset', () => {
+    expect(SPEED_MIN).toBe(0.8);
+    expect(SPEED_MAX).toBe(1.5);
+    expect(SPEED_PRESETS).toEqual([0.8, 1.0, 1.5]);
+
+    expect(clampSpeed(Number.NaN)).toBe(1.0);
+    expect(clampSpeed(0.5)).toBe(0.8);
+    expect(clampSpeed(0.85)).toBe(0.8);
+    expect(clampSpeed(0.95)).toBe(1.0);
+    expect(clampSpeed(1.0)).toBe(1.0);
+    expect(clampSpeed(1.4)).toBe(1.5);
+    expect(clampSpeed(2.5)).toBe(1.5);
+
+    expect(nextSpeedPreset(1.0)).toBe(1.5);
+    expect(nextSpeedPreset(1.5)).toBe(0.8);
+    expect(nextSpeedPreset(0.8)).toBe(1.0);
+
+    expect(prevSpeedPreset(1.5)).toBe(1.0);
+    expect(prevSpeedPreset(1.0)).toBe(0.8);
+    expect(prevSpeedPreset(0.8)).toBe(1.5);
+  });
+
+  it('supports desktop transport, 3 speed presets (no slider), keyboard shortcuts, active chapter highlight + seek, and sanitized shownotes', async () => {
     const { host, engine } = renderMiniPod({ width: 1200 });
 
     fireEvent.click(await screen.findByText('Syntax & Signal'));
@@ -26,21 +50,26 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     fireEvent.click(screen.getByTestId('desktop-skip-back-btn'));
     expect(engine.getSnapshot().positionMs).toBe(posBefore + 20_000);
 
-    // Cycle speed presets: 1x -> 1.25x -> 1.5x -> 1.75x -> 2x -> 1x
+    // Fine-grained speed slider and ± button are removed
+    expect(screen.queryByTestId('desktop-speed-slider-btn')).toBeNull();
+    expect(screen.queryByTestId('desktop-speed-slider')).toBeNull();
+    expect(screen.queryByTestId('desktop-speed-popover')).toBeNull();
+
+    // Cycle speed presets strictly through 1x -> 1.5x -> 0.8x -> 1x
     const speedBtn = screen.getByTestId('desktop-speed-btn');
     expect(speedBtn).toHaveTextContent('1×');
-    fireEvent.click(speedBtn);
-    expect(speedBtn).toHaveTextContent('1.25×');
+    expect(engine.getSnapshot().speed).toBe(1.0);
     fireEvent.click(speedBtn);
     expect(speedBtn).toHaveTextContent('1.5×');
+    expect(engine.getSnapshot().speed).toBe(1.5);
+    fireEvent.click(speedBtn);
+    expect(speedBtn).toHaveTextContent('0.8×');
+    expect(engine.getSnapshot().speed).toBe(0.8);
+    fireEvent.click(speedBtn);
+    expect(speedBtn).toHaveTextContent('1×');
+    expect(engine.getSnapshot().speed).toBe(1.0);
 
-    // Fine-grain speed slider (0.5x..3.0x)
-    fireEvent.click(screen.getByTestId('desktop-speed-slider-btn'));
-    const slider = await screen.findByTestId('desktop-speed-slider');
-    fireEvent.change(slider, { target: { value: '2.35' } });
-    expect(engine.getSnapshot().speed).toBeCloseTo(2.35, 2);
-
-    // Keyboard shortcuts: Space pauses/plays, J/L skip, [/] adjust speed, Q opens Queue
+    // Keyboard shortcuts: Space pauses/plays, J/L skip, [/] cycle speed presets, Q opens Queue
     fireEvent.keyDown(window, { key: ' ', code: 'Space' });
     expect(engine.getSnapshot().playing).toBe(false);
     fireEvent.keyDown(window, { key: ' ', code: 'Space' });
@@ -52,8 +81,27 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     fireEvent.keyDown(window, { key: 'j' });
     expect(engine.getSnapshot().positionMs).toBe(beforeKeySkip + 20_000);
 
+    // ] steps forward: 1.0 -> 1.5 -> 0.8 -> 1.0
     fireEvent.keyDown(window, { key: ']' });
-    expect(engine.getSnapshot().speed).toBeCloseTo(2.45, 2);
+    expect(engine.getSnapshot().speed).toBe(1.5);
+    expect(speedBtn).toHaveTextContent('1.5×');
+    fireEvent.keyDown(window, { key: ']' });
+    expect(engine.getSnapshot().speed).toBe(0.8);
+    expect(speedBtn).toHaveTextContent('0.8×');
+    fireEvent.keyDown(window, { key: ']' });
+    expect(engine.getSnapshot().speed).toBe(1.0);
+    expect(speedBtn).toHaveTextContent('1×');
+
+    // [ steps backward: 1.0 -> 0.8 -> 1.5 -> 1.0
+    fireEvent.keyDown(window, { key: '[' });
+    expect(engine.getSnapshot().speed).toBe(0.8);
+    expect(speedBtn).toHaveTextContent('0.8×');
+    fireEvent.keyDown(window, { key: '[' });
+    expect(engine.getSnapshot().speed).toBe(1.5);
+    expect(speedBtn).toHaveTextContent('1.5×');
+    fireEvent.keyDown(window, { key: '[' });
+    expect(engine.getSnapshot().speed).toBe(1.0);
+    expect(speedBtn).toHaveTextContent('1×');
 
     fireEvent.keyDown(window, { key: 'q' });
     expect(await screen.findByTestId('queue-screen')).toBeInTheDocument();
@@ -232,11 +280,25 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     expect(miniImg.getAttribute('referrerpolicy')).toBe('no-referrer');
     expect(miniImg.getAttribute('src')).toBe(brokenEpUrl);
 
-    // Open ExpandedPlayer and step through error fallbacks
+    // Open ExpandedPlayer and verify 3 speed presets (1x -> 1.5x -> 0.8x -> 1x) + absence of slider controls
     fireEvent.click(screen.getByTestId('mini-player'));
     const expandedImg = (await screen.findByTestId('expanded-artwork-img')) as HTMLImageElement;
     expect(expandedImg.getAttribute('referrerpolicy')).toBe('no-referrer');
     expect(expandedImg.getAttribute('src')).toBe(brokenEpUrl);
+
+    expect(screen.queryByTestId('expanded-speed-slider-toggle')).toBeNull();
+    expect(screen.queryByTestId('expanded-speed-slider')).toBeNull();
+    const expandedSpeedBtn = screen.getByTestId('expanded-speed-btn');
+    expect(expandedSpeedBtn).toHaveTextContent('1×');
+    fireEvent.click(expandedSpeedBtn);
+    expect(expandedSpeedBtn).toHaveTextContent('1.5×');
+    expect(mobile.engine.getSnapshot().speed).toBe(1.5);
+    fireEvent.click(expandedSpeedBtn);
+    expect(expandedSpeedBtn).toHaveTextContent('0.8×');
+    expect(mobile.engine.getSnapshot().speed).toBe(0.8);
+    fireEvent.click(expandedSpeedBtn);
+    expect(expandedSpeedBtn).toHaveTextContent('1×');
+    expect(mobile.engine.getSnapshot().speed).toBe(1.0);
 
     // Error 1 -> falls back to `/api/image-proxy?url=<episode.imageUrl>`
     fireEvent.error(expandedImg);

@@ -63,6 +63,7 @@ export {
   SLEEP_FADE_WINDOW_MS,
   clampSpeed,
   nextSpeedPreset,
+  prevSpeedPreset,
   computeResumePositionMs,
   isEpisodeNearEnd,
   findActiveChapterIndex,

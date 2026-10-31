@@ -1,8 +1,7 @@
 /**
  * Full-height Expanded Player sheet on mobile (`DESIGN.md` §4.6).
  */
-import { useRef, useState } from 'react';
-import { SPEED_MAX, SPEED_MIN } from '@minipod/core';
+import { useState } from 'react';
 import { useRouteStore } from '../../app/routes';
 import { ArtworkImage, BottomSheet, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
@@ -20,11 +19,8 @@ export function ExpandedPlayer() {
   const setOpen = useRouteStore((s) => s.setExpandedPlayerOpen);
   const setSleepTimerSheetOpen = useRouteStore((s) => s.setSleepTimerSheetOpen);
 
-  const [showSpeedSlider, setShowSpeedSlider] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(true);
   const [notesOpen, setNotesOpen] = useState(false);
-  const speedLongPressRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const speedLongTriggeredRef = useRef(false);
 
   const episode = player.episode;
   const durationMs = player.snapshot.durationMs ?? episode?.durationMs ?? 0;
@@ -67,61 +63,12 @@ export function ExpandedPlayer() {
                 variant="tonal"
                 aria-label={t('player.speed')}
                 data-testid="expanded-speed-btn"
-                onPointerDown={() => {
-                  speedLongTriggeredRef.current = false;
-                  speedLongPressRef.current = setTimeout(() => {
-                    speedLongTriggeredRef.current = true;
-                    setShowSpeedSlider((v) => !v);
-                  }, 450);
-                }}
-                onPointerUp={() => {
-                  if (speedLongPressRef.current) {
-                    clearTimeout(speedLongPressRef.current);
-                    speedLongPressRef.current = null;
-                  }
-                }}
-                onClick={() => {
-                  if (speedLongTriggeredRef.current) {
-                    speedLongTriggeredRef.current = false;
-                    return;
-                  }
-                  player.cycleSpeed();
-                }}
+                onClick={player.cycleSpeed}
               >
                 {formatSpeed(player.snapshot.speed)}
               </Button>
-              <Button
-                variant="text"
-                aria-label={t('player.speedSlider')}
-                data-testid="expanded-speed-slider-toggle"
-                onClick={() => setShowSpeedSlider((v) => !v)}
-                style={{ padding: '0 8px' }}
-              >
-                ±
-              </Button>
             </div>
           </header>
-
-          {showSpeedSlider && (
-            <label
-              className="m-field"
-              style={{ padding: '8px 12px', borderRadius: 12, background: 'var(--md-sys-color-surface-container)' }}
-            >
-              <span className="m-field__label">
-                {t('player.speedSlider')}: {formatSpeed(player.snapshot.speed)}
-              </span>
-              <input
-                type="range"
-                min={SPEED_MIN}
-                max={SPEED_MAX}
-                step={0.05}
-                aria-label={t('player.speedSlider')}
-                data-testid="expanded-speed-slider"
-                value={player.snapshot.speed}
-                onChange={(e) => player.setSpeed(Number.parseFloat(e.target.value))}
-              />
-            </label>
-          )}
 
           {isVideoInline ? (
             <div

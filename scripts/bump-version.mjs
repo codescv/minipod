@@ -55,6 +55,9 @@ patchIfExists('packages/host-node/src/server/context.ts', (src) =>
 patchIfExists('packages/host-android/src/default-deps.ts', (src) =>
   src.replace(/version = '[0-9]+\.[0-9]+\.[0-9]+';/, `version = '${nextVersion}';`),
 );
+patchIfExists('packages/host-android/src/capacitor-host.ts', (src) =>
+  src.replace(/export const CAPACITOR_HOST_VERSION = '[^']+';/, `export const CAPACITOR_HOST_VERSION = '${nextVersion}';`),
+);
 patchIfExists('packages/ui/src/host/mock-host.ts', (src) =>
   src.replace(/appVersion: options\?\.appVersion \?\? '[0-9]+\.[0-9]+\.[0-9]+'/, `appVersion: options?.appVersion ?? '${nextVersion}'`),
 );

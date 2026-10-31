@@ -924,9 +924,9 @@ export interface PlatformHost {
 
 export const SKIP_BACK_MS = 10_000;
 export const SKIP_FORWARD_MS = 30_000;
-export const SPEED_MIN = 0.5;
-export const SPEED_MAX = 3.0;
-export const SPEED_PRESETS: readonly number[] = [1.0, 1.25, 1.5, 1.75, 2.0];
+export const SPEED_MIN = 0.8;
+export const SPEED_MAX = 1.5;
+export const SPEED_PRESETS: readonly number[] = [0.8, 1.0, 1.5];
 export const RESUME_REWIND_MS = 3_000;
 export const COMPLETION_TAIL_MS = 1_000;
 export const LOCAL_PROGRESS_INTERVAL_MS = 5_000;

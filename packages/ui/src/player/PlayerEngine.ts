@@ -37,21 +37,38 @@ export type {
 
 export function clampSpeed(speed: number): number {
   if (!Number.isFinite(speed)) return 1.0;
-  const clamped = Math.min(SPEED_MAX, Math.max(SPEED_MIN, speed));
-  return Math.round(clamped * 100) / 100;
-}
-
-/** Cycles `1.0 -> 1.25 -> 1.5 -> 1.75 -> 2.0 -> 1.0` (DESIGN.md §4.6). */
-export function nextSpeedPreset(current: number): number {
-  const rounded = Math.round(current * 100) / 100;
-  for (let i = 0; i < SPEED_PRESETS.length; i++) {
+  const bounded = Math.min(SPEED_MAX, Math.max(SPEED_MIN, speed));
+  let nearest = SPEED_PRESETS[0] ?? 1.0;
+  let minDiff = Math.abs(bounded - nearest);
+  for (let i = 1; i < SPEED_PRESETS.length; i++) {
     const preset = SPEED_PRESETS[i]!;
-    if (Math.abs(preset - rounded) < 0.02) {
-      return SPEED_PRESETS[(i + 1) % SPEED_PRESETS.length]!;
+    const diff = Math.abs(bounded - preset);
+    if (diff < minDiff) {
+      minDiff = diff;
+      nearest = preset;
     }
   }
-  const higher = SPEED_PRESETS.find((p) => p > rounded + 0.02);
-  return higher ?? SPEED_PRESETS[0]!;
+  return nearest;
+}
+
+/** Cycles `1.0 -> 1.5 -> 0.8 -> 1.0` across `SPEED_PRESETS` (`[0.8, 1.0, 1.5]`). */
+export function nextSpeedPreset(current: number): number {
+  const snapped = clampSpeed(current);
+  const idx = SPEED_PRESETS.findIndex((p) => Math.abs(p - snapped) < 0.02);
+  if (idx >= 0) {
+    return SPEED_PRESETS[(idx + 1) % SPEED_PRESETS.length]!;
+  }
+  return SPEED_PRESETS[0] ?? 1.0;
+}
+
+/** Cycles backwards `1.5 -> 1.0 -> 0.8 -> 1.5` across `SPEED_PRESETS` (`[0.8, 1.0, 1.5]`). */
+export function prevSpeedPreset(current: number): number {
+  const snapped = clampSpeed(current);
+  const idx = SPEED_PRESETS.findIndex((p) => Math.abs(p - snapped) < 0.02);
+  if (idx >= 0) {
+    return SPEED_PRESETS[(idx - 1 + SPEED_PRESETS.length) % SPEED_PRESETS.length]!;
+  }
+  return SPEED_PRESETS[0] ?? 1.0;
 }
 
 /**

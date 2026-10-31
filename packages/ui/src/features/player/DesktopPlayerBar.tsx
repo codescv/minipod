@@ -1,8 +1,6 @@
 /**
  * Persistent bottom Desktop Player Bar (`>= 840px`, `DESIGN.md` §4.6).
  */
-import { useState } from 'react';
-import { SPEED_MAX, SPEED_MIN } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import { ArtworkImage, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
@@ -17,8 +15,6 @@ export function DesktopPlayerBar() {
 
   const toggleSideSheet = useRouteStore((s) => s.toggleSideSheet);
   const setSleepTimerSheetOpen = useRouteStore((s) => s.setSleepTimerSheetOpen);
-
-  const [showSpeedPopover, setShowSpeedPopover] = useState(false);
 
   const episode = player.episode;
   const durationMs = player.snapshot.durationMs ?? episode?.durationMs ?? 0;
@@ -42,39 +38,6 @@ export function DesktopPlayerBar() {
             ref={player.attachVideoSurface}
             data-testid="desktop-video-surface"
           />
-        </div>
-      )}
-
-      {showSpeedPopover && (
-        <div
-          style={{
-            position: 'absolute',
-            right: 96,
-            bottom: 82,
-            zIndex: 45,
-            width: 240,
-            padding: '12px 16px',
-            borderRadius: 12,
-            background: 'var(--md-sys-color-surface-container-high)',
-            boxShadow: 'var(--md-sys-elevation-2)',
-          }}
-          data-testid="desktop-speed-popover"
-        >
-          <label className="m-field">
-            <span className="m-field__label">
-              {t('player.speedSlider')}: {formatSpeed(player.snapshot.speed)}
-            </span>
-            <input
-              type="range"
-              min={SPEED_MIN}
-              max={SPEED_MAX}
-              step={0.05}
-              aria-label={t('player.speedSlider')}
-              data-testid="desktop-speed-slider"
-              value={player.snapshot.speed}
-              onChange={(e) => player.setSpeed(Number.parseFloat(e.target.value))}
-            />
-          </label>
         </div>
       )}
 
@@ -213,22 +176,8 @@ export function DesktopPlayerBar() {
             aria-label={t('player.speed')}
             data-testid="desktop-speed-btn"
             onClick={player.cycleSpeed}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setShowSpeedPopover((v) => !v);
-            }}
           >
             {formatSpeed(player.snapshot.speed)}
-          </Button>
-
-          <Button
-            variant="text"
-            aria-label={t('player.speedSlider')}
-            data-testid="desktop-speed-slider-btn"
-            onClick={() => setShowSpeedPopover((v) => !v)}
-            style={{ padding: '0 8px' }}
-          >
-            ±
           </Button>
 
           <Button
