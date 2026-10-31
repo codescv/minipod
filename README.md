@@ -5,9 +5,9 @@
 It preserves **100% of AntennaPod's podcast discovery, feed parsing, authentication, local folder, OPML, and 5-format chapter capabilities**, strips away every non-essential screen and setting, and syncs subscriptions, playback queue, and millisecond episode progress across all your devices through a **single JSON file (`minipod-sync.v1.json`) in your own cloud storage** — with **zero backend servers**, **zero accounts**, and **zero native `.node` C++/Rust addons**.
 
 - **GitHub Repository**: <https://github.com/codescv/minipod>
-- **Latest Release (`v0.1.4`)**: <https://github.com/codescv/minipod/releases/tag/v0.1.4>
-  - **Android APK (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 5`)**: [`minipod-v0.1.4.apk`](https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4.apk) (`6.79 MiB`, APK Signature v2)
-  - **PC Web App Bundle**: [`minipod-v0.1.4-pc.tar.gz`](https://github.com/codescv/minipod/releases/download/v0.1.4/minipod-v0.1.4-pc.tar.gz) (Node.js `>= 22.5.0`)
+- **Latest Release (`v0.1.5`)**: <https://github.com/codescv/minipod/releases/tag/v0.1.5>
+  - **Android APK (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 6`)**: [`minipod-v0.1.5.apk`](https://github.com/codescv/minipod/releases/download/v0.1.5/minipod-v0.1.5.apk) (`6.79 MiB`, APK Signature v2)
+  - **PC Web App Bundle**: [`minipod-v0.1.5-pc.tar.gz`](https://github.com/codescv/minipod/releases/download/v0.1.5/minipod-v0.1.5-pc.tar.gz) (Node.js `>= 22.5.0`)
 
 ---
 
@@ -20,9 +20,12 @@ It preserves **100% of AntennaPod's podcast discovery, feed parsing, authenticat
 - **Ultra-Minimalist Material Design 3 UI & System-Theme-Adaptive Identity**:
   - **Nordic Dot & Arcs Adaptive Icon**: Automatically switches between **7A Light** (`#F4F1EA` warm paper / `#1C1917` charcoal arcs / `#FF4F00` signal dot) and **7B Dark** (`#18181B` obsidian / `#F4F4F5` off-white arcs / `#FF4F00` signal dot) across Android Adaptive Icons (`values` & `values-night` + Android 13+ monochrome themed icon + `mipmap-night-*` raster fallbacks) and Web/Desktop (`favicon.svg` `@media (prefers-color-scheme: dark)` + `icon-light-192.png` / `icon-dark-192.png`).
   - Strictly **2 primary tabs on mobile** (`Subscriptions`, `Queue`) and a **3-item `NavRail` on desktop** (`Subscriptions`, `Queue`, `Settings` + `+ Add` FAB), with **zero unread counter badges**, **strictly 9 Settings rows**, dynamic seed-color M3 theming (Light / Dark / System), and full **English + Simplified Chinese (`zh-CN`) + Japanese (`ja`)** localization.
-  - **Subscriptions Timeline & Collapsible Grid**: Expandable subscription cover grid (`> 6` feeds) with viewport-clamped long-press/right-click context menus (`8px` safe margin, zero cluttering `⋮` buttons on covers) and an integrated **Latest Episodes Timeline (`最新单集`)** below Subscriptions merging episodes across all subscribed podcasts sorted by `pubDate` DESC.
-  - **Streamlined Episode Actions & Resilient Artwork**: Inline `▶/⏸` play/pause, inline `Add to Queue` toggle, and minimal `⋮` overflow (`Download` + `Mark played` only), paired with `<ArtworkImage>` multi-stage fallback (`<itunes:image>` / `<podcast:images>` / `<item><image>` -> `/api/image-proxy` CORS/hotlink bypass -> podcast cover -> M3 icon).
-  - **Stream Without Subscribing**: Tap `▶` on any search/preview episode to stream immediately via the HTTP `206 Partial Content` Range proxy with chapters and progress tracking before deciding to subscribe.
+  - **Subscriptions Timeline & Collapsible Grid**: Expandable subscription cover grid (`> 6` feeds) with viewport-clamped long-press/right-click context menus (`8px` safe margin, zero cluttering `⋮` buttons on covers) and an integrated **Latest Unplayed Episodes Timeline (`最新单集`)** below Subscriptions merging unplayed episodes across all subscribed podcasts sorted by `pubDate` DESC.
+  - **Gesture-Driven Minimalist Episode & Queue Rows**:
+    - **Episode Rows**: Strictly 4 visual elements — `44×44` cover icon (with `<ArtworkImage>` `<itunes:image>` / `<podcast:images>` / `/api/image-proxy` / feed fallback), 2-line clamped title (`-webkit-line-clamp: 2`), publish date, and remaining time — with **zero inline buttons**. Tap/click plays directly, long-press (~450ms) or right-click opens a viewport-clamped context menu, **swipe left** inserts as **Play Next**, and **swipe right** marks **Played** and immediately removes from the list (with `Undo`).
+    - **Queue Rows & Compact Pointer/Touch Reorder**: Zero inline buttons, tap-to-play, long-press context menu, **swipe left** to remove (with `Undo`), and a compact `20×36px` drag handle (`touch-action: none`) powered by **Pointer Events + Touch drag-and-drop** across Android touchscreens and desktop mice.
+    - **Conditional Manage Downloads (`管理下载`)**: Top-right `⋮` overflow menus surface `Manage downloads (N)` (`DownloadsPage` with single & `Delete all` cleanup) **only when `>= 1` downloaded episode exists**, staying completely hidden when empty.
+  - **Stream Without Subscribing**: Tap any search/preview episode in `FeedPreview` to stream immediately via the HTTP `206 Partial Content` Range proxy with chapters and progress tracking before deciding to subscribe.
   - **Thoughtful Uninterrupted Background Playback**: Native Android `MediaSessionService` foreground notification (`addSession`, immediate `startForeground`, `onTaskRemoved` continuation, `WifiLock` network wake mode) and persistent Web media park, `-10s` / `+30s` transport, `0.5x–3.0x` pitch-preserved speed presets & slider, Sleep Timer (`15m` / `30m` / `45m` / `60m` / `End of episode` / `End of chapter` with 60s linear volume fade-out), 5-second + immediate pause/`pagehide` millisecond persistence, and automatic **3-second rewind** when resuming `IN_PROGRESS` episodes.
 - **Serverless CRDT Cloud File Auto-Sync**:
   - Syncs through a single `minipod-sync.v1.json` envelope stored in **any cloud-synced folder** (Syncthing, iCloud Drive, Dropbox, OneDrive, Nextcloud desktop client, or Android SAF folder), **Google Drive** (`appDataFolder` or visible Drive file), **WebDAV** (`ETag` + `If-Match` conditional writes, Basic & Digest Auth), or a **GitHub Secret Gist** (with automatic `gzip` + Base64 above 800 KB).
@@ -52,7 +55,7 @@ minipod/
     ├── core/                # @minipod/core — 0 external deps; searchers, XML/HTML/OPML parsers,
     │                        #   5-format chapters, HLC + CRDT sync engine, providers & release updater
     ├── ui/                  # @minipod/ui — Shared React 19 + M3 adaptive UI, Zustand stores,
-    │                        #   UpdateBanner, HtmlAudioEngine, MockPlatformHost, EN + zh-CN i18n
+    │                        #   UpdateBanner, HtmlAudioEngine, MockPlatformHost, EN + zh-CN + JA i18n
     ├── host-node/           # @minipod/host-node — Loopback Hono server (127.0.0.1), node:sqlite,
     │                        #   HTTP 206 Range media proxy, SSE events, sync & PC self-updater
     └── host-android/        # @minipod/host-android — Capacitor 8 Android app, IndexedDB store,
