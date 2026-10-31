@@ -59,15 +59,15 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
     });
 
     const banner = await screen.findByTestId('update-banner');
-    expect(banner).toHaveTextContent('MiniPod v0.1.2 available');
+    expect(banner).toHaveTextContent('Podcasts v0.1.2 available');
 
     // Dismiss v0.1.2 and verify localStorage persistence
     fireEvent.click(screen.getByTestId('update-banner-dismiss-btn'));
     expect(screen.queryByTestId('update-banner')).not.toBeInTheDocument();
     expect(localStorage.getItem(DISMISSED_UPDATE_TAG_KEY)).toBe('v0.1.2');
 
-    // A newer release (v0.1.3) still surfaces the banner
-    mockGithubLatestRelease('v0.1.3');
+    // A newer release (v0.1.4) still surfaces the banner
+    mockGithubLatestRelease('v0.1.4');
     await act(async () => {
       useUpdateStore.setState({ lastCheckedAt: undefined });
       await useUpdateStore.getState().checkForUpdate({
@@ -90,7 +90,7 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
         },
       } as never);
     });
-    expect(await screen.findByTestId('update-banner')).toHaveTextContent('MiniPod v0.1.3 available');
+    expect(await screen.findByTestId('update-banner')).toHaveTextContent('Podcasts v0.1.4 available');
   });
 
   it('streams Android APK download progress and handles unknown-sources permission + install retry', async () => {

@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'dev.minipod.app',
-  appName: 'MiniPod',
+  appName: 'Podcasts',
   // Output of `vite build web` (see web/vite.config.ts).
   webDir: 'www',
   android: {

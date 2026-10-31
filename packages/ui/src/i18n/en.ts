@@ -4,7 +4,7 @@
 import type { Messages } from './zh-CN';
 
 export const en: Messages = {
-  'app.name': 'MiniPod',
+  'app.name': 'Podcasts',
   'nav.subscriptions': 'Subscriptions',
   'nav.queue': 'Queue',
   'nav.settings': 'Settings',
@@ -191,7 +191,7 @@ export const en: Messages = {
   'settings.sourceCode': 'Source code',
 
   'update.newBadge': 'NEW',
-  'update.bannerTitle': 'MiniPod v{version} available',
+  'update.bannerTitle': 'Podcasts v{version} available',
   'update.updateNow': 'Update now',
   'update.installApk': 'Install APK',
   'update.grantAndInstall': 'Grant & install',
@@ -209,16 +209,16 @@ export const en: Messages = {
   'update.appliedStatus': '{message}',
   'update.errorStatus': 'Update error: {error}',
   'update.foundSnack': 'New version available: v{version}',
-  'update.upToDateSnack': 'MiniPod v{version} is up to date',
+  'update.upToDateSnack': 'Podcasts v{version} is up to date',
   'update.checkErrorSnack': 'Update check failed: {error}',
   'update.downloadErrorSnack': 'Update failed: {error}',
-  'update.permissionSnack': 'Allow installing unknown apps in Settings, then return to MiniPod',
+  'update.permissionSnack': 'Allow installing unknown apps in Settings, then return to Podcasts',
   'update.installingSnack': 'Launching system installer for v{version}…',
   'update.openedReleaseSnack': 'Opened v{version} release page',
 
   'sync.setupTitle': 'Cloud sync',
   'sync.recommended': 'Recommended',
-  'sync.folderDescDesktop': 'Pick a folder your Drive / Dropbox / Syncthing / iCloud / OneDrive desktop client already syncs. No sign-in to MiniPod.',
+  'sync.folderDescDesktop': 'Pick a folder your Drive / Dropbox / Syncthing / iCloud / OneDrive desktop client already syncs. No sign-in to Podcasts.',
   'sync.folderDescAndroid': 'Pick a sync file with the system picker (Dropbox, Nextcloud, Syncthing, OneDrive…). For Google Drive on Android, prefer the Google Drive option below.',
   'sync.safCreate': 'Create new sync file',
   'sync.safOpen': 'Use existing sync file',
@@ -231,8 +231,8 @@ export const en: Messages = {
   'sync.gistDesc': 'Personal access token with gist scope. Secret gists are unlisted, not private — feed credentials never enter the sync file.',
   'sync.gistToken': 'Personal access token (gist scope)',
   'sync.gistId': 'Existing Gist ID (optional — leave blank to create)',
-  'sync.bgDesktopHint': 'Syncs while MiniPod is running, even with this window closed.',
-  'sync.bgAndroidHint': 'Syncs while MiniPod is open or playing.',
+  'sync.bgDesktopHint': 'Syncs while Podcasts is running, even with this window closed.',
+  'sync.bgAndroidHint': 'Syncs while Podcasts is open or playing.',
   'sync.applyProvider': 'Save & sync',
   'sync.disconnect': 'Disconnect',
   'sync.resetRemote': 'Delete cloud data',

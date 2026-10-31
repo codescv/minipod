@@ -39,7 +39,7 @@ describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Them
     fireEvent.click(screen.getByTestId('settings-row-provider'));
     expect(await screen.findByTestId('cloud-sync-screen')).toBeInTheDocument();
     expect(screen.getByTestId('sync-bg-hint')).toHaveTextContent(
-      'Syncs while MiniPod is running, even with this window closed.',
+      'Syncs while Podcasts is running, even with this window closed.',
     );
     expect(screen.getByTestId('sync-card-drive')).toBeInTheDocument();
 
@@ -88,7 +88,7 @@ describe('Minimalist Settings (9 Rows), Cloud Sync Capability Gating & i18n/Them
 
     // Truthful Android foreground copy + Google Drive card hidden
     expect(screen.getByTestId('sync-bg-hint')).toHaveTextContent(
-      'Syncs while MiniPod is open or playing.',
+      'Syncs while Podcasts is open or playing.',
     );
     expect(screen.queryByTestId('sync-card-drive')).not.toBeInTheDocument();
 

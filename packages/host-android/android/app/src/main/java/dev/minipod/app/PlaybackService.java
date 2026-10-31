@@ -493,11 +493,11 @@ public class PlaybackService extends MediaSessionService {
             if (nm != null) {
                 NotificationChannel channel = new NotificationChannel(
                     NOTIFICATION_CHANNEL_ID,
-                    getString(R.string.app_name),
+                    "Podcasts Playback",
                     NotificationManager.IMPORTANCE_LOW
                 );
                 channel.setShowBadge(false);
-                channel.setDescription("Podcast background playback");
+                channel.setDescription("Podcasts background playback");
                 nm.createNotificationChannel(channel);
             }
         }
@@ -505,7 +505,8 @@ public class PlaybackService extends MediaSessionService {
 
     private Notification buildBootstrapForegroundNotification() {
         ensureNotificationChannel();
-        CharSequence title = getString(R.string.app_name);
+        CharSequence appLabel = getString(R.string.app_name);
+        CharSequence title = (appLabel != null && appLabel.length() > 0) ? appLabel : "Podcasts";
         CharSequence subtitle = null;
         if (player != null && player.getCurrentMediaItem() != null) {
             MediaMetadata meta = player.getCurrentMediaItem().mediaMetadata;

@@ -6,6 +6,7 @@ import type { Messages } from './zh-CN';
 
 export const ja: Messages = {
   ...en,
+  'app.name': 'Podcasts',
   'nav.subscriptions': '登録番組',
   'nav.queue': 'キュー',
   'nav.settings': '設定',
@@ -24,6 +25,9 @@ export const ja: Messages = {
   'player.shownotes': '概要',
   'sleep.title': 'スリープタイマー',
   'update.newBadge': '新着',
+  'update.bannerTitle': 'Podcasts v{version} が利用可能です',
+  'update.applyingUpdate': 'Podcasts を更新しています…',
+  'update.upToDateSnack': 'Podcasts v{version} は最新です',
   'update.updateNow': '今すぐ更新',
   'update.checkForUpdates': 'アップデートを確認',
 };

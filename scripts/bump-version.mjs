@@ -46,6 +46,9 @@ function patchIfExists(rel, replacer) {
   writeFileSync(full, replacer(readFileSync(full, 'utf8')), 'utf8');
 }
 
+patchIfExists('packages/core/src/updater/updater.ts', (src) =>
+  src.replace(/export const CURRENT_APP_VERSION = '[^']+';/, `export const CURRENT_APP_VERSION = '${nextVersion}';`),
+);
 patchIfExists('packages/host-node/src/server/context.ts', (src) =>
   src.replace(/export const MINIPOD_VERSION = '[^']+';/, `export const MINIPOD_VERSION = '${nextVersion}';`),
 );
