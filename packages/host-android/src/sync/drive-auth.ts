@@ -19,6 +19,7 @@ export class AndroidDriveAuthManager {
   private readonly plugin: Pick<MiniPodPlugin, 'auth'>;
   private readonly tokenByScope = new Map<string, CachedToken>();
   private lastSafFallbackUri: string | undefined;
+  private lastAuthorizedEmail: string | undefined;
 
   constructor(plugin: Pick<MiniPodPlugin, 'auth'>) {
     this.plugin = plugin;
@@ -36,6 +37,10 @@ export class AndroidDriveAuthManager {
     const uri = this.lastSafFallbackUri;
     this.lastSafFallbackUri = undefined;
     return uri;
+  }
+
+  getLastAuthorizedEmail(): string | undefined {
+    return this.lastAuthorizedEmail;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -71,6 +76,9 @@ export class AndroidDriveAuthManager {
       throw new MiniPodError('sync-auth', 'Google Drive authorization did not return an access token');
     }
     this.lastSafFallbackUri = undefined;
+    if (res.accountEmail) {
+      this.lastAuthorizedEmail = res.accountEmail;
+    }
     this.tokenByScope.set(scope, {
       accessToken: res.accessToken,
       expiresAt: res.expiresAt ?? Date.now() + 50 * 60_000,
@@ -95,9 +103,10 @@ export class AndroidDriveAuthManager {
       }
 
       try {
+        const effectiveHint = accountHint ?? this.lastAuthorizedEmail;
         const res = await this.plugin.auth.googleSignIn({
           scopes: [scope],
-          ...(accountHint !== undefined ? { accountHint } : {}),
+          ...(effectiveHint !== undefined ? { accountHint: effectiveHint } : {}),
           forceRefresh: Boolean(opts?.forceRefresh),
         });
         if (!res.supported) {
@@ -108,6 +117,9 @@ export class AndroidDriveAuthManager {
         }
         if (!res.accessToken) {
           throw new MiniPodError('sync-auth', 'Google Drive authorization required');
+        }
+        if (res.accountEmail) {
+          this.lastAuthorizedEmail = res.accountEmail;
         }
         this.tokenByScope.set(scope, {
           accessToken: res.accessToken,
@@ -128,5 +140,6 @@ export class AndroidDriveAuthManager {
   clearCache(): void {
     this.tokenByScope.clear();
     this.lastSafFallbackUri = undefined;
+    this.lastAuthorizedEmail = undefined;
   }
 }

@@ -162,6 +162,7 @@ export interface GoogleSignInOptions {
   readonly scopes: readonly string[];
   readonly accountHint?: string;
   readonly forceRefresh?: boolean;
+  readonly interactive?: boolean;
   readonly safMode?: 'create' | 'open';
 }
 

@@ -96,7 +96,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.9';
+export const CAPACITOR_HOST_VERSION = '0.1.10';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -407,10 +407,11 @@ export async function createCapacitorPlatformHost(
           );
         }
         const st = await syncStore.getSyncState();
+        const effectiveHint = config.accountHint ?? driveAuth.getLastAuthorizedEmail();
         return new GoogleDriveProvider({
           mode: config.id === 'drive-appdata' ? 'appdata' : 'file',
           http,
-          getToken: driveAuth.createTokenProvider(config.id, config.accountHint),
+          getToken: driveAuth.createTokenProvider(config.id, effectiveHint),
           initialFileId: st.remoteFileId,
           userAgent,
           ...(config.id === 'drive-file' && config.folderName
@@ -1727,7 +1728,18 @@ export async function createCapacitorPlatformHost(
                 ...settings,
                 provider: { id: 'saf', documentUri: driveAuth.consumeSafFallbackUri()! },
               }
-            : settings;
+            : (settings.provider?.id === 'drive-appdata' ||
+                  settings.provider?.id === 'drive-file') &&
+                !settings.provider.accountHint &&
+                driveAuth.getLastAuthorizedEmail()
+              ? {
+                  ...settings,
+                  provider: {
+                    ...settings.provider,
+                    accountHint: driveAuth.getLastAuthorizedEmail()!,
+                  },
+                }
+              : settings;
 
         const prevSettings = await readSettings();
         const providerChanged =

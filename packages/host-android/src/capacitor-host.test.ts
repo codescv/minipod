@@ -573,4 +573,68 @@ describe('CapacitorPlatformHost', () => {
 
     await host.dispose();
   });
+
+  it('persists accountHint when Google Drive OAuth authorization returns accountEmail', async () => {
+    const harness = createTestPluginHarness();
+    const googleSignInSpy = vi.fn(async () => ({
+      supported: true,
+      accessToken: 'mock-direct-android-oauth-token',
+      expiresAt: Date.now() + 3600_000,
+      accountEmail: 'listener@gmail.com',
+    }));
+    harness.plugin.auth.isGoogleSignInAvailable = vi.fn(async () => ({ available: true }));
+    harness.plugin.auth.googleSignIn = googleSignInSpy;
+
+    const origHttp = harness.plugin.http;
+    harness.plugin.http = vi.fn(async (req) => {
+      if (req.url.startsWith('https://www.googleapis.com/drive/v3/files')) {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          finalUrl: req.url,
+          chain: [],
+          bodyBase64: encodeBase64(new TextEncoder().encode(JSON.stringify({ files: [] }))),
+        };
+      }
+      if (req.url.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          finalUrl: req.url,
+          chain: [],
+          bodyBase64: encodeBase64(
+            new TextEncoder().encode(
+              JSON.stringify({ id: 'drive-file-1', md5Checksum: 'abc123', version: '1' }),
+            ),
+          ),
+        };
+      }
+      return origHttp(req);
+    });
+
+    const { host } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-drive-oauth-hint-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    await expect(host.sync.authorize('drive-appdata')).resolves.toBeUndefined();
+    const status = await host.sync.configure({
+      provider: { id: 'drive-appdata' },
+      wifiOnly: false,
+      deviceName: 'Pixel 9 Pro',
+    });
+
+    expect(status.enabled).toBe(true);
+    expect(status.provider).toBe('drive-appdata');
+
+    const savedSettings = await host.settings.get();
+    expect(savedSettings.sync.provider).toEqual({
+      id: 'drive-appdata',
+      accountHint: 'listener@gmail.com',
+    });
+
+    await host.dispose();
+  });
 });

@@ -1,11 +1,13 @@
 package dev.minipod.app;
 
 import android.accounts.Account;
+import android.accounts.AccountManager;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -92,10 +94,13 @@ public class MiniPodPlugin extends Plugin {
     private static final int DEFAULT_MAX_REDIRECTS = 10;
     private static final int DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024;
     private static final long DOWNLOAD_PROGRESS_THROTTLE_MS = 250L;
+    private static final String AUTH_PREFS_NAME = "minipod_auth";
+    private static final String AUTH_PREFS_ACCOUNT_EMAIL = "google_account_email";
 
     @Nullable private static volatile JSObject pendingLaunchIntent;
     @Nullable private static volatile MiniPodPlugin activeInstance;
     @Nullable private static volatile File pendingInstallApkFile;
+    @Nullable private volatile Account pendingConsentAccount;
 
     private final ExecutorService ioPool = Executors.newCachedThreadPool();
     private final Map<String, Call> activeDownloadCalls = new ConcurrentHashMap<>();
@@ -1281,6 +1286,77 @@ public class MiniPodPlugin extends Plugin {
         }
     }
 
+    @Nullable
+    private String getSavedGoogleAccountEmail() {
+        try {
+            SharedPreferences prefs =
+                getContext().getSharedPreferences(AUTH_PREFS_NAME, Context.MODE_PRIVATE);
+            String saved = prefs.getString(AUTH_PREFS_ACCOUNT_EMAIL, null);
+            return saved != null && !saved.trim().isEmpty() ? saved.trim() : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void saveGoogleAccountEmail(@Nullable String email) {
+        if (email == null || email.trim().isEmpty()) return;
+        try {
+            getContext()
+                .getSharedPreferences(AUTH_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(AUTH_PREFS_ACCOUNT_EMAIL, email.trim())
+                .apply();
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+
+    private static List<String> extractOAuthScopes(PluginCall call) {
+        JSArray scopesArr = call.getArray("scopes");
+        List<String> scopes = new ArrayList<>();
+        if (scopesArr != null) {
+            for (int i = 0; i < scopesArr.length(); i++) {
+                String s = scopesArr.optString(i, "");
+                if (!s.isEmpty()) scopes.add(s);
+            }
+        }
+        if (scopes.isEmpty()) {
+            scopes.add("https://www.googleapis.com/auth/drive.appdata");
+        }
+        return scopes;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void launchGoogleAccountChooser(
+        PluginCall call,
+        @Nullable GoogleSignInClient fallbackSignInClient
+    ) {
+        if (!hasConfiguredOAuthClient()) {
+            launchGoogleDriveSafFallback(call);
+            return;
+        }
+        try {
+            Intent chooseIntent = AccountManager.newChooseAccountIntent(
+                null,
+                null,
+                new String[] { "com.google" },
+                null,
+                null,
+                null,
+                null
+            );
+            startActivityForResult(call, chooseIntent, "onGoogleAccountPickedResult");
+        } catch (ActivityNotFoundException e) {
+            if (fallbackSignInClient != null) {
+                startActivityForResult(call, fallbackSignInClient.getSignInIntent(), "onGoogleSignInResult");
+            } else {
+                launchGoogleDriveSafFallback(call);
+            }
+        } catch (Exception e) {
+            launchGoogleDriveSafFallback(call);
+        }
+    }
+
     @PluginMethod
     public void authStatus(PluginCall call) {
         int code = GoogleApiAvailability.getInstance()
@@ -1301,16 +1377,18 @@ public class MiniPodPlugin extends Plugin {
             return;
         }
 
-        JSArray scopesArr = call.getArray("scopes");
-        List<String> scopes = new ArrayList<>();
-        if (scopesArr != null) {
-            for (int i = 0; i < scopesArr.length(); i++) {
-                String s = scopesArr.optString(i, "");
-                if (!s.isEmpty()) scopes.add(s);
-            }
-        }
-        if (scopes.isEmpty()) {
-            scopes.add("https://www.googleapis.com/auth/drive.appdata");
+        List<String> scopes = extractOAuthScopes(call);
+        String rawHint = call.getString("accountHint");
+        boolean interactive = Boolean.TRUE.equals(call.getBoolean("interactive", false));
+        String effectiveHint = (rawHint != null && !rawHint.trim().isEmpty())
+            ? rawHint.trim()
+            : (!interactive ? getSavedGoogleAccountEmail() : null);
+
+        if (effectiveHint != null && !effectiveHint.isEmpty()) {
+            Account hintedAccount = new Account(effectiveHint, "com.google");
+            pendingConsentAccount = hintedAccount;
+            ioPool.execute(() -> resolveAccessTokenForAccount(call, hintedAccount, scopes));
+            return;
         }
 
         GoogleSignInOptions.Builder gsoBuilder =
@@ -1319,31 +1397,59 @@ public class MiniPodPlugin extends Plugin {
         for (String s : scopes) {
             gsoBuilder.requestScopes(new Scope(s));
         }
-        String accountHint = call.getString("accountHint");
-        if (accountHint != null && !accountHint.isEmpty()) {
-            gsoBuilder.setAccountName(accountHint);
-        }
 
         GoogleSignInClient signInClient = GoogleSignIn.getClient(getContext(), gsoBuilder.build());
         ioPool.execute(() -> {
             try {
                 GoogleSignInAccount account = Tasks.await(signInClient.silentSignIn());
+                if (account != null && account.getAccount() != null) {
+                    saveGoogleAccountEmail(account.getAccount().name);
+                    pendingConsentAccount = account.getAccount();
+                    resolveAccessTokenForAccount(call, account.getAccount(), scopes);
+                    return;
+                }
                 resolveAccessTokenForAccount(call, account, scopes);
             } catch (Exception silentErr) {
+                String savedEmail = getSavedGoogleAccountEmail();
+                if (!interactive && savedEmail != null && !savedEmail.isEmpty()) {
+                    Account savedAccount = new Account(savedEmail, "com.google");
+                    pendingConsentAccount = savedAccount;
+                    resolveAccessTokenForAccount(call, savedAccount, scopes);
+                    return;
+                }
                 Activity activity = getActivity();
                 if (activity == null) {
                     call.reject("Sign-in required in foreground", "sync-auth", silentErr);
                     return;
                 }
-                if (!hasConfiguredOAuthClient()) {
-                    activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
-                    return;
-                }
-                activity.runOnUiThread(() ->
-                    startActivityForResult(call, signInClient.getSignInIntent(), "onGoogleSignInResult")
-                );
+                activity.runOnUiThread(() -> launchGoogleAccountChooser(call, signInClient));
             }
         });
+    }
+
+    @ActivityCallback
+    private void onGoogleAccountPickedResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        Intent data = result.getData();
+        if (result.getResultCode() != Activity.RESULT_OK || data == null) {
+            call.reject("Google Sign-In cancelled", "cancelled");
+            return;
+        }
+        String accountName = data.getStringExtra(AccountManager.KEY_ACCOUNT_NAME);
+        String accountType = data.getStringExtra(AccountManager.KEY_ACCOUNT_TYPE);
+        if (accountName == null || accountName.trim().isEmpty()) {
+            call.reject("No Google account selected", "sync-auth");
+            return;
+        }
+        String cleanEmail = accountName.trim();
+        String cleanType = (accountType != null && !accountType.trim().isEmpty())
+            ? accountType.trim()
+            : "com.google";
+        saveGoogleAccountEmail(cleanEmail);
+        Account account = new Account(cleanEmail, cleanType);
+        pendingConsentAccount = account;
+        List<String> scopes = extractOAuthScopes(call);
+        ioPool.execute(() -> resolveAccessTokenForAccount(call, account, scopes));
     }
 
     @ActivityCallback
@@ -1364,17 +1470,7 @@ public class MiniPodPlugin extends Plugin {
             return;
         }
 
-        JSArray scopesArr = call.getArray("scopes");
-        List<String> scopes = new ArrayList<>();
-        if (scopesArr != null) {
-            for (int i = 0; i < scopesArr.length(); i++) {
-                String s = scopesArr.optString(i, "");
-                if (!s.isEmpty()) scopes.add(s);
-            }
-        }
-        if (scopes.isEmpty()) {
-            scopes.add("https://www.googleapis.com/auth/drive.appdata");
-        }
+        List<String> scopes = extractOAuthScopes(call);
 
         ioPool.execute(() -> {
             try {
@@ -1390,7 +1486,7 @@ public class MiniPodPlugin extends Plugin {
                 if (statusCode == 10 || statusCode == 12500) {
                     Activity activity = getActivity();
                     if (activity != null) {
-                        activity.runOnUiThread(() -> launchGoogleDriveSafFallback(call));
+                        activity.runOnUiThread(() -> launchGoogleAccountChooser(call, null));
                         return;
                     }
                 }
@@ -1459,14 +1555,29 @@ public class MiniPodPlugin extends Plugin {
 
     private void resolveAccessTokenForAccount(
         PluginCall call,
-        GoogleSignInAccount account,
+        @Nullable GoogleSignInAccount account,
         List<String> scopes
     ) {
-        Account androidAccount = account.getAccount();
+        Account androidAccount = account != null ? account.getAccount() : null;
+        if (androidAccount == null
+            && account != null
+            && account.getEmail() != null
+            && !account.getEmail().trim().isEmpty()) {
+            androidAccount = new Account(account.getEmail().trim(), "com.google");
+        }
         if (androidAccount == null) {
             call.reject("Signed-in Google account has no Android Account handle", "sync-auth");
             return;
         }
+        resolveAccessTokenForAccount(call, androidAccount, scopes);
+    }
+
+    private void resolveAccessTokenForAccount(
+        PluginCall call,
+        Account androidAccount,
+        List<String> scopes
+    ) {
+        pendingConsentAccount = androidAccount;
         boolean forceRefresh = Boolean.TRUE.equals(call.getBoolean("forceRefresh", false));
         String oauthScope = "oauth2:" + String.join(" ", scopes);
         try {
@@ -1475,12 +1586,13 @@ public class MiniPodPlugin extends Plugin {
                 GoogleAuthUtil.clearToken(getContext(), prevToken);
             }
             String token = GoogleAuthUtil.getToken(getContext(), androidAccount, oauthScope);
+            saveGoogleAccountEmail(androidAccount.name);
             JSObject out = new JSObject();
             out.put("supported", true);
             out.put("accessToken", token);
             out.put("expiresAt", System.currentTimeMillis() + 50L * 60_000L);
-            if (account.getEmail() != null) {
-                out.put("accountEmail", account.getEmail());
+            if (androidAccount.name != null && !androidAccount.name.isEmpty()) {
+                out.put("accountEmail", androidAccount.name);
             }
             call.resolve(out);
         } catch (UserRecoverableAuthException recoverable) {
@@ -1510,6 +1622,19 @@ public class MiniPodPlugin extends Plugin {
         if (call == null) return;
         if (result.getResultCode() != Activity.RESULT_OK) {
             call.reject("Google Drive consent denied", "sync-auth");
+            return;
+        }
+        Account account = pendingConsentAccount;
+        if (account == null) {
+            String savedEmail = getSavedGoogleAccountEmail();
+            if (savedEmail != null) {
+                account = new Account(savedEmail, "com.google");
+            }
+        }
+        if (account != null) {
+            final Account targetAccount = account;
+            final List<String> scopes = extractOAuthScopes(call);
+            ioPool.execute(() -> resolveAccessTokenForAccount(call, targetAccount, scopes));
             return;
         }
         authGoogleSignIn(call);
