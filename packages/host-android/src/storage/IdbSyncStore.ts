@@ -886,6 +886,48 @@ export class IdbSyncStore implements SyncStore {
     await tx.done;
   }
 
+  /**
+   * Marks all non-local RSS subscriptions (`subscribedNum === 1 || deletedAt != null`),
+   * queue entries, and progress records as dirty (`syncDirty = 1`) in a single `readwrite`
+   * transaction so switching/configuring a new sync provider pushes all local state.
+   */
+  async markAllDirty(): Promise<void> {
+    const tx = this.db.transaction(['feeds', 'queue', 'progress'], 'readwrite');
+    const feedsStore = tx.objectStore('feeds');
+    const queueStore = tx.objectStore('queue');
+    const progStore = tx.objectStore('progress');
+
+    const [allFeeds, allQueue, allProgress] = await Promise.all([
+      feedsStore.getAll(),
+      queueStore.getAll(),
+      progStore.getAll(),
+    ]);
+
+    for (const f of allFeeds) {
+      if (f.kind === 'LOCAL' || f.feedKey.startsWith('l_')) continue;
+      if (f.subscribedNum === 0 && f.deletedAt == null) continue;
+      if (f.syncDirty !== 1) {
+        await feedsStore.put({ ...f, syncDirty: 1 });
+      }
+    }
+
+    for (const q of allQueue) {
+      if (q.feedKey.startsWith('l_')) continue;
+      if (q.syncDirty !== 1) {
+        await queueStore.put({ ...q, syncDirty: 1 });
+      }
+    }
+
+    for (const p of allProgress) {
+      if (p.feedKey.startsWith('l_')) continue;
+      if (p.syncDirty !== 1) {
+        await progStore.put({ ...p, syncDirty: 1 });
+      }
+    }
+
+    await tx.done;
+  }
+
   // -------------------------------------------------------------------------
   // Domain CRUD helpers for `CapacitorPlatformHost`
   // -------------------------------------------------------------------------

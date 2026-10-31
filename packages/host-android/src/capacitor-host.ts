@@ -96,7 +96,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.10';
+export const CAPACITOR_HOST_VERSION = '0.1.11';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -1745,6 +1745,10 @@ export async function createCapacitorPlatformHost(
         const providerChanged =
           JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(effectiveSettings.provider);
 
+        if (providerChanged && effectiveSettings.provider !== null) {
+          await syncStore.markAllDirty();
+        }
+
         await syncStore.setSyncState({
           deviceName: effectiveSettings.deviceName,
           ...(providerChanged
@@ -1752,6 +1756,7 @@ export async function createCapacitorPlatformHost(
                 remoteEtag: null,
                 remoteFileId: null,
                 remoteRev: 0,
+                floors: { subscriptions: 0, queue: 0, progress: 0 },
               }
             : {}),
         });

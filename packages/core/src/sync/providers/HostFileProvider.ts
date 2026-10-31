@@ -17,6 +17,26 @@ function syntheticEtag(stat: { readonly size: number; readonly mtimeMs: number }
   return `${Math.trunc(stat.mtimeMs)}-${Math.trunc(stat.size)}`;
 }
 
+function isBlankBytes(bytes: Uint8Array): boolean {
+  if (bytes.byteLength === 0) return true;
+  let start = 0;
+  if (
+    bytes.byteLength >= 3 &&
+    bytes[0] === 0xef &&
+    bytes[1] === 0xbb &&
+    bytes[2] === 0xbf
+  ) {
+    start = 3;
+  }
+  for (let i = start; i < bytes.byteLength; i++) {
+    const b = bytes[i]!;
+    if (b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d && b !== 0x00) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isNonRetryableFsError(err: unknown): boolean {
   if (err instanceof MiniPodError) {
     return err.code === 'sync-auth' || err.code === 'not-found' || err.code === 'invalid-argument';
@@ -121,17 +141,26 @@ export class HostFileProvider implements CloudFileProvider {
         return { kind: 'missing' };
       }
       const etag = syntheticEtag(st);
-      if (ifNoneMatch !== null && etag === ifNoneMatch) {
+      if (st.size > 0 && ifNoneMatch !== null && etag === ifNoneMatch) {
         return { kind: 'not-modified' };
       }
       const bytes = await this.access.read();
+      if (isBlankBytes(bytes)) {
+        return { kind: 'missing' };
+      }
       const postSt = await this.access.stat();
-      const finalEtag = postSt ? syntheticEtag(postSt) : etag;
+      const effectivePostSt = postSt
+        ? {
+            size: postSt.size > 0 ? postSt.size : bytes.byteLength,
+            mtimeMs: postSt.mtimeMs > 0 ? postSt.mtimeMs : st.mtimeMs,
+          }
+        : { size: bytes.byteLength, mtimeMs: st.mtimeMs };
+      const finalEtag = syntheticEtag(effectivePostSt);
       return {
         kind: 'blob',
         bytes,
         etag: finalEtag,
-        lastModified: postSt ? postSt.mtimeMs : st.mtimeMs,
+        lastModified: effectivePostSt.mtimeMs,
       };
     } catch (err) {
       if (err instanceof MiniPodError) throw err;
@@ -145,20 +174,37 @@ export class HostFileProvider implements CloudFileProvider {
     }
 
     try {
-      const currentEtag = await this.head(signal);
+      const preStat = await this.access.stat();
+      const currentEtag = preStat ? syntheticEtag(preStat) : null;
       if (ifMatch === null) {
-        if (currentEtag !== null) {
-          return { kind: 'conflict' };
+        if (preStat !== null) {
+          const isBlankExisting =
+            preStat.size === 0 || isBlankBytes(await this.access.read());
+          if (!isBlankExisting) {
+            return { kind: 'conflict' };
+          }
         }
       } else if (currentEtag !== ifMatch) {
-        return { kind: 'conflict' };
+        const isBlankExisting =
+          preStat !== null &&
+          preStat.size === 0 &&
+          isBlankBytes(await this.access.read());
+        if (!isBlankExisting) {
+          return { kind: 'conflict' };
+        }
       }
 
       this.writeInProgress = true;
       try {
         await this.access.write(bytes);
         const postStat = await this.access.stat();
-        const newEtag = postStat ? syntheticEtag(postStat) : null;
+        const effectiveStat = postStat
+          ? {
+              size: postStat.size > 0 ? postStat.size : bytes.byteLength,
+              mtimeMs: postStat.mtimeMs > 0 ? postStat.mtimeMs : (preStat?.mtimeMs || Date.now()),
+            }
+          : { size: bytes.byteLength, mtimeMs: Date.now() };
+        const newEtag = syntheticEtag(effectiveStat);
         this.lastWrittenEtag = newEtag;
         return { kind: 'ok', newEtag };
       } finally {

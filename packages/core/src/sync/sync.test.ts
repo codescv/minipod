@@ -700,6 +700,40 @@ describe('sync/providers contract suite (HostFile, GoogleDrive, WebDAV, GitHubGi
     await new Promise((r) => setTimeout(r, 10));
     expect(externalEvents).toBe(1);
     unsub();
+
+    // Newly created 0-byte SAF document (`Intent.ACTION_CREATE_DOCUMENT`) must be treated as
+    // `missing` on `read()` and allow `write(bytes, null)` without false conflict or `sync-schema` error.
+    const zeroByteSaf = new InMemoryHostFile();
+    zeroByteSaf.externalWrite(new Uint8Array(0));
+    const safProvider = new HostFileProvider({ id: 'saf', access: zeroByteSaf });
+    expect(await safProvider.read(null)).toEqual({ kind: 'missing' });
+
+    const safStore = new InMemorySyncStore('d_saf', 'Pixel 9');
+    const safHlc = new HybridLogicalClock(0, () => 500_000);
+    safStore.subs.set('f_saf_pod', {
+      item: {
+        url: 'https://saf-pod.example/rss.xml',
+        title: 'SAF Pod',
+        updatedAt: safHlc.now(),
+        deleted: false,
+        deviceId: 'd_saf',
+      },
+      dirty: true,
+    });
+    const safEngine = new SyncEngine({
+      store: safStore,
+      provider: safProvider,
+      hlc: safHlc,
+      backgroundSync: false,
+      now: () => 500_000,
+    });
+    const firstRun = await safEngine.run('configured');
+    expect(firstRun.uploaded).toBe(true);
+    expect(firstRun.status.phase).toBe('idle');
+    expect(firstRun.status.lastError).toBeUndefined();
+    const writtenDoc = parseSyncDocument(await zeroByteSaf.read());
+    expect(writtenDoc.rev).toBe(1);
+    expect(writtenDoc.subscriptions.items['f_saf_pod']?.url).toBe('https://saf-pod.example/rss.xml');
   });
 
   it('passes full contract suite on WebDavProvider including RFC 2617 Digest auth & 412 conflict', async () => {

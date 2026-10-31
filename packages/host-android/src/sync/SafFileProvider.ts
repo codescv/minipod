@@ -95,7 +95,11 @@ export function createSafFileProvider(options: SafFileProviderOptions): CloudFil
         });
         const postStat = await plugin.saf.stat({ uri: documentUri });
         if (postStat.exists) {
-          const etag = syntheticEtag(postStat.mtimeMs ?? 0, postStat.size ?? bytes.length);
+          const effectiveSize =
+            postStat.size && postStat.size > 0 ? postStat.size : bytes.byteLength;
+          const effectiveMtime =
+            postStat.mtimeMs && postStat.mtimeMs > 0 ? postStat.mtimeMs : Date.now();
+          const etag = syntheticEtag(effectiveMtime, effectiveSize);
           lastWrittenEtag = etag;
           lastKnownEtag = etag;
         }

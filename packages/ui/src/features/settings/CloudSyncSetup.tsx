@@ -105,11 +105,16 @@ export function CloudSyncSetup() {
       const picked = await host.files.pickSyncFile(mode);
       if (!picked) return;
       setSafUri(picked.documentUri);
-      await host.sync.configure({
+      const status = await host.sync.configure({
         ...settings.sync,
         provider: { id: 'saf', documentUri: picked.documentUri },
       });
       await loadSettings(host);
+      if (status.lastError) {
+        showSnackbar(status.lastError.message);
+      }
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -130,11 +135,16 @@ export function CloudSyncSetup() {
     if (!trimmed || busy) return;
     setBusy(true);
     try {
-      await host.sync.configure({
+      const status = await host.sync.configure({
         ...settings.sync,
         provider: { id: 'local-folder', folderPath: trimmed },
       });
       await loadSettings(host);
+      if (status.lastError) {
+        showSnackbar(status.lastError.message);
+      }
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -145,11 +155,14 @@ export function CloudSyncSetup() {
     setBusy(true);
     try {
       await host.sync.authorize(driveMode);
-      await host.sync.configure({
+      const status = await host.sync.configure({
         ...settings.sync,
         provider: { id: driveMode },
       });
       await loadSettings(host);
+      if (status.lastError) {
+        showSnackbar(status.lastError.message);
+      }
     } catch (err) {
       showSnackbar(err instanceof Error ? err.message : String(err));
     } finally {
@@ -161,7 +174,7 @@ export function CloudSyncSetup() {
     if (!webdavUrl.trim() || !webdavUser.trim() || busy) return;
     setBusy(true);
     try {
-      await host.sync.configure(
+      const status = await host.sync.configure(
         {
           ...settings.sync,
           provider: {
@@ -173,6 +186,11 @@ export function CloudSyncSetup() {
         { id: 'webdav', password: webdavPass },
       );
       await loadSettings(host);
+      if (status.lastError) {
+        showSnackbar(status.lastError.message);
+      }
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -183,7 +201,7 @@ export function CloudSyncSetup() {
     setBusy(true);
     try {
       const trimmedId = gistId.trim();
-      await host.sync.configure(
+      const status = await host.sync.configure(
         {
           ...settings.sync,
           provider: {
@@ -194,6 +212,11 @@ export function CloudSyncSetup() {
         { id: 'gist', token: gistToken.trim() },
       );
       await loadSettings(host);
+      if (status.lastError) {
+        showSnackbar(status.lastError.message);
+      }
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }

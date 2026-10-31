@@ -527,11 +527,18 @@ describe('CapacitorPlatformHost', () => {
       'content://com.google.android.apps.docs.storage/document/acc%3D1%3Bdoc%3Dminipod-sync-v1.json';
     const harness = createTestPluginHarness();
     harness.plugin.auth.isGoogleSignInAvailable = vi.fn(async () => ({ available: true }));
-    harness.plugin.auth.googleSignIn = vi.fn(async () => ({
-      supported: true,
-      safUri: driveSafUri,
-      displayName: 'minipod-sync-v1.json',
-    }));
+    harness.plugin.auth.googleSignIn = vi.fn(async () => {
+      // Real Android `Intent.ACTION_CREATE_DOCUMENT` immediately creates a 0-byte document
+      harness.safFiles.set(driveSafUri, {
+        bytes: new Uint8Array(0),
+        mtimeMs: Date.now(),
+      });
+      return {
+        supported: true,
+        safUri: driveSafUri,
+        displayName: 'minipod-sync-v1.json',
+      };
+    });
 
     const { host } = await createCapacitorPlatformHost({
       plugin: harness.plugin,
@@ -633,6 +640,79 @@ describe('CapacitorPlatformHost', () => {
     expect(savedSettings.sync.provider).toEqual({
       id: 'drive-appdata',
       accountHint: 'listener@gmail.com',
+    });
+
+    await host.dispose();
+  });
+
+  it('writes full local subscriptions, queue, and progress when selecting/creating a 0-byte SAF cloud file', async () => {
+    const harness = createTestPluginHarness();
+    const { host } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-saf-zero-byte-create-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+    const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+    await host.queue.add(ep1Key);
+    await host.progress.save({
+      episodeKey: ep1Key,
+      positionMs: 42_000,
+      durationMs: 120_000,
+      state: 'IN_PROGRESS',
+    });
+
+    // First sync to an initial SAF file so local records become clean (`syncDirty = 0`)
+    const initialUri = 'content://saf/initial-sync.json';
+    harness.safFiles.set(initialUri, { bytes: new Uint8Array(0), mtimeMs: 1_760_000_000_000 });
+    const firstStatus = await host.sync.configure({
+      provider: { id: 'saf', documentUri: initialUri },
+      wifiOnly: false,
+      deviceName: 'Pixel 9',
+    });
+    expect(firstStatus.phase).toBe('idle');
+    expect(firstStatus.lastError).toBeUndefined();
+
+    // Now simulate picking/creating a brand-new 0-byte cloud drive SAF file (`size: 0`, `base64: ""`)
+    const cloudSafUri =
+      'content://com.google.android.apps.docs.storage/document/acc%3D1%3Bdoc%3Dnew-cloud-sync.json';
+    harness.safFiles.set(cloudSafUri, { bytes: new Uint8Array(0), mtimeMs: 1_760_000_100_000 });
+
+    const secondStatus = await host.sync.configure({
+      provider: { id: 'saf', documentUri: cloudSafUri },
+      wifiOnly: false,
+      deviceName: 'Pixel 9',
+    });
+
+    expect(secondStatus.phase).toBe('idle');
+    expect(secondStatus.lastError).toBeUndefined();
+
+    const cloudBytes = harness.safFiles.get(cloudSafUri)?.bytes;
+    expect(cloudBytes).toBeDefined();
+    expect(cloudBytes!.byteLength).toBeGreaterThan(0);
+
+    const exportedDoc = JSON.parse(new TextDecoder().decode(cloudBytes!)) as {
+      schemaVersion: number;
+      rev: number;
+      subscriptions: { items: Record<string, { url: string; deleted: boolean }> };
+      queue: { items: Record<string, { feedKey: string; removed: boolean }> };
+      progress: { items: Record<string, { positionMs: number; state: string }> };
+    };
+    expect(exportedDoc.schemaVersion).toBe(1);
+    expect(exportedDoc.rev).toBe(1);
+    expect(exportedDoc.subscriptions.items[feed.feedKey]).toMatchObject({
+      url: 'https://pod.example.com/rss.xml',
+      deleted: false,
+    });
+    expect(exportedDoc.queue.items[ep1Key]).toMatchObject({
+      feedKey: feed.feedKey,
+      removed: false,
+    });
+    expect(exportedDoc.progress.items[ep1Key]).toMatchObject({
+      positionMs: 42_000,
+      state: 'IN_PROGRESS',
     });
 
     await host.dispose();

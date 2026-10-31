@@ -224,6 +224,10 @@ export class NodeSyncService {
     const providerChanged =
       JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(settings.provider);
 
+    if (providerChanged && settings.provider !== null) {
+      await this.store.markAllDirty();
+    }
+
     await this.store.setSyncState({
       deviceName: settings.deviceName,
       ...(providerChanged
@@ -231,6 +235,7 @@ export class NodeSyncService {
             remoteEtag: null,
             remoteFileId: null,
             remoteRev: 0,
+            floors: { subscriptions: 0, queue: 0, progress: 0 },
           }
         : {}),
     });

@@ -45,9 +45,11 @@ import com.google.android.gms.tasks.Tasks;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -1026,8 +1028,8 @@ public class MiniPodPlugin extends Plugin {
     }
 
     /**
-     * Truncating full-file SAF write (`ARCHITECTURE.md §8.2`):
-     * `openFileDescriptor(uri, "rw")` -> write from offset 0 -> `truncate(size)` -> `fsync`.
+     * Truncating full-file SAF write (`ARCHITECTURE.md §8.2`) compatible with both local
+     * `ExternalStorageProvider` and cloud `DocumentsProvider`s (Google Drive, OneDrive, Nextcloud).
      */
     @PluginMethod
     public void safWrite(PluginCall call) {
@@ -1041,30 +1043,92 @@ public class MiniPodPlugin extends Plugin {
             byte[] bytes = Base64.decode(base64 != null ? base64 : "", Base64.DEFAULT);
             Uri uri = Uri.parse(rawUri);
 
-            try (ParcelFileDescriptor pfd =
-                     getContext().getContentResolver().openFileDescriptor(uri, "rw")) {
-                if (pfd == null) {
-                    call.reject("FileNotFoundException: openFileDescriptor returned null", "sync-auth");
-                    return;
-                }
-                try (FileOutputStream fos = new FileOutputStream(pfd.getFileDescriptor());
-                     FileChannel channel = fos.getChannel()) {
-                    channel.position(0L);
-                    ByteBuffer buffer = ByteBuffer.wrap(bytes);
-                    while (buffer.hasRemaining()) {
-                        channel.write(buffer);
-                    }
-                    channel.truncate(bytes.length);
-                    channel.force(true);
-                    pfd.getFileDescriptor().sync();
-                }
+            try {
+                writeSafBytes(getContext().getContentResolver(), uri, bytes);
                 call.resolve();
             } catch (SecurityException se) {
                 call.reject("SecurityException: " + se.getMessage(), "sync-auth", se);
+            } catch (FileNotFoundException fnfe) {
+                call.reject("FileNotFoundException: " + fnfe.getMessage(), "sync-auth", fnfe);
             } catch (Exception e) {
                 call.reject("SAF write failed: " + e.getMessage(), "network", e);
             }
         });
+    }
+
+    private static void writeSafBytes(
+        ContentResolver resolver,
+        Uri uri,
+        byte[] bytes
+    ) throws IOException {
+        OutputStream openedStream = null;
+        IOException lastOpenErr = null;
+        String[] modes = new String[] { "wt", "rwt", "w", null };
+        for (String mode : modes) {
+            try {
+                openedStream = mode != null
+                    ? resolver.openOutputStream(uri, mode)
+                    : resolver.openOutputStream(uri);
+                if (openedStream != null) {
+                    break;
+                }
+            } catch (SecurityException se) {
+                throw se;
+            } catch (IllegalArgumentException | FileNotFoundException e) {
+                lastOpenErr = new IOException(e.getMessage(), e);
+            }
+        }
+
+        if (openedStream != null) {
+            try (OutputStream out = openedStream) {
+                if (out instanceof FileOutputStream) {
+                    try {
+                        FileChannel ch = ((FileOutputStream) out).getChannel();
+                        ch.position(0L);
+                        ch.truncate(0L);
+                    } catch (Exception ignored) {
+                        // Cloud DocumentsProviders may back FileOutputStream with a non-seekable pipe
+                    }
+                }
+                out.write(bytes);
+                out.flush();
+                if (out instanceof FileOutputStream) {
+                    try {
+                        FileOutputStream fos = (FileOutputStream) out;
+                        fos.getChannel().truncate(bytes.length);
+                        fos.getChannel().force(true);
+                        fos.getFD().sync();
+                    } catch (Exception ignored) {
+                        // Cloud DocumentsProviders commit on close() and may not support truncate/fsync
+                    }
+                }
+            }
+            return;
+        }
+
+        try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "rw")) {
+            if (pfd == null) {
+                if (lastOpenErr != null) throw lastOpenErr;
+                throw new FileNotFoundException("openOutputStream and openFileDescriptor returned null");
+            }
+            try (FileOutputStream fos = new FileOutputStream(pfd.getFileDescriptor());
+                 FileChannel channel = fos.getChannel()) {
+                try {
+                    channel.position(0L);
+                } catch (Exception ignored) {
+                }
+                ByteBuffer buffer = ByteBuffer.wrap(bytes);
+                while (buffer.hasRemaining()) {
+                    channel.write(buffer);
+                }
+                try {
+                    channel.truncate(bytes.length);
+                    channel.force(true);
+                    pfd.getFileDescriptor().sync();
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     @PluginMethod

@@ -689,4 +689,20 @@ export class SqliteSyncStore implements SyncStore {
       }
     });
   }
+
+  async markAllDirty(): Promise<void> {
+    transaction(this.db, () => {
+      this.db
+        .prepare(
+          "UPDATE feeds SET sync_dirty = 1 WHERE kind = 'RSS' AND (subscribed = 1 OR deleted_at IS NOT NULL)",
+        )
+        .run();
+      this.db
+        .prepare("UPDATE queue SET sync_dirty = 1 WHERE feed_key NOT LIKE 'l_%'")
+        .run();
+      this.db
+        .prepare("UPDATE progress SET sync_dirty = 1 WHERE feed_key NOT LIKE 'l_%'")
+        .run();
+    });
+  }
 }
