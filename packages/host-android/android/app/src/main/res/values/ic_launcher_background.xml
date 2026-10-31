@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#FFFFFF</color>
+    <color name="ic_launcher_background">#F4F1EA</color>
+    <color name="ic_launcher_bg_top">#FAF8F4</color>
+    <color name="ic_launcher_bg_mid">#F4F1EA</color>
+    <color name="ic_launcher_bg_bottom">#ECE8DF</color>
+    <color name="ic_launcher_bg_glow_start">#00FFFFFF</color>
+    <color name="ic_launcher_bg_glow_mid">#00FFFFFF</color>
     <color name="ic_launcher_dot">#FF4F00</color>
     <color name="ic_launcher_arcs">#1C1917</color>
 </resources>
