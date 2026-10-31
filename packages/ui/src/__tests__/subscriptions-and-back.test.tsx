@@ -2,7 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderMiniPod } from './test-helpers';
 
-describe('Subscriptions & LIFO Back Navigation', () => {
+describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO Back Navigation', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -49,25 +49,28 @@ describe('Subscriptions & LIFO Back Navigation', () => {
     expect(await screen.findByTestId('snackbar')).toHaveTextContent(/Minimalist Design Radio/);
   });
 
-  it('renders Latest Episodes timeline below Subscriptions sorted by pubDate DESC, navigates to podcast on thumb/title click, and paginates >30 episodes', async () => {
+  it('renders Latest Episodes timeline filtered to unplayed sorted by pubDate DESC, removes on right-swipe, navigates to podcast from context menu, and paginates >30 episodes', async () => {
     const { host } = renderMiniPod({ width: 1024 });
 
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
     const timeline = await screen.findByTestId('subs-timeline-section');
     expect(timeline).toHaveTextContent('Latest episodes');
 
-    // Collect all episodes across subscribed feeds and verify strict pubDate DESC order
+    // Collect unplayed episodes across subscribed feeds and verify strict pubDate DESC order
     const subscribedFeeds = await host.feeds.list();
-    const allPages = await Promise.all(
-      subscribedFeeds.map((f) => host.episodes.list(f.feedKey, 'all')),
+    const unplayedPages = await Promise.all(
+      subscribedFeeds.map((f) => host.episodes.list(f.feedKey, 'unplayed')),
     );
-    const expectedOrder = allPages
+    const expectedOrder = unplayedPages
       .flatMap((p) => p.items.map((i) => i.episode))
       .sort((a, b) => {
         const diff = (b.pubDate ?? 0) - (a.pubDate ?? 0);
         return diff !== 0 ? diff : a.episodeKey.localeCompare(b.episodeKey);
       });
 
+    // Played episode 41 (`41: Parsing 15 Years`) is excluded from Timeline (`7` unplayed instead of `8` total)
+    expect(expectedOrder).toHaveLength(7);
+    expect(screen.queryByText(/41: Parsing 15 Years/)).not.toBeInTheDocument();
     expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent(
       String(expectedOrder.length),
     );
@@ -79,12 +82,19 @@ describe('Subscriptions & LIFO Back Navigation', () => {
       expectedOrder.map((ep) => `episode-row-${ep.episodeKey}`),
     );
 
-    // Clicking a timeline episode's podcast title link opens PodcastDetail for that feed
+    // Every timeline row has 0 inline buttons
+    expect(renderedRows[0]!.querySelectorAll('button')).toHaveLength(0);
+
+    // Opening podcast from timeline episode's context menu (`Go to podcast`) navigates to PodcastDetail
     const firstEp = expectedOrder[0]!;
-    fireEvent.click(screen.getByTestId(`ep-podcast-link-${firstEp.episodeKey}`));
+    fireEvent.contextMenu(screen.getByTestId(`episode-row-${firstEp.episodeKey}`), {
+      clientX: 200,
+      clientY: 240,
+    });
+    fireEvent.click(await screen.findByTestId(`ep-open-podcast-${firstEp.episodeKey}`));
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
 
-    // Navigate back to Subscriptions and add enough feeds so total timeline episodes > 30
+    // Navigate back to Subscriptions and add enough feeds so total unplayed timeline episodes > 30
     fireEvent.click(screen.getByTestId('detail-back-btn'));
     expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
 
@@ -96,9 +106,9 @@ describe('Subscriptions & LIFO Back Navigation', () => {
       await host.feeds.subscribeMany(extraUrls);
     });
 
-    // Each extra preview feed adds 2 episodes -> 8 + 28 = 36 > 30
+    // Each extra preview feed adds 2 unplayed episodes -> 7 + 28 = 35 > 30
     await waitFor(() => {
-      expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('36');
+      expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('35');
     });
     expect(
       within(screen.getByTestId('subs-timeline-list')).getAllByTestId(/^episode-row-/).length,
@@ -109,9 +119,67 @@ describe('Subscriptions & LIFO Back Navigation', () => {
     await waitFor(() => {
       expect(
         within(screen.getByTestId('subs-timeline-list')).getAllByTestId(/^episode-row-/).length,
-      ).toBe(36);
+      ).toBe(35);
     });
     expect(screen.queryByTestId('subs-timeline-load-more')).not.toBeInTheDocument();
+  });
+
+  it('conditionally displays Manage Downloads in top-right menu ONLY when >= 1 downloaded episode exists and opens DownloadsPage to delete downloads', async () => {
+    const { host } = renderMiniPod({
+      width: 1024,
+      hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
+    });
+    expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
+
+    // Initially 2 episodes (`ep42` and `kt-17`) have `downloadState === 'DONE'` -> `管理下载 (2)` appears!
+    await waitFor(() => {
+      fireEvent.click(screen.getByTestId('subs-overflow-btn'));
+      expect(screen.getByTestId('subs-manage-downloads')).toHaveTextContent('管理下载 (2)');
+    });
+
+    // Open DownloadsPage
+    fireEvent.click(screen.getByTestId('subs-manage-downloads'));
+    expect(await screen.findByTestId('downloads-screen')).toBeInTheDocument();
+    expect(screen.getByTestId('downloads-header-title')).toHaveTextContent('管理下载');
+    expect(screen.getByTestId('downloads-count')).toHaveTextContent('2');
+    expect(within(screen.getByTestId('downloads-list')).getAllByTestId(/^episode-row-/)).toHaveLength(
+      2,
+    );
+
+    // Swipe-left on the first downloaded row deletes that single download (`2 -> 1`)
+    const firstDlRow = within(screen.getByTestId('downloads-list')).getAllByTestId(
+      /^episode-row-/,
+    )[0]!;
+    fireEvent.touchStart(firstDlRow, { touches: [{ clientX: 260, clientY: 120 }] });
+    fireEvent.touchEnd(firstDlRow, { changedTouches: [{ clientX: 120, clientY: 120 }] });
+    await waitFor(() => {
+      expect(screen.getByTestId('downloads-count')).toHaveTextContent('1');
+    });
+
+    // Click `全部删除` (`downloads-delete-all-btn`) -> deletes remaining download and shows empty state
+    fireEvent.click(screen.getByTestId('downloads-delete-all-btn'));
+    expect(await screen.findByTestId('downloads-empty')).toHaveTextContent('暂无已下载的单集');
+
+    // Navigate back to Subscriptions -> `subs-manage-downloads` MUST BE HIDDEN when 0 downloads exist!
+    fireEvent.click(screen.getByTestId('downloads-back-btn'));
+    expect(await screen.findByTestId('subscriptions-screen')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
+    expect(screen.queryByTestId('subs-manage-downloads')).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Triggering a download via episode context menu makes `管理下载 (1)` reappear immediately!
+    const firstTimelineRow = within(screen.getByTestId('subs-timeline-list')).getAllByTestId(
+      /^episode-row-/,
+    )[0]!;
+    const epKey = firstTimelineRow.getAttribute('data-testid')!.replace('episode-row-', '');
+    fireEvent.contextMenu(firstTimelineRow, { clientX: 180, clientY: 220 });
+    fireEvent.click(await screen.findByTestId(`ep-download-${epKey}`));
+
+    await waitFor(async () => {
+      expect((await host.episodes.get(epKey)).episode.downloadState).toBe('DONE');
+    });
+    fireEvent.click(screen.getByTestId('subs-overflow-btn'));
+    expect(await screen.findByTestId('subs-manage-downloads')).toHaveTextContent('管理下载 (1)');
   });
 
   it('collapses >6 subscriptions in grid mode (and >4 in list mode) with Show all (N) / Show less toggle', async () => {
@@ -308,9 +376,9 @@ describe('Subscriptions & LIFO Back Navigation', () => {
     // Now on PodcastDetail
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
 
-    // Play first episode so MiniPlayer appears on mobile
-    const playBtns = screen.getAllByTestId(/^ep-play-/);
-    fireEvent.click(playBtns[0]!);
+    // Tap first episode row directly so MiniPlayer appears on mobile
+    const epRows = screen.getAllByTestId(/^episode-row-/);
+    fireEvent.click(epRows[0]!);
 
     const miniPlayer = await screen.findByTestId('mini-player');
     fireEvent.click(miniPlayer);

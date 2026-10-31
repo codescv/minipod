@@ -1,0 +1,162 @@
+/**
+ * Manage Downloads screen (`管理下载` / `Manage downloads`):
+ * - Opened from top-right `⋮` menu (`subs-manage-downloads` / `detail-manage-downloads` / `queue-manage-downloads`)
+ *   when >= 1 downloaded episode exists across subscribed feeds.
+ * - Supports single-episode delete (via long-press context menu `ep-download-*` or swipe-left) and `Delete all`.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { EpisodeRow as EpisodeRowModel, Feed } from '@minipod/core';
+import { dispatchBackNavigation } from '../../app/back';
+import { useRouteStore } from '../../app/routes';
+import { Button, Icon, IconButton } from '../../components/m3';
+import { useHost } from '../../host/HostContext';
+import { useHostEvents } from '../../host/useHostEvents';
+import { useT } from '../../i18n';
+import { EpisodeRow } from './EpisodeRow';
+
+interface DownloadedEpisodeItem {
+  readonly row: EpisodeRowModel;
+  readonly feed: Feed;
+}
+
+export function DownloadsPage() {
+  const host = useHost();
+  const t = useT();
+  const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
+
+  const [items, setItems] = useState<readonly DownloadedEpisodeItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [deletingAll, setDeletingAll] = useState(false);
+  const seqRef = useRef(0);
+
+  const loadDownloads = useCallback(async () => {
+    const seq = ++seqRef.current;
+    try {
+      if (!host.info.capabilities.downloads) {
+        if (seq === seqRef.current) setItems([]);
+        return;
+      }
+      const feeds = (await host.feeds.list()).filter((f) => f.kind !== 'LOCAL');
+      if (feeds.length === 0) {
+        if (seq === seqRef.current) setItems([]);
+        return;
+      }
+
+      const perFeed = await Promise.all(
+        feeds.map(async (feed) => {
+          try {
+            const page = await host.episodes.list(feed.feedKey, 'downloaded');
+            return page.items
+              .filter((row) => row.episode.downloadState === 'DONE')
+              .map((row): DownloadedEpisodeItem => ({ row, feed }));
+          } catch {
+            return [] as readonly DownloadedEpisodeItem[];
+          }
+        }),
+      );
+
+      if (seq !== seqRef.current) return;
+      const merged = perFeed.flat().sort((a, b) => {
+        const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
+        if (pubDiff !== 0) return pubDiff;
+        return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
+      });
+      setItems(merged);
+    } finally {
+      if (seq === seqRef.current) {
+        setLoading(false);
+      }
+    }
+  }, [host]);
+
+  useEffect(() => {
+    void loadDownloads();
+  }, [loadDownloads]);
+
+  useHostEvents((ev) => {
+    if (
+      ev.type === 'download-updated' ||
+      ev.type === 'episodes-changed' ||
+      ev.type === 'feeds-changed' ||
+      ev.type === 'progress-changed' ||
+      ev.type === 'queue-changed'
+    ) {
+      void loadDownloads();
+    }
+  });
+
+  const handleDeleteAll = async () => {
+    if (items.length === 0 || deletingAll) return;
+    setDeletingAll(true);
+    try {
+      await Promise.all(
+        items.map((item) => host.episodes.deleteDownload(item.row.episode.episodeKey)),
+      );
+      await loadDownloads();
+    } finally {
+      setDeletingAll(false);
+    }
+  };
+
+  return (
+    <div className="m-page" data-testid="downloads-screen">
+      <header className="m-appbar">
+        <IconButton
+          icon="back"
+          label={t('common.back')}
+          data-testid="downloads-back-btn"
+          onClick={() => dispatchBackNavigation()}
+        />
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <h1 className="m-appbar__title" style={{ flex: '0 1 auto' }} data-testid="downloads-header-title">
+            {t('downloads.title')}
+          </h1>
+          {items.length > 0 && (
+            <span className="m-pill-badge" data-testid="downloads-count">
+              {items.length}
+            </span>
+          )}
+        </div>
+        <Button
+          variant="text"
+          icon="delete"
+          disabled={items.length === 0 || deletingAll}
+          data-testid="downloads-delete-all-btn"
+          onClick={() => {
+            void handleDeleteAll();
+          }}
+        >
+          {t('downloads.deleteAll')}
+        </Button>
+      </header>
+
+      {!loading && items.length === 0 ? (
+        <div className="m-empty" data-testid="downloads-empty">
+          <Icon name="downloaded" size={44} />
+          <div>{t('downloads.empty')}</div>
+        </div>
+      ) : (
+        <div className="m-episode-list" data-testid="downloads-list">
+          {items.map((item) => (
+            <EpisodeRow
+              key={item.row.episode.episodeKey}
+              row={item.row}
+              feedTitle={item.feed.title ?? item.feed.url}
+              feedImageUrl={item.feed.imageUrl}
+              allowDownloads
+              onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
+              onSwipeLeftOverride={() => {
+                void host.episodes
+                  .deleteDownload(item.row.episode.episodeKey)
+                  .then(() => loadDownloads());
+              }}
+              onChanged={() => {
+                void loadDownloads();
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

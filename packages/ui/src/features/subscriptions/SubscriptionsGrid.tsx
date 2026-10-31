@@ -166,10 +166,12 @@ export function SubscriptionsGrid() {
 
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const openAdd = useRouteStore((s) => s.openAdd);
+  const openDownloads = useRouteStore((s) => s.openDownloads);
   const setTab = useRouteStore((s) => s.setTab);
 
   const [feeds, setFeeds] = useState<readonly Feed[]>([]);
   const [timelineItems, setTimelineItems] = useState<readonly TimelineEpisodeItem[]>([]);
+  const [downloadedCount, setDownloadedCount] = useState(0);
   const [subsExpanded, setSubsExpanded] = useState(false);
   const [timelineLimit, setTimelineLimit] = useState(TIMELINE_PAGE_SIZE);
   const [contextMenu, setContextMenu] = useState<ActiveFeedContextMenu | null>(null);
@@ -190,6 +192,7 @@ export function SubscriptionsGrid() {
 
       if (list.length === 0) {
         setTimelineItems([]);
+        setDownloadedCount(0);
         return;
       }
 
@@ -212,12 +215,20 @@ export function SubscriptionsGrid() {
       );
 
       if (seq !== loadSeqRef.current) return;
-      const merged = perFeed.flat().sort((a, b) => {
-        const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
-        if (pubDiff !== 0) return pubDiff;
-        return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
-      });
-      setTimelineItems(merged);
+      const allItems = perFeed.flat();
+      const dlCount = allItems.filter(
+        (item) => item.allowDownloads && item.row.episode.downloadState === 'DONE',
+      ).length;
+      setDownloadedCount(dlCount);
+
+      const mergedUnplayed = allItems
+        .filter((item) => item.row.progress?.state !== 'PLAYED')
+        .sort((a, b) => {
+          const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
+          if (pubDiff !== 0) return pubDiff;
+          return a.row.episode.episodeKey.localeCompare(b.row.episode.episodeKey);
+        });
+      setTimelineItems(mergedUnplayed);
     } finally {
       if (seq === loadSeqRef.current) {
         setLoading(false);
@@ -290,6 +301,17 @@ export function SubscriptionsGrid() {
   );
 
   const appBarMenuItems: MenuEntry[] = [
+    ...(downloadedCount > 0
+      ? [
+          {
+            key: 'manage-downloads',
+            label: t('subs.manageDownloads', { count: downloadedCount }),
+            icon: 'downloaded' as const,
+            testId: 'subs-manage-downloads',
+            onSelect: () => openDownloads(),
+          },
+        ]
+      : []),
     {
       key: 'toggle-layout',
       label: layout === 'grid' ? t('subs.viewGrid') : t('subs.viewList'),
@@ -480,6 +502,11 @@ export function SubscriptionsGrid() {
                         allowDownloads={item.allowDownloads}
                         showPodcastInfo
                         onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
+                        onRemove={(epKey) => {
+                          setTimelineItems((prev) =>
+                            prev.filter((entry) => entry.row.episode.episodeKey !== epKey),
+                          );
+                        }}
                         onChanged={() => {
                           void loadFeedsAndTimeline();
                         }}

@@ -17,7 +17,8 @@ export type ScreenRoute =
       readonly authChallenge?: { readonly url: string; readonly realm?: string | undefined } | undefined;
       readonly choices?: { readonly pageUrl: string; readonly items: readonly DiscoveredFeedLink[] } | undefined;
     }
-  | { readonly kind: 'cloud-sync' };
+  | { readonly kind: 'cloud-sync' }
+  | { readonly kind: 'downloads' };
 
 export type SidePanelTab = 'chapters' | 'shownotes';
 
@@ -43,6 +44,7 @@ export interface RouteStoreState {
   openFeedPreview(params: Omit<Extract<ScreenRoute, { kind: 'feed-preview' }>, 'kind'>): void;
   replaceFeedPreview(params: Omit<Extract<ScreenRoute, { kind: 'feed-preview' }>, 'kind'>): void;
   openCloudSync(): void;
+  openDownloads(): void;
   setExpandedPlayerOpen(open: boolean): void;
   setSideSheet(open: boolean, tab?: SidePanelTab): void;
   toggleSideSheet(tab?: SidePanelTab): void;
@@ -121,6 +123,15 @@ export const useRouteStore = create<RouteStoreState>()((set, get) => ({
     set((s) => ({
       screen: { kind: 'cloud-sync' },
       history: pushHistory(s.history, { tab: s.tab, screen: s.screen }),
+    })),
+
+  openDownloads: () =>
+    set((s) => ({
+      screen: { kind: 'downloads' },
+      history:
+        s.screen.kind === 'downloads'
+          ? s.history
+          : pushHistory(s.history, { tab: s.tab, screen: s.screen }),
     })),
 
   setExpandedPlayerOpen: (expandedPlayerOpen) => set({ expandedPlayerOpen }),

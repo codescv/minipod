@@ -8,8 +8,8 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const { host, engine } = renderMiniPod({ width: 1200 });
 
     fireEvent.click(await screen.findByText('Syntax & Signal'));
-    const playBtns = await screen.findAllByTestId(/^ep-play-/);
-    fireEvent.click(playBtns[0]!);
+    const epRows = await screen.findAllByTestId(/^episode-row-/);
+    fireEvent.click(epRows[0]!);
 
     await waitFor(() => {
       expect(engine.getSnapshot().playing).toBe(true);
@@ -83,8 +83,8 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const { host, engine } = renderMiniPod({ width: 1024 });
 
     fireEvent.click(await screen.findByText('Syntax & Signal'));
-    const playBtns = await screen.findAllByTestId(/^ep-play-/);
-    fireEvent.click(playBtns[0]!);
+    const epRows = await screen.findAllByTestId(/^episode-row-/);
+    fireEvent.click(epRows[0]!);
     await waitFor(() => expect(engine.getSnapshot().playing).toBe(true));
 
     const loadedKey = engine.getSnapshot().episodeKey!;
@@ -182,7 +182,7 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
     const page = await desktop.host.episodes.list(syntax.feedKey, 'all');
     const ep39NoArt = page.items[3]!.episode;
-    fireEvent.click(await screen.findByTestId(`ep-play-${ep39NoArt.episodeKey}`));
+    fireEvent.click(await screen.findByTestId(`episode-row-${ep39NoArt.episodeKey}`));
     await waitFor(() => expect(desktop.engine.getSnapshot().playing).toBe(true));
 
     const desktopCover = screen.getByTestId('desktop-cover-btn') as HTMLImageElement;
@@ -221,10 +221,10 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
       return origListEpisodes(fk, filter, cursor);
     });
 
-    // Open Syntax & Signal and play the episode
+    // Open Syntax & Signal and play the episode by tapping the row directly
     fireEvent.click(screen.getByTestId(`feed-tile-${syntax.feedKey}`));
     expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
-    fireEvent.click(await screen.findByTestId(`ep-play-${epWithBrokenArt.episodeKey}`));
+    fireEvent.click(await screen.findByTestId(`episode-row-${epWithBrokenArt.episodeKey}`));
     await waitFor(() => expect(mobile.engine.getSnapshot().playing).toBe(true));
 
     // MiniPlayer shows episode artwork with referrerPolicy="no-referrer"

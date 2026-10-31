@@ -39,6 +39,11 @@ export const zhCN = {
   'subs.collapse': '收起',
   'subs.loadMoreTimeline': '加载更多',
   'subs.longPressHint': '长按或右键打开操作菜单',
+  'subs.manageDownloads': '管理下载 ({count})',
+
+  'downloads.title': '管理下载',
+  'downloads.deleteAll': '全部删除',
+  'downloads.empty': '暂无已下载的单集',
 
   'detail.filterAll': '全部',
   'detail.filterUnplayed': '未播',
@@ -65,6 +70,8 @@ export const zhCN = {
   'detail.addedPlayNext': '已设为下一首播放',
   'detail.markPlayed': '标记为已播',
   'detail.markUnplayed': '标记为未播',
+  'detail.markedPlayedRemovedSnack': '已标为已播并移除',
+  'detail.goToPodcast': '查看播客节目',
   'detail.shareLink': '分享单集链接',
   'detail.openInVideoPlayer': '在外部视频播放器中打开',
 
@@ -125,7 +132,8 @@ export const zhCN = {
   'queue.moveToTop': '移至顶部',
   'queue.moveUp': '上移',
   'queue.moveDown': '下移',
-  'queue.remove': '移除',
+  'queue.markPlayedAndRemove': '标记为已播并移除',
+  'queue.remove': '从队列移除',
   'queue.removedSnack': '已从队列移除《{title}》',
 
   'player.nothingPlaying': '尚未播放单集',

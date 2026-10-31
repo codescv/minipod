@@ -1,14 +1,29 @@
 /**
- * Feed Preview screen (`DESIGN.md` §4.2):
+ * Feed Preview screen (`DESIGN.md` §4.2 + `v0.1.5`):
  * 1. Inline HTTP 401 Basic Auth username/password retry prompt (`authChallenge`).
  * 2. Multi-feed HTML `<link rel="alternate">` radio selector (`choices`).
- * 3. Full feed preview with `[ Subscribe ]` AND direct `▶` episode streaming without subscribing.
+ * 3. Full feed preview with `[ Subscribe ]` AND direct tap-to-play episode streaming + long-press / swipe-left queue gestures.
  */
 import { useCallback, useEffect, useState } from 'react';
-import type { DiscoveredFeedLink, EpisodeKey, FeedPreview as FeedPreviewModel } from '@minipod/core';
+import type {
+  DiscoveredFeedLink,
+  EpisodeKey,
+  FeedPreview as FeedPreviewModel,
+  ParsedEpisode,
+} from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
-import { ArtworkImage, Button, cx, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
+import {
+  ArtworkImage,
+  Button,
+  ContextMenu,
+  cx,
+  Icon,
+  IconButton,
+  shouldUseImageProxy,
+  type MenuEntry,
+} from '../../components/m3';
+import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
@@ -29,6 +44,7 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
   const locale = useLocale();
   const t = useT();
   const player = usePlayer();
+  const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const replaceFeedPreview = useRouteStore((s) => s.replaceFeedPreview);
@@ -324,7 +340,7 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
           <section className="m-feed-hero">
             <ArtworkImage
               src={preview.parsed.imageUrl}
-              allowProxyFallback={shouldUseImageProxy(host.info.platform)}
+              allowProxyFallback={allowProxy}
               className="m-feed-hero__cover"
               placeholder={
                 <div className="m-feed-hero__cover" style={{ display: 'grid', placeItems: 'center' }}>
@@ -370,65 +386,18 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
           <div className="m-episode-list" data-testid="preview-episode-list">
             {preview.parsed.episodes.map((ep, idx) => {
               const epKey = deriveEpisodeKey(preview.feedKey, ep.identity);
-              const inQueue = queuedKeys.has(epKey);
-              const isCurrent = player.episode?.episodeKey === epKey;
-              const isPlaying = isCurrent && player.snapshot.playing;
-              const dateStr = formatShortDate(ep.pubDate, locale);
-              const durStr = formatHumanDuration(ep.durationMs);
               return (
-                <div key={ep.identity} className="m-episode-row" data-testid={`preview-ep-row-${idx}`}>
-                  <div className="m-episode-row__body">
-                    <div className="m-episode-row__meta">
-                      {dateStr && <span>{dateStr}</span>}
-                      {dateStr && durStr && <span>·</span>}
-                      {durStr && <span>{durStr}</span>}
-                    </div>
-                    <div className="m-episode-row__title">{ep.title}</div>
-                  </div>
-                  <div className="m-episode-row__actions">
-                    <IconButton
-                      icon={isPlaying ? 'pause' : 'play'}
-                      variant={isPlaying ? 'filled' : 'tonal'}
-                      label={`${isPlaying ? t('detail.pause') : t('detail.play')} ${ep.title}`}
-                      data-testid={`preview-ep-play-${idx}`}
-                      onClick={() => {
-                        if (isCurrent) {
-                          void player.togglePlayPause();
-                        } else {
-                          void player.playPreviewEpisode(preview, ep);
-                        }
-                      }}
-                    />
-                    <IconButton
-                      icon={inQueue ? 'queueMusic' : 'playlistAdd'}
-                      variant={inQueue ? 'tonal' : 'standard'}
-                      label={`${inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')} ${ep.title}`}
-                      data-testid={`preview-ep-queue-${idx}`}
-                      onClick={() => {
-                        void (async () => {
-                          try {
-                            if (inQueue) {
-                              await host.queue.remove(epKey);
-                            } else {
-                              await host.queue.add(epKey);
-                              showSnackbar(t('detail.addedToQueue'), {
-                                action: {
-                                  label: t('common.undo'),
-                                  run: () => {
-                                    void host.queue.remove(epKey).then(loadQueuedKeys);
-                                  },
-                                },
-                              });
-                            }
-                            await loadQueuedKeys();
-                          } catch (err) {
-                            showSnackbar(err instanceof Error ? err.message : String(err));
-                          }
-                        })();
-                      }}
-                    />
-                  </div>
-                </div>
+                <PreviewEpisodeRow
+                  key={ep.identity}
+                  idx={idx}
+                  preview={preview}
+                  ep={ep}
+                  epKey={epKey}
+                  inQueue={queuedKeys.has(epKey)}
+                  locale={locale}
+                  allowProxy={allowProxy}
+                  onQueueChanged={loadQueuedKeys}
+                />
               );
             })}
           </div>
@@ -439,5 +408,160 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
         <div className="m-empty">{t('common.loading')}</div>
       )}
     </div>
+  );
+}
+
+function PreviewEpisodeRow({
+  idx,
+  preview,
+  ep,
+  epKey,
+  inQueue,
+  locale,
+  allowProxy,
+  onQueueChanged,
+}: {
+  readonly idx: number;
+  readonly preview: FeedPreviewModel;
+  readonly ep: ParsedEpisode;
+  readonly epKey: EpisodeKey;
+  readonly inQueue: boolean;
+  readonly locale: string;
+  readonly allowProxy: boolean;
+  readonly onQueueChanged: () => Promise<void>;
+}) {
+  const host = useHost();
+  const t = useT();
+  const player = usePlayer();
+  const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
+
+  const isCurrent = player.episode?.episodeKey === epKey;
+  const isPlaying = isCurrent && player.snapshot.playing;
+  const dateStr = formatShortDate(ep.pubDate, locale);
+  const durStr = formatHumanDuration(ep.durationMs);
+
+  const handlePlay = () => {
+    if (isCurrent) {
+      void player.togglePlayPause();
+    } else {
+      void player.playPreviewEpisode(preview, ep);
+    }
+  };
+
+  const handlePlayNext = async () => {
+    try {
+      await host.queue.playNext(epKey);
+      await onQueueChanged();
+      showSnackbar(t('detail.addedPlayNext'), {
+        action: {
+          label: t('common.undo'),
+          run: () => {
+            void host.queue.remove(epKey).then(onQueueChanged);
+          },
+        },
+      });
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleToggleQueue = async () => {
+    try {
+      if (inQueue) {
+        await host.queue.remove(epKey);
+      } else {
+        await host.queue.add(epKey);
+        showSnackbar(t('detail.addedToQueue'), {
+          action: {
+            label: t('common.undo'),
+            run: () => {
+              void host.queue.remove(epKey).then(onQueueChanged);
+            },
+          },
+        });
+      }
+      await onQueueChanged();
+    } catch (err) {
+      showSnackbar(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const { swipeOffsetX, handlers } = useRowGestures({
+    onTap: handlePlay,
+    onContext: (x, y) => setCtxPos({ x, y }),
+    onSwipeLeft: () => {
+      void handlePlayNext();
+    },
+  });
+
+  const menuItems: MenuEntry[] = [
+    {
+      key: 'play-next',
+      label: t('detail.playNext'),
+      icon: 'playlistAdd',
+      testId: `preview-ep-play-next-${idx}`,
+      onSelect: () => {
+        void handlePlayNext();
+      },
+    },
+    {
+      key: 'toggle-queue',
+      label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
+      icon: inQueue ? 'queueMusic' : 'playlistAdd',
+      testId: `preview-ep-queue-${idx}`,
+      onSelect: () => {
+        void handleToggleQueue();
+      },
+    },
+  ];
+
+  return (
+    <>
+      <div
+        className={cx('m-episode-row', isCurrent && 'is-current', isPlaying && 'is-playing')}
+        role="button"
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={ep.title}
+        data-testid={`preview-ep-row-${idx}`}
+        style={
+          swipeOffsetX !== 0
+            ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
+            : undefined
+        }
+        {...handlers}
+      >
+        <div className="m-episode-row__thumb">
+          <ArtworkImage
+            src={ep.imageUrl}
+            fallbackSrc={preview.parsed.imageUrl}
+            allowProxyFallback={allowProxy}
+            className="m-episode-row__thumb-img"
+            loading="lazy"
+            draggable={false}
+            placeholder={<Icon name="podcasts" size={20} />}
+          />
+        </div>
+        <div className="m-episode-row__body">
+          <div className="m-episode-row__title">{ep.title}</div>
+          {(dateStr || durStr) && (
+            <div className="m-episode-row__meta">
+              {dateStr && <span>{dateStr}</span>}
+              {dateStr && durStr && <span>·</span>}
+              {durStr && <span>{durStr}</span>}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <ContextMenu
+        open={ctxPos !== null}
+        x={ctxPos?.x ?? 0}
+        y={ctxPos?.y ?? 0}
+        onClose={() => setCtxPos(null)}
+        items={menuItems}
+        testId="preview-ep-context-menu"
+      />
+    </>
   );
 }

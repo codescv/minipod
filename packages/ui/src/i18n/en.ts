@@ -41,6 +41,11 @@ export const en: Messages = {
   'subs.collapse': 'Show less',
   'subs.loadMoreTimeline': 'Load more',
   'subs.longPressHint': 'Long-press or right-click for options',
+  'subs.manageDownloads': 'Manage downloads ({count})',
+
+  'downloads.title': 'Manage downloads',
+  'downloads.deleteAll': 'Delete all',
+  'downloads.empty': 'No downloaded episodes',
 
   'detail.filterAll': 'All',
   'detail.filterUnplayed': 'Unplayed',
@@ -67,6 +72,8 @@ export const en: Messages = {
   'detail.addedPlayNext': 'Playing next',
   'detail.markPlayed': 'Mark played',
   'detail.markUnplayed': 'Mark unplayed',
+  'detail.markedPlayedRemovedSnack': 'Marked played and removed',
+  'detail.goToPodcast': 'Go to podcast',
   'detail.shareLink': 'Share link',
   'detail.openInVideoPlayer': 'Open in video player',
 
@@ -127,7 +134,8 @@ export const en: Messages = {
   'queue.moveToTop': 'Move to top',
   'queue.moveUp': 'Move up',
   'queue.moveDown': 'Move down',
-  'queue.remove': 'Remove',
+  'queue.markPlayedAndRemove': 'Mark played & remove',
+  'queue.remove': 'Remove from queue',
   'queue.removedSnack': 'Removed "{title}" from queue',
 
   'player.nothingPlaying': 'Nothing playing',

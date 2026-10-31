@@ -1,23 +1,23 @@
 /**
- * Episode row (`DESIGN.md` §4.3):
- * - Optional podcast cover thumbnail + clickable podcast title in timeline mode (`showPodcastInfo`)
- * - Date · human duration · `✓` played · downloaded indicator · `Audio only` badge
- * - Linear progress bar + remaining time when `IN_PROGRESS`
- * - Swipe-right to toggle queue + Undo snackbar
- * - Inline actions: `▶/⏸` play/pause, inline Add/Remove Queue (`ep-queue-btn-*`), and `⋮` overflow
- *   (`Download / Delete download`, `Mark played / unplayed`, and `Open in video player` when needed)
+ * Minimalist gesture-driven episode row (`v0.1.5`):
+ * - Strictly 4 visual elements: `44×44` cover icon, 2-line clamped title, publish date, and remaining time
+ * - Zero inline action buttons
+ * - Tap / click directly plays (or toggles pause if current)
+ * - Long-press (~450ms) / right-click / keyboard (`ContextMenu` / `Shift+F10`) opens viewport-clamped `<ContextMenu>`
+ * - Swipe left (`deltaX < -64px`): Play next (`queue.playNext`) + Undo snackbar
+ * - Swipe right (`deltaX > +64px`): Mark played (`progress.markPlayed(key, true)`) & remove + Undo snackbar
  */
-import { useRef } from 'react';
-import type { EpisodeRow as EpisodeRowModel } from '@minipod/core';
+import { useState } from 'react';
+import type { EpisodeKey, EpisodeRow as EpisodeRowModel } from '@minipod/core';
 import {
   ArtworkImage,
+  ContextMenu,
   cx,
   Icon,
-  IconButton,
-  Menu,
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
+import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate } from '../../lib/format';
@@ -31,6 +31,9 @@ export interface EpisodeRowProps {
   readonly allowDownloads: boolean;
   readonly showPodcastInfo?: boolean | undefined;
   readonly onOpenPodcast?: (() => void) | undefined;
+  readonly onRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
+  readonly onUndoRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
+  readonly onSwipeLeftOverride?: (() => void) | undefined;
   readonly onChanged: () => void;
 }
 
@@ -39,8 +42,10 @@ export function EpisodeRow({
   feedTitle,
   feedImageUrl,
   allowDownloads,
-  showPodcastInfo = false,
   onOpenPodcast,
+  onRemove,
+  onUndoRemove,
+  onSwipeLeftOverride,
   onChanged,
 }: EpisodeRowProps) {
   const host = useHost();
@@ -49,6 +54,8 @@ export function EpisodeRow({
   const player = usePlayer();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
+  const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
+
   const { episode, progress, inQueue } = row;
   const isCurrent = player.episode?.episodeKey === episode.episodeKey;
   const isPlaying = isCurrent && player.snapshot.playing;
@@ -56,17 +63,9 @@ export function EpisodeRow({
   const positionMs = isCurrent ? player.snapshot.positionMs : (progress?.positionMs ?? 0);
   const durationMs =
     (isCurrent ? player.snapshot.durationMs : undefined) ?? progress?.durationMs ?? episode.durationMs;
-  const showProgress = !isPlayed && positionMs > 0;
-  const pct =
-    durationMs && durationMs > 0 ? Math.min(100, Math.round((positionMs / durationMs) * 100)) : 0;
-  const remainingText =
-    durationMs && durationMs > positionMs
-      ? formatHumanDuration(durationMs - positionMs)
-      : '';
+
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
   const isDownloading = episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED';
-
-  const swipeStartXRef = useRef<number | null>(null);
 
   const handlePlayToggle = () => {
     if (isCurrent) {
@@ -74,6 +73,19 @@ export function EpisodeRow({
     } else {
       void player.playEpisode(episode, { feedTitle, feedImageUrl });
     }
+  };
+
+  const handlePlayNextWithUndo = async () => {
+    await host.queue.playNext(episode.episodeKey);
+    onChanged();
+    showSnackbar(t('detail.addedPlayNext'), {
+      action: {
+        label: t('common.undo'),
+        run: () => {
+          void host.queue.remove(episode.episodeKey).then(onChanged);
+        },
+      },
+    });
   };
 
   const handleAddQueueWithUndo = async () => {
@@ -107,7 +119,65 @@ export function EpisodeRow({
     onChanged();
   };
 
+  const handleMarkPlayedAndRemove = async () => {
+    const wasInQueue = inQueue;
+    onRemove?.(episode.episodeKey);
+    await host.progress.markPlayed(episode.episodeKey, true);
+    if (wasInQueue) {
+      await host.queue.remove(episode.episodeKey);
+    }
+    onChanged();
+    showSnackbar(t('detail.markedPlayedRemovedSnack'), {
+      action: {
+        label: t('common.undo'),
+        run: () => {
+          void (async () => {
+            await host.progress.markPlayed(episode.episodeKey, false);
+            if (wasInQueue) {
+              await host.queue.add(episode.episodeKey);
+            }
+            onUndoRemove?.(episode.episodeKey);
+            onChanged();
+          })();
+        },
+      },
+    });
+  };
+
+  const { swipeOffsetX, handlers } = useRowGestures({
+    onTap: handlePlayToggle,
+    onContext: (x, y) => setCtxPos({ x, y }),
+    onSwipeLeft: () => {
+      if (onSwipeLeftOverride) {
+        onSwipeLeftOverride();
+      } else {
+        void handlePlayNextWithUndo();
+      }
+    },
+    onSwipeRight: () => {
+      void handleMarkPlayedAndRemove();
+    },
+  });
+
   const menuItems: MenuEntry[] = [
+    {
+      key: 'play-next',
+      label: t('detail.playNext'),
+      icon: 'playlistAdd',
+      testId: `ep-play-next-${episode.episodeKey}`,
+      onSelect: () => {
+        void handlePlayNextWithUndo();
+      },
+    },
+    {
+      key: 'toggle-queue',
+      label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
+      icon: inQueue ? 'queueMusic' : 'playlistAdd',
+      testId: `ep-queue-btn-${episode.episodeKey}`,
+      onSelect: () => {
+        void handleToggleQueue();
+      },
+    },
     ...(allowDownloads
       ? [
           {
@@ -118,7 +188,9 @@ export function EpisodeRow({
                 : isDownloading
                   ? t('detail.downloading')
                   : t('detail.download'),
-            icon: (episode.downloadState === 'DONE' ? 'downloaded' : 'download') as 'downloaded' | 'download',
+            icon: (episode.downloadState === 'DONE' ? 'downloaded' : 'download') as
+              | 'downloaded'
+              | 'download',
             disabled: isDownloading,
             testId: `ep-download-${episode.episodeKey}`,
             onSelect: () => {
@@ -136,6 +208,19 @@ export function EpisodeRow({
         void host.progress.markPlayed(episode.episodeKey, !isPlayed).then(onChanged);
       },
     },
+    ...(onOpenPodcast
+      ? [
+          {
+            key: 'open-podcast',
+            label: t('detail.goToPodcast'),
+            icon: 'podcasts' as const,
+            testId: `ep-open-podcast-${episode.episodeKey}`,
+            onSelect: () => {
+              onOpenPodcast();
+            },
+          },
+        ]
+      : []),
     ...(isAudioOnlyVideo && episode.enclosureUrl
       ? [
           {
@@ -154,36 +239,37 @@ export function EpisodeRow({
   ];
 
   const dateStr = formatShortDate(episode.pubDate, locale);
-  const durStr = formatHumanDuration(durationMs);
+  const remStr =
+    !isPlayed && durationMs && positionMs > 0 && durationMs > positionMs
+      ? t('detail.timeLeft', { time: formatHumanDuration(durationMs - positionMs) })
+      : durationMs
+        ? formatHumanDuration(durationMs)
+        : '';
 
   return (
-    <div
-      className={cx('m-episode-row', isPlayed && 'is-played')}
-      data-testid={`episode-row-${episode.episodeKey}`}
-      onTouchStart={(e) => {
-        const touch = e.touches[0];
-        if (touch) swipeStartXRef.current = touch.clientX;
-      }}
-      onTouchEnd={(e) => {
-        const startX = swipeStartXRef.current;
-        swipeStartXRef.current = null;
-        const touch = e.changedTouches[0];
-        if (startX !== null && touch && touch.clientX - startX > 64) {
-          void handleToggleQueue();
+    <>
+      <div
+        className={cx(
+          'm-episode-row',
+          isPlayed && 'is-played',
+          isCurrent && 'is-current',
+          isPlaying && 'is-playing',
+        )}
+        role="button"
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={episode.title}
+        data-testid={`episode-row-${episode.episodeKey}`}
+        style={
+          swipeOffsetX !== 0
+            ? { transform: `translateX(${swipeOffsetX}px)`, transition: 'none' }
+            : undefined
         }
-      }}
-    >
-      {showPodcastInfo && (
-        <button
-          type="button"
-          className="m-episode-row__podcast-thumb"
-          aria-label={feedTitle || episode.title}
-          title={feedTitle || episode.title}
-          data-testid={`ep-podcast-thumb-${episode.episodeKey}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onOpenPodcast?.();
-          }}
+        {...handlers}
+      >
+        <div
+          className="m-episode-row__thumb"
+          data-testid={`ep-thumb-${episode.episodeKey}`}
         >
           <ArtworkImage
             src={episode.imageUrl}
@@ -192,109 +278,30 @@ export function EpisodeRow({
             className="m-episode-row__thumb-img"
             loading="lazy"
             draggable={false}
-            placeholder={<Icon name="podcasts" size={18} />}
+            placeholder={<Icon name="podcasts" size={20} />}
           />
-        </button>
-      )}
+        </div>
 
-      <div
-        className="m-episode-row__body"
-        role="button"
-        tabIndex={0}
-        onClick={handlePlayToggle}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            handlePlayToggle();
-          }
-        }}
-      >
-        <div className="m-episode-row__meta">
-          {showPodcastInfo && feedTitle && (
-            <button
-              type="button"
-              className="m-episode-row__podcast-link"
-              data-testid={`ep-podcast-link-${episode.episodeKey}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenPodcast?.();
-              }}
-            >
-              {dateStr || durStr ? `${feedTitle} ·` : `${feedTitle} ›`}
-            </button>
-          )}
-          {dateStr && <span>{dateStr}</span>}
-          {dateStr && durStr && <span>·</span>}
-          {durStr && <span>{durStr}</span>}
-          {isPlayed && (
-            <span title={t('detail.played')} data-testid={`ep-played-badge-${episode.episodeKey}`}>
-              ✓
-            </span>
-          )}
-          {episode.downloadState === 'DONE' && (
-            <span
-              title={t('detail.filterDownloaded')}
-              data-testid={`ep-downloaded-badge-${episode.episodeKey}`}
-              style={{ display: 'inline-flex', alignItems: 'center', color: 'var(--md-sys-color-primary)' }}
-            >
-              <Icon name="downloaded" size={14} />
-            </span>
-          )}
-          {isDownloading && (
-            <span className="m-pill-badge" data-testid={`ep-downloading-badge-${episode.episodeKey}`}>
-              {t('detail.downloading')}
-            </span>
-          )}
-          {isAudioOnlyVideo && (
-            <span className="m-pill-badge" data-testid={`ep-audio-only-${episode.episodeKey}`}>
-              {t('detail.audioOnly')}
-            </span>
+        <div className="m-episode-row__body">
+          <div className="m-episode-row__title">{episode.title}</div>
+          {(dateStr || remStr) && (
+            <div className="m-episode-row__meta">
+              {dateStr && <span>{dateStr}</span>}
+              {dateStr && remStr && <span>·</span>}
+              {remStr && <span>{remStr}</span>}
+            </div>
           )}
         </div>
-        <div className="m-episode-row__title">{episode.title}</div>
-        {showProgress && (
-          <div className="m-episode-row__progress-row" data-testid={`ep-progress-${episode.episodeKey}`}>
-            <div className="m-progress-track">
-              <div className="m-progress-fill" style={{ width: `${pct}%` }} />
-            </div>
-            {remainingText && (
-              <span style={{ font: 'var(--md-sys-typescale-label-small)', color: 'var(--md-sys-color-on-surface-variant)' }}>
-                {t('detail.timeLeft', { time: remainingText })}
-              </span>
-            )}
-          </div>
-        )}
       </div>
 
-      <div className="m-episode-row__actions">
-        <IconButton
-          icon={isPlaying ? 'pause' : 'play'}
-          variant={isPlaying ? 'filled' : 'tonal'}
-          label={`${isPlaying ? t('detail.pause') : t('detail.play')} ${episode.title}`}
-          data-testid={`ep-play-${episode.episodeKey}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            handlePlayToggle();
-          }}
-        />
-
-        <IconButton
-          icon={inQueue ? 'queueMusic' : 'playlistAdd'}
-          variant={inQueue ? 'tonal' : 'standard'}
-          label={`${inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')} ${episode.title}`}
-          data-testid={`ep-queue-btn-${episode.episodeKey}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            void handleToggleQueue();
-          }}
-        />
-
-        <Menu
-          label={`${t('common.more')} ${episode.title}`}
-          items={menuItems}
-          testId={`ep-menu-${episode.episodeKey}`}
-        />
-      </div>
-    </div>
+      <ContextMenu
+        open={ctxPos !== null}
+        x={ctxPos?.x ?? 0}
+        y={ctxPos?.y ?? 0}
+        onClose={() => setCtxPos(null)}
+        items={menuItems}
+        testId="ep-context-menu"
+      />
+    </>
   );
 }

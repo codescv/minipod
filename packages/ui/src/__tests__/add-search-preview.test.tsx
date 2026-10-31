@@ -47,14 +47,18 @@ describe('Unified Add / Search / Top Charts / FeedPreview / 401 / Multi-Feed / O
     expect(await screen.findByTestId('feed-preview-screen')).toBeInTheDocument();
     expect(screen.getAllByText('Indie Synth').length).toBeGreaterThan(0);
 
-    // Stream episode 0 directly from FeedPreview WITHOUT subscribing!
-    fireEvent.click(screen.getByTestId('preview-ep-play-0'));
+    // Preview episode rows have zero inline buttons; tapping row 0 directly streams WITHOUT subscribing!
+    const previewRow0 = screen.getByTestId('preview-ep-row-0');
+    expect(previewRow0.querySelectorAll('button')).toHaveLength(0);
+    fireEvent.click(previewRow0);
     await waitFor(() => {
       expect(engine.getSnapshot().playing).toBe(true);
     });
     expect((await host.feeds.list()).length).toBe(initialSubCount);
 
-    // Inline Add-to-Queue on episode 1 in FeedPreview also works without subscribing
+    // Context menu Add-to-Queue on episode 1 in FeedPreview also works without subscribing
+    fireEvent.contextMenu(screen.getByTestId('preview-ep-row-1'), { clientX: 160, clientY: 220 });
+    expect(await screen.findByTestId('preview-ep-context-menu')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('preview-ep-queue-1'));
     expect(await screen.findByTestId('snackbar')).toHaveTextContent('Added to queue');
     expect((await host.feeds.list()).length).toBe(initialSubCount);

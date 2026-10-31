@@ -1,13 +1,20 @@
 /**
- * Podcast Detail screen (`DESIGN.md` §4.3):
- * - Header (`←`, title, `⋮` Refresh / Visit website / Set credentials / Copy URL / Unsubscribe)
+ * Podcast Detail screen (`DESIGN.md` §4.3 + `v0.1.5`):
+ * - Header (`←`, title, `⋮` Manage downloads when non-empty / Refresh / Visit website / Set credentials / Copy URL / Unsubscribe)
  * - Hero (cover, author, 3-line expandable description)
  * - Strictly 3 filter chips: `All` / `Unplayed` / `Downloaded`
- * - Episode rows + RFC 5005 *Load older episodes* pagination footer
+ * - Gesture-driven `EpisodeRow` items + immediate swipe-right dismiss (with Undo) + RFC 5005 *Load older episodes*
  */
 import { useCallback, useEffect, useState } from 'react';
-import type { EpisodeFilter, EpisodeRow as EpisodeRowModel, Feed, FeedKey } from '@minipod/core';
+import type {
+  EpisodeFilter,
+  EpisodeKey,
+  EpisodeRow as EpisodeRowModel,
+  Feed,
+  FeedKey,
+} from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
+import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
   Button,
@@ -20,6 +27,7 @@ import {
   shouldUseImageProxy,
   type MenuEntry,
 } from '../../components/m3';
+import { useDownloadedCount } from '../../hooks/useDownloadedCount';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
@@ -30,16 +38,23 @@ import { EpisodeRow } from './EpisodeRow';
 export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const host = useHost();
   const t = useT();
+  const openDownloads = useRouteStore((s) => s.openDownloads);
+  const downloadedCount = useDownloadedCount();
 
   const [feed, setFeed] = useState<Feed | null>(null);
   const [rows, setRows] = useState<readonly EpisodeRowModel[]>([]);
   const [filter, setFilter] = useState<EpisodeFilter>('all');
+  const [dismissedKeys, setDismissedKeys] = useState<ReadonlySet<EpisodeKey>>(() => new Set());
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [credsDialogOpen, setCredsDialogOpen] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+
+  useEffect(() => {
+    setDismissedKeys(new Set());
+  }, [feedKey, filter]);
 
   const reload = useCallback(async () => {
     try {
@@ -107,8 +122,20 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
 
   const plainDesc = stripHtmlToText(feed?.description);
   const allowDownloads = Boolean(host.info.capabilities.downloads && feed?.kind !== 'LOCAL');
+  const visibleRows = rows.filter((r) => !dismissedKeys.has(r.episode.episodeKey));
 
   const menuItems: MenuEntry[] = [
+    ...(downloadedCount > 0
+      ? [
+          {
+            key: 'manage-downloads',
+            label: t('subs.manageDownloads', { count: downloadedCount }),
+            icon: 'downloaded' as const,
+            testId: 'detail-manage-downloads',
+            onSelect: () => openDownloads(),
+          },
+        ]
+      : []),
     {
       key: 'refresh',
       label: t('common.refresh'),
@@ -243,19 +270,34 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         </Chip>
       </div>
 
-      {rows.length === 0 ? (
+      {visibleRows.length === 0 ? (
         <div className="m-empty" data-testid="detail-empty">
           {t('detail.noEpisodes')}
         </div>
       ) : (
         <div className="m-episode-list" data-testid="detail-episode-list">
-          {rows.map((r) => (
+          {visibleRows.map((r) => (
             <EpisodeRow
               key={r.episode.episodeKey}
               row={r}
               feedTitle={feed?.title}
               feedImageUrl={feed?.imageUrl}
               allowDownloads={allowDownloads}
+              onRemove={(epKey) => {
+                setDismissedKeys((prev) => {
+                  const next = new Set(prev);
+                  next.add(epKey);
+                  return next;
+                });
+              }}
+              onUndoRemove={(epKey) => {
+                setDismissedKeys((prev) => {
+                  if (!prev.has(epKey)) return prev;
+                  const next = new Set(prev);
+                  next.delete(epKey);
+                  return next;
+                });
+              }}
               onChanged={() => {
                 void reload();
               }}

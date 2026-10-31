@@ -21,6 +21,7 @@ import { SleepTimerSheet } from '../features/player/SleepTimerSheet';
 import { QueueList } from '../features/queue/QueueList';
 import { CloudSyncSetup } from '../features/settings/CloudSyncSetup';
 import { SettingsPage } from '../features/settings/SettingsPage';
+import { DownloadsPage } from '../features/subscriptions/DownloadsPage';
 import { PodcastDetail } from '../features/subscriptions/PodcastDetail';
 import { SubscriptionsGrid } from '../features/subscriptions/SubscriptionsGrid';
 import { UpdateBanner } from '../features/updater/UpdateBanner';
@@ -138,6 +139,8 @@ export function Shell() {
         );
       case 'cloud-sync':
         return <CloudSyncSetup />;
+      case 'downloads':
+        return <DownloadsPage />;
       case 'root':
         switch (tab) {
           case 'subscriptions':

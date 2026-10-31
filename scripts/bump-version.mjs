@@ -56,7 +56,9 @@ patchIfExists('packages/host-android/src/default-deps.ts', (src) =>
   src.replace(/version = '[0-9]+\.[0-9]+\.[0-9]+';/, `version = '${nextVersion}';`),
 );
 patchIfExists('packages/ui/src/features/updater/updater.ts', (src) =>
-  src.replace(/currentVersion: '[0-9]+\.[0-9]+\.[0-9]+'/g, `currentVersion: '${nextVersion}'`),
+  src
+    .replace(/currentVersion: '[0-9]+\.[0-9]+\.[0-9]+'/g, `currentVersion: '${nextVersion}'`)
+    .replace(/appVersion \|\| '[0-9]+\.[0-9]+\.[0-9]+'/g, `appVersion || '${nextVersion}'`),
 );
 
 let nextVersionCode = 1;
