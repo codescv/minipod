@@ -35,6 +35,7 @@ export interface EpisodeRowProps {
   readonly feedImageUrl?: string | undefined;
   readonly allowDownloads: boolean;
   readonly showPodcastInfo?: boolean | undefined;
+  readonly removeWhenQueued?: boolean | undefined;
   readonly onOpenPodcast?: (() => void) | undefined;
   readonly onStartInlineRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
   readonly onRemove?: ((episodeKey: EpisodeKey) => void) | undefined;
@@ -51,6 +52,7 @@ export function EpisodeRow({
   feedTitle,
   feedImageUrl,
   allowDownloads,
+  removeWhenQueued,
   onOpenPodcast,
   onStartInlineRemove,
   onRemove,
@@ -95,31 +97,52 @@ export function EpisodeRow({
     if (isCurrent) {
       void player.togglePlayPause();
     } else {
+      if (removeWhenQueued) {
+        onRemove?.(episode.episodeKey);
+      }
       void player.playEpisode(episode, { feedTitle, feedImageUrl });
     }
   };
 
   const handlePlayNextWithUndo = async () => {
+    if (removeWhenQueued) {
+      onRemove?.(episode.episodeKey);
+    }
     await host.queue.playNext(episode.episodeKey);
     onChanged();
     showSnackbar(t('detail.addedPlayNext'), {
       action: {
         label: t('common.undo'),
         run: () => {
-          void host.queue.remove(episode.episodeKey).then(onChanged);
+          void (async () => {
+            await host.queue.remove(episode.episodeKey);
+            if (removeWhenQueued) {
+              onUndoRemove?.(episode.episodeKey);
+            }
+            onChanged();
+          })();
         },
       },
     });
   };
 
   const handleAddQueueWithUndo = async () => {
+    if (removeWhenQueued) {
+      onRemove?.(episode.episodeKey);
+    }
     await host.queue.add(episode.episodeKey);
     onChanged();
     showSnackbar(t('detail.addedToQueue'), {
       action: {
         label: t('common.undo'),
         run: () => {
-          void host.queue.remove(episode.episodeKey).then(onChanged);
+          void (async () => {
+            await host.queue.remove(episode.episodeKey);
+            if (removeWhenQueued) {
+              onUndoRemove?.(episode.episodeKey);
+            }
+            onChanged();
+          })();
         },
       },
     });
@@ -171,13 +194,19 @@ export function EpisodeRow({
   const handleSwipePlayNext = async () => {
     useSnackbarStore.getState().clear();
     clearInlineUndoTimer();
-    await host.queue.playNext(episode.episodeKey);
-    onChanged();
+    if (removeWhenQueued) {
+      onStartInlineRemove?.(episode.episodeKey);
+    }
     setInlineUndo({ kind: 'play-next' });
     inlineUndoTimerRef.current = setTimeout(() => {
       inlineUndoTimerRef.current = null;
       setInlineUndo(null);
+      if (removeWhenQueued) {
+        onRemove?.(episode.episodeKey);
+      }
     }, 4000);
+    await host.queue.playNext(episode.episodeKey);
+    onChanged();
   };
 
   const handleSwipeMarkPlayedAndRemove = async () => {
@@ -205,6 +234,7 @@ export function EpisodeRow({
     setInlineUndo(null);
     if (currentUndo.kind === 'play-next') {
       await host.queue.remove(episode.episodeKey);
+      onUndoRemove?.(episode.episodeKey);
       onChanged();
     } else {
       await host.progress.markPlayed(episode.episodeKey, false);
@@ -325,14 +355,19 @@ export function EpisodeRow({
 
   return (
     <>
-      {inlineUndo?.kind === 'marked-played' ? (
+      {inlineUndo?.kind === 'marked-played' ||
+      (inlineUndo?.kind === 'play-next' && removeWhenQueued) ? (
         <div
           className="m-inline-undo"
           role="status"
           aria-live="polite"
           data-testid={`inline-undo-${episode.episodeKey}`}
         >
-          <span className="m-inline-undo__text">{t('detail.markedPlayedRemovedSnack')}</span>
+          <span className="m-inline-undo__text">
+            {inlineUndo.kind === 'marked-played'
+              ? t('detail.markedPlayedRemovedSnack')
+              : t('detail.addedPlayNext')}
+          </span>
           <button
             type="button"
             className="m-inline-undo__btn"
@@ -418,7 +453,7 @@ export function EpisodeRow({
               )}
             </div>
           </div>
-          {inlineUndo?.kind === 'play-next' && (
+          {inlineUndo?.kind === 'play-next' && !removeWhenQueued && (
             <div
               className="m-inline-undo m-inline-undo--overlay"
               role="status"

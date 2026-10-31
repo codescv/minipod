@@ -110,12 +110,17 @@ export function recomputeHostTimelineAndDownloads(
   feeds: readonly Feed[],
   episodesByFeed: ReadonlyMap<FeedKey, readonly EpisodeRowModel[]>,
   inlineUndoKeys?: ReadonlySet<EpisodeKey>,
+  activeEpisodeKey?: EpisodeKey,
 ): {
   readonly timelineItems: readonly TimelineEpisodeItem[];
   readonly downloadedCount: number;
   readonly downloadedItems: readonly DownloadedEpisodeItem[];
 } {
   const canDownload = Boolean(host.info.capabilities.downloads);
+  const viewCache = getHostViewCache(host);
+  const queuedEpisodeKeys = new Set<EpisodeKey>(
+    viewCache.queueRows.map((q) => q.episode.episodeKey),
+  );
   const allItems: TimelineEpisodeItem[] = [];
 
   for (const feed of feeds) {
@@ -137,11 +142,18 @@ export function recomputeHostTimelineAndDownloads(
     });
 
   const timelineItems = allItems
-    .filter(
-      (item) =>
-        item.row.progress?.state !== 'PLAYED' ||
-        (inlineUndoKeys !== undefined && inlineUndoKeys.has(item.row.episode.episodeKey)),
-    )
+    .filter((item) => {
+      const epKey = item.row.episode.episodeKey;
+      if (inlineUndoKeys !== undefined && inlineUndoKeys.has(epKey)) {
+        return true;
+      }
+      if (item.row.progress?.state === 'PLAYED') return false;
+      if (item.row.progress?.state === 'IN_PROGRESS') return false;
+      if ((item.row.progress?.positionMs ?? 0) > 0) return false;
+      if (item.row.inQueue || queuedEpisodeKeys.has(epKey)) return false;
+      if (activeEpisodeKey !== undefined && epKey === activeEpisodeKey) return false;
+      return true;
+    })
     .sort((a, b) => {
       const pubDiff = (b.row.episode.pubDate ?? 0) - (a.row.episode.pubDate ?? 0);
       if (pubDiff !== 0) return pubDiff;

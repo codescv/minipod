@@ -1,9 +1,9 @@
 /**
- * Subscriptions screen (`DESIGN.md` §4.1 + v0.1.6 enhancements):
- * - 3-col mobile / 6-col desktop cover grid (zero unread badges)
- * - Collapsible subscriptions bar when > 6 feeds
+ * Subscriptions screen (`DESIGN.md` §4.1 + v0.1.12 enhancements):
+ * - Flexible multi-column cover grid (`computeSubscriptionsGridCols`, 4 cols on compact phones like OnePlus 13T, 6–8 cols on desktop, zero unread badges)
+ * - Collapsible subscriptions bar when > 2 rows (`MAX_SUBS_COLLAPSED_ROWS = 2`)
  * - Long-press (~450ms) / right-click / keyboard viewport-clamped context menu (no top-right `⋮` button)
- * - Latest Episodes Timeline (`最新单集`) directly below Subscriptions across all subscribed feeds
+ * - Latest Episodes Timeline (`最新单集`) directly below Subscriptions across all subscribed feeds, excluding played, in-progress/playing, and queued episodes
  * - Manual `⟳` refresh + direct top-right Settings button + touch pull-to-refresh + `.opml` / `.xml` drag-and-drop import
  */
 import {
@@ -11,6 +11,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type CSSProperties as ReactCssProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -33,6 +34,7 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { preloadArtworkUrls } from '../../lib/artwork-cache';
+import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar } from '../../stores/snackbar';
 import {
   DEFAULT_TIMELINE_LIMIT,
@@ -43,10 +45,31 @@ import {
 import { openOpmlImportWithXml } from '../add/OpmlImport';
 import { EpisodeRow } from './EpisodeRow';
 
-const GRID_COLLAPSE_THRESHOLD = 6;
+export const MAX_SUBS_COLLAPSED_ROWS = 2;
 const TIMELINE_PAGE_SIZE = DEFAULT_TIMELINE_LIMIT;
 const LONG_PRESS_DELAY_MS = 450;
 const LONG_PRESS_MOVE_SLOP_PX = 10;
+
+export function computeSubscriptionsGridCols(
+  viewportWidth: number,
+  containerWidth?: number,
+): number {
+  const safeViewport = Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 390;
+  const isDesktopViewport = safeViewport >= 840;
+  const measuredWidth =
+    containerWidth !== undefined && Number.isFinite(containerWidth) && containerWidth > 0
+      ? containerWidth
+      : undefined;
+
+  if (isDesktopViewport) {
+    const availWidth =
+      measuredWidth ?? Math.min(1120, Math.max(600, safeViewport - 84)) - 56;
+    return Math.max(4, Math.min(10, Math.floor((availWidth + 14) / (120 + 14))));
+  }
+
+  const availWidth = measuredWidth ?? Math.max(240, safeViewport - 32);
+  return Math.max(3, Math.min(8, Math.floor((availWidth + 10) / (74 + 10))));
+}
 
 interface ActiveFeedContextMenu {
   readonly feed: Feed;
@@ -156,8 +179,12 @@ function useLongPressHandlers({
 export function SubscriptionsGrid() {
   const host = useHost();
   const t = useT();
+  const player = usePlayer();
   const isDesktop = useIsDesktop();
   const allowProxy = shouldUseImageProxy(host.info.platform);
+  const activeEpisodeKey = player.episode?.episodeKey;
+  const activeEpisodeKeyRef = useRef<EpisodeKey | undefined>(activeEpisodeKey);
+  activeEpisodeKeyRef.current = activeEpisodeKey;
 
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const openAdd = useRouteStore((s) => s.openAdd);
@@ -178,7 +205,11 @@ export function SubscriptionsGrid() {
   const [refreshing, setRefreshing] = useState(false);
   const [authFailedKeys, setAuthFailedKeys] = useState<ReadonlySet<FeedKey>>(() => new Set());
   const [dragOver, setDragOver] = useState(false);
+  const [gridCols, setGridCols] = useState<number>(() =>
+    computeSubscriptionsGridCols(typeof window !== 'undefined' ? window.innerWidth : 390),
+  );
 
+  const subsGridRef = useRef<HTMLDivElement | null>(null);
   const pullStartYRef = useRef<number | null>(null);
   const loadSeqRef = useRef(0);
   const inlineUndoKeysRef = useRef<Set<EpisodeKey>>(new Set());
@@ -190,6 +221,58 @@ export function SubscriptionsGrid() {
   useEffect(() => {
     getHostViewCache(host).timelineLimit = timelineLimit;
   }, [host, timelineLimit]);
+
+  useEffect(() => {
+    const undoKeys = inlineUndoKeysRef.current;
+    return () => {
+      if (undoKeys.size > 0) {
+        const cache = getHostViewCache(host);
+        cache.timelineItems = cache.timelineItems.filter(
+          (entry) => !undoKeys.has(entry.row.episode.episodeKey),
+        );
+        undoKeys.clear();
+      }
+    };
+  }, [host]);
+
+  useEffect(() => {
+    if (!activeEpisodeKey) return;
+    if (inlineUndoKeysRef.current.has(activeEpisodeKey)) return;
+    setTimelineItems((prev) => {
+      if (!prev.some((entry) => entry.row.episode.episodeKey === activeEpisodeKey)) {
+        return prev;
+      }
+      const next = prev.filter((entry) => entry.row.episode.episodeKey !== activeEpisodeKey);
+      getHostViewCache(host).timelineItems = next;
+      return next;
+    });
+  }, [activeEpisodeKey, host]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const updateCols = () => {
+      const el = subsGridRef.current;
+      const rectWidth = el ? el.getBoundingClientRect().width : 0;
+      const next = computeSubscriptionsGridCols(
+        window.innerWidth,
+        rectWidth > 0 ? rectWidth : undefined,
+      );
+      setGridCols((prev) => (prev === next ? prev : next));
+    };
+    updateCols();
+    window.addEventListener('resize', updateCols);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && subsGridRef.current) {
+      observer = new ResizeObserver(() => {
+        updateCols();
+      });
+      observer.observe(subsGridRef.current);
+    }
+    return () => {
+      window.removeEventListener('resize', updateCols);
+      observer?.disconnect();
+    };
+  }, [feeds.length]);
 
   const loadFeedsAndTimeline = useCallback(async () => {
     const seq = ++loadSeqRef.current;
@@ -243,18 +326,26 @@ export function SubscriptionsGrid() {
         return;
       }
 
-      const perFeed = await Promise.all(
-        list.map(async (feed) => {
-          try {
-            const page = await host.episodes.list(feed.feedKey, 'all');
-            return { feed, items: page.items };
-          } catch {
-            return { feed, items: [] as readonly EpisodeRowModel[] };
-          }
-        }),
-      );
+      const [perFeed, latestQueue] = await Promise.all([
+        Promise.all(
+          list.map(async (feed) => {
+            try {
+              const page = await host.episodes.list(feed.feedKey, 'all');
+              return { feed, items: page.items };
+            } catch {
+              return { feed, items: [] as readonly EpisodeRowModel[] };
+            }
+          }),
+        ),
+        host.queue.list().catch(() => null),
+      ]);
 
       if (seq !== loadSeqRef.current) return;
+
+      if (latestQueue !== null) {
+        viewCache.queueRows = latestQueue;
+        viewCache.queueLoaded = true;
+      }
 
       const activeFeedKeys = new Set(list.map((f) => f.feedKey));
       for (const existingKey of viewCache.episodesByFeed.keys()) {
@@ -271,6 +362,7 @@ export function SubscriptionsGrid() {
         list,
         viewCache.episodesByFeed,
         inlineUndoKeysRef.current,
+        activeEpisodeKeyRef.current,
       );
       viewCache.timelineItems = derived.timelineItems;
       viewCache.downloadedCount = derived.downloadedCount;
@@ -384,8 +476,9 @@ export function SubscriptionsGrid() {
     },
   ];
 
-  const canCollapse = feeds.length > GRID_COLLAPSE_THRESHOLD;
-  const visibleFeeds = canCollapse && !subsExpanded ? feeds.slice(0, GRID_COLLAPSE_THRESHOLD) : feeds;
+  const collapseThreshold = gridCols * MAX_SUBS_COLLAPSED_ROWS;
+  const canCollapse = feeds.length > collapseThreshold;
+  const visibleFeeds = canCollapse && !subsExpanded ? feeds.slice(0, collapseThreshold) : feeds;
 
   return (
     <div
@@ -468,7 +561,13 @@ export function SubscriptionsGrid() {
       ) : (
         <>
           <div className="m-subs-section">
-            <div className="m-subs-grid" data-testid="subs-grid">
+            <div
+              ref={subsGridRef}
+              className="m-subs-grid"
+              data-testid="subs-grid"
+              data-grid-cols={gridCols}
+              style={{ '--subs-grid-cols': String(gridCols) } as ReactCssProperties}
+            >
               {visibleFeeds.map((feed) => (
                 <PodcastTile
                   key={feed.feedKey}
@@ -534,6 +633,7 @@ export function SubscriptionsGrid() {
                         feedImageUrl={item.feed.imageUrl}
                         allowDownloads={item.allowDownloads}
                         showPodcastInfo
+                        removeWhenQueued
                         onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
                         onStartInlineRemove={(epKey) => {
                           inlineUndoKeysRef.current.add(epKey);

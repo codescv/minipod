@@ -2,6 +2,10 @@ import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { shouldUseImageProxy } from '../components/m3';
 import {
+  computeSubscriptionsGridCols,
+  MAX_SUBS_COLLAPSED_ROWS,
+} from '../features/subscriptions/SubscriptionsGrid';
+import {
   clearArtworkCacheForTests,
   getRememberedCandidateIndex,
   isArtworkLoaded,
@@ -66,35 +70,45 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(await screen.findByTestId('snackbar')).toHaveTextContent(/Minimalist Design Radio/);
   });
 
-  it('renders Latest Episodes timeline filtered to unplayed sorted by pubDate DESC, removes on right-swipe, navigates to podcast from context menu, and paginates >30 episodes', async () => {
-    const { host } = renderMiniPod({ width: 1024 });
+  it('renders Latest Episodes timeline excluding played, in-progress/playing & queued episodes, removes immediately on tap-to-play or swipe-left Play Next (with Undo), removes on right-swipe, and paginates >30 episodes', async () => {
+    const { host, engine } = renderMiniPod({ width: 1024 });
 
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
     const timeline = await screen.findByTestId('subs-timeline-section');
     expect(timeline).toHaveTextContent('Latest episodes');
 
-    // Collect unplayed episodes across subscribed feeds and verify strict pubDate DESC order
+    // Collect unplayed, unstarted & unqueued episodes across subscribed feeds and verify strict pubDate DESC order
     const subscribedFeeds = await host.feeds.list();
-    const unplayedPages = await Promise.all(
-      subscribedFeeds.map((f) => host.episodes.list(f.feedKey, 'unplayed')),
+    const allPages = await Promise.all(
+      subscribedFeeds.map((f) => host.episodes.list(f.feedKey, 'all')),
     );
-    const expectedOrder = unplayedPages
-      .flatMap((p) => p.items.map((i) => i.episode))
+    const expectedOrder = allPages
+      .flatMap((p) =>
+        p.items
+          .filter(
+            (i) =>
+              i.progress?.state !== 'PLAYED' &&
+              i.progress?.state !== 'IN_PROGRESS' &&
+              (i.progress?.positionMs ?? 0) <= 0 &&
+              !i.inQueue,
+          )
+          .map((i) => i.episode),
+      )
       .sort((a, b) => {
         const diff = (b.pubDate ?? 0) - (a.pubDate ?? 0);
         return diff !== 0 ? diff : a.episodeKey.localeCompare(b.episodeKey);
       });
 
-    // Played episode 41 (`41: Parsing 15 Years`) is excluded from Timeline (`7` unplayed instead of `8` total)
-    expect(expectedOrder).toHaveLength(7);
-    expect(screen.queryByText(/41: Parsing 15 Years/)).not.toBeInTheDocument();
-    expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent(
-      String(expectedOrder.length),
-    );
+    // Played ep 41, in-progress/queued ep 42, and queued kt-18 & mdr-09 are excluded -> 4 episodes remain
+    expect(expectedOrder).toHaveLength(4);
+    const timelineList = screen.getByTestId('subs-timeline-list');
+    expect(within(timelineList).queryByText(/41: Parsing 15 Years/)).not.toBeInTheDocument();
+    expect(within(timelineList).queryByText(/42: Zero-Backend Sync/)).not.toBeInTheDocument();
+    expect(within(timelineList).queryByText(/Vol\.18/)).not.toBeInTheDocument();
+    expect(within(timelineList).queryByText(/09: Dynamic Color/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('4');
 
-    const renderedRows = within(screen.getByTestId('subs-timeline-list')).getAllByTestId(
-      /^episode-row-/,
-    );
+    const renderedRows = within(timelineList).getAllByTestId(/^episode-row-/);
     expect(renderedRows.map((el) => el.getAttribute('data-testid'))).toEqual(
       expectedOrder.map((ep) => `episode-row-${ep.episodeKey}`),
     );
@@ -102,8 +116,23 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     // Every timeline row has 0 inline buttons
     expect(renderedRows[0]!.querySelectorAll('button')).toHaveLength(0);
 
-    // Swipe right on first timeline row replaces it in-place with inline Undo (no bottom snackbar), and Undo restores it
+    // Swipe left (Play Next) on first timeline row replaces it in-place with inline Undo (`Playing next`), and Undo removes from queue & restores it in timeline
     const firstEp = expectedOrder[0]!;
+    const firstRowForPlayNext = screen.getByTestId(`episode-row-${firstEp.episodeKey}`);
+    fireEvent.touchStart(firstRowForPlayNext, { touches: [{ clientX: 260, clientY: 160 }] });
+    fireEvent.touchMove(firstRowForPlayNext, { touches: [{ clientX: 150, clientY: 161 }] });
+    fireEvent.touchEnd(firstRowForPlayNext, { changedTouches: [{ clientX: 140, clientY: 161 }] });
+
+    expect(await screen.findByTestId(`inline-undo-${firstEp.episodeKey}`)).toHaveTextContent(
+      'Playing next',
+    );
+    expect(screen.queryByTestId(`episode-row-${firstEp.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('snackbar')).toBeNull();
+
+    fireEvent.click(screen.getByTestId(`inline-undo-btn-${firstEp.episodeKey}`));
+    expect(await screen.findByTestId(`episode-row-${firstEp.episodeKey}`)).toBeInTheDocument();
+
+    // Swipe right on first timeline row replaces it in-place with inline Undo (no bottom snackbar), and Undo restores it
     const firstTimelineRowEl = screen.getByTestId(`episode-row-${firstEp.episodeKey}`);
     fireEvent.touchStart(firstTimelineRowEl, { touches: [{ clientX: 80, clientY: 160 }] });
     fireEvent.touchMove(firstTimelineRowEl, { touches: [{ clientX: 190, clientY: 161 }] });
@@ -117,6 +146,15 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
 
     fireEvent.click(screen.getByTestId(`inline-undo-btn-${firstEp.episodeKey}`));
     expect(await screen.findByTestId(`episode-row-${firstEp.episodeKey}`)).toBeInTheDocument();
+
+    // Tapping the last timeline episode starts playback and immediately removes it from Latest episodes on frame 0 (`4 -> 3`)
+    const tappedEp = expectedOrder[3]!;
+    fireEvent.click(screen.getByTestId(`episode-row-${tappedEp.episodeKey}`));
+    expect(screen.queryByTestId(`episode-row-${tappedEp.episodeKey}`)).not.toBeInTheDocument();
+    expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('3');
+    await waitFor(() => {
+      expect(engine.getSnapshot().episodeKey).toBe(tappedEp.episodeKey);
+    });
 
     // Opening podcast from timeline episode's context menu (`Go to podcast`) navigates to PodcastDetail
     fireEvent.contextMenu(screen.getByTestId(`episode-row-${firstEp.episodeKey}`), {
@@ -138,9 +176,9 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
       await host.feeds.subscribeMany(extraUrls);
     });
 
-    // Each extra preview feed adds 2 unplayed episodes -> 7 + 28 = 35 > 30
+    // Each extra preview feed adds 2 unplayed & unqueued episodes -> 3 + 28 = 31 > 30
     await waitFor(() => {
-      expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('35');
+      expect(screen.getByTestId('subs-timeline-count')).toHaveTextContent('31');
     });
     expect(
       within(screen.getByTestId('subs-timeline-list')).getAllByTestId(/^episode-row-/).length,
@@ -151,7 +189,7 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     await waitFor(() => {
       expect(
         within(screen.getByTestId('subs-timeline-list')).getAllByTestId(/^episode-row-/).length,
-      ).toBe(35);
+      ).toBe(31);
     });
     expect(screen.queryByTestId('subs-timeline-load-more')).not.toBeInTheDocument();
   });
@@ -217,41 +255,52 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(reappearedBtn.getAttribute('aria-label')).toBe('管理下载 (1)');
   });
 
-  it('collapses >6 subscriptions in grid mode with Show all (N) / Show less toggle', async () => {
+  it('computes flexible multi-column cover grid and collapses after 2 rows (12 on 6-col desktop, 8 on 4-col phone like OnePlus 13T) with Show all (N) / Show less toggle', async () => {
+    expect(MAX_SUBS_COLLAPSED_ROWS).toBe(2);
+    // Compact phones (360px, 390px OnePlus 13T, 412px) -> 4 columns per row (8 max before collapse)
+    expect(computeSubscriptionsGridCols(320)).toBe(3);
+    expect(computeSubscriptionsGridCols(360)).toBe(4);
+    expect(computeSubscriptionsGridCols(390)).toBe(4);
+    expect(computeSubscriptionsGridCols(412)).toBe(4);
+    expect(computeSubscriptionsGridCols(480)).toBe(5);
+    expect(computeSubscriptionsGridCols(600)).toBe(6);
+    // Desktop viewports -> 5..8 columns per row
+    expect(computeSubscriptionsGridCols(840)).toBe(5);
+    expect(computeSubscriptionsGridCols(1024)).toBe(6);
+    expect(computeSubscriptionsGridCols(1160)).toBe(7);
+    expect(computeSubscriptionsGridCols(1280)).toBe(8);
+
     const { host } = renderMiniPod({ width: 1024 });
     expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-grid').getAttribute('data-grid-cols')).toBe('6');
 
     // With 3 feeds, no expand toggle is shown
     expect(screen.queryByTestId('subs-expand-toggle')).not.toBeInTheDocument();
 
-    // Subscribe to 5 more feeds -> total 8 feeds (> 6 grid threshold)
+    // Subscribe to 11 more feeds -> total 14 feeds (> 12 threshold for 2 rows × 6 cols on 1024px desktop)
     await act(async () => {
-      await host.feeds.subscribeMany([
-        'https://feeds.example.org/alpha-cast.xml',
-        'https://feeds.example.org/beta-cast.xml',
-        'https://feeds.example.org/gamma-cast.xml',
-        'https://feeds.example.org/delta-cast.xml',
-        'https://feeds.example.org/epsilon-cast.xml',
-      ]);
+      await host.feeds.subscribeMany(
+        Array.from({ length: 11 }, (_, i) => `https://feeds.example.org/desk-cast-${i + 1}.xml`),
+      );
     });
 
     const expandToggle = await screen.findByTestId('subs-expand-toggle');
-    expect(expandToggle).toHaveTextContent('Show all (8)');
-    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(6);
+    expect(expandToggle).toHaveTextContent('Show all (14)');
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(12);
 
-    // Expand all 8
+    // Expand all 14
     fireEvent.click(expandToggle);
     expect(expandToggle).toHaveTextContent('Show less');
-    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(14);
 
-    // Collapse back to 6
+    // Collapse back to 12 (2 rows × 6 cols)
     fireEvent.click(expandToggle);
-    expect(expandToggle).toHaveTextContent('Show all (8)');
-    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(6);
+    expect(expandToggle).toHaveTextContent('Show all (14)');
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(12);
 
-    // Re-expand all 8 and verify switching tabs (Subscriptions -> Queue -> Settings -> Subscriptions) preserves expanded state & renders synchronously on frame 0
+    // Re-expand all 14 and verify switching tabs (Subscriptions -> Queue -> Settings -> Subscriptions) preserves expanded state & renders synchronously on frame 0
     fireEvent.click(expandToggle);
-    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(14);
 
     fireEvent.click(screen.getByTestId('nav-rail-queue'));
     expect(screen.getByTestId('queue-screen')).toBeInTheDocument();
@@ -264,17 +313,20 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
 
     fireEvent.click(screen.getByTestId('nav-rail-subscriptions'));
     expect(screen.getByTestId('subscriptions-screen')).toBeInTheDocument();
-    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(14);
     expect(screen.getByTestId('subs-timeline-list')).toBeInTheDocument();
     expect(screen.queryByTestId('subs-empty')).not.toBeInTheDocument();
   });
 
-  it('localizes timeline and expandable subscriptions labels in zh-CN', async () => {
+  it('shows 4 covers per row (max 2 rows = 8 covers before collapsing) on compact phone screens (390px) and localizes labels in zh-CN', async () => {
     const { host } = renderMiniPod({
       width: 390,
       hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
     });
     expect(await screen.findByText('最新单集')).toBeInTheDocument();
+    expect(screen.getByTestId('subs-grid').getAttribute('data-grid-cols')).toBe('4');
+
+    // Subscribe to 5 more feeds -> total 8 feeds (exact 2 rows × 4 cols = 8 -> NOT collapsed yet!)
     await act(async () => {
       await host.feeds.subscribeMany([
         'https://feeds.example.org/zh-1.xml',
@@ -284,10 +336,22 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
         'https://feeds.example.org/zh-5.xml',
       ]);
     });
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
+    expect(screen.queryByTestId('subs-expand-toggle')).not.toBeInTheDocument();
+
+    // Subscribe to 2 more feeds -> total 10 feeds (> 8 threshold for 2 rows × 4 cols)
+    await act(async () => {
+      await host.feeds.subscribeMany([
+        'https://feeds.example.org/zh-6.xml',
+        'https://feeds.example.org/zh-7.xml',
+      ]);
+    });
     const zhToggle = await screen.findByTestId('subs-expand-toggle');
-    expect(zhToggle).toHaveTextContent('展开全部 (8)');
+    expect(zhToggle).toHaveTextContent('展开全部 (10)');
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(8);
     fireEvent.click(zhToggle);
     expect(zhToggle).toHaveTextContent('收起');
+    expect(within(screen.getByTestId('subs-grid')).getAllByTestId(/^feed-tile-/).length).toBe(10);
   });
 
   it('opens viewport-clamped context menu on ~450ms long-press (suppressing click & cancelling on pointer move) and clamps Menu near screen edges', async () => {

@@ -33,6 +33,7 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { stripHtmlToText } from '../../lib/format';
+import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar } from '../../stores/snackbar';
 import {
   filterCachedEpisodeRows,
@@ -44,8 +45,11 @@ import { EpisodeRow } from './EpisodeRow';
 export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const host = useHost();
   const t = useT();
+  const player = usePlayer();
   const openDownloads = useRouteStore((s) => s.openDownloads);
   const downloadedCount = useDownloadedCount();
+  const activeEpisodeKeyRef = useRef<EpisodeKey | undefined>(player.episode?.episodeKey);
+  activeEpisodeKeyRef.current = player.episode?.episodeKey;
 
   const [feed, setFeed] = useState<Feed | null>(
     () => getHostViewCache(host).feedsByKey.get(feedKey) ?? null,
@@ -103,11 +107,16 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     try {
       const fetchFilter: EpisodeFilter =
         filter === 'unplayed' && inlineUndoKeysRef.current.size > 0 ? 'all' : filter;
-      const [loadedFeed, page] = await Promise.all([
+      const [loadedFeed, page, latestQueue] = await Promise.all([
         host.feeds.get(feedKey),
         host.episodes.list(feedKey, fetchFilter),
+        host.queue.list().catch(() => null),
       ]);
       const viewCache = getHostViewCache(host);
+      if (latestQueue !== null) {
+        viewCache.queueRows = latestQueue;
+        viewCache.queueLoaded = true;
+      }
       const nextFeedsByKey = new Map(viewCache.feedsByKey);
       nextFeedsByKey.set(feedKey, loadedFeed);
       viewCache.feedsByKey = nextFeedsByKey;
@@ -123,6 +132,8 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
             host,
             viewCache.feeds,
             viewCache.episodesByFeed,
+            undefined,
+            activeEpisodeKeyRef.current,
           );
           viewCache.timelineItems = derived.timelineItems;
           viewCache.downloadedCount = derived.downloadedCount;
@@ -147,6 +158,8 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
                 host,
                 c.feeds,
                 c.episodesByFeed,
+                undefined,
+                activeEpisodeKeyRef.current,
               );
               c.timelineItems = derived.timelineItems;
               c.downloadedCount = derived.downloadedCount;
