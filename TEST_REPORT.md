@@ -1,10 +1,10 @@
 # Podcasts (`codescv/minipod`) — Integration, E2E, Cloud Sync, Auto-Updater & Android APK Test Report
 
 - **Date**: 2026-10-31
-- **Version Verified**: `0.1.5` (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 6`)
+- **Version Verified**: `0.1.6` (`dev.minipod.app`, `application-label: 'Podcasts'`, `versionCode 7`)
 - **Live Repository & Release**:
-  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.5`)
-  - Release `v0.1.5`: <https://github.com/codescv/minipod/releases/tag/v0.1.5>
+  - Repository: <https://github.com/codescv/minipod> (`origin main` + tag `v0.1.6`)
+  - Release `v0.1.6`: <https://github.com/codescv/minipod/releases/tag/v0.1.6>
   - Release API: `https://api.github.com/repos/codescv/minipod/releases/latest` (`200 OK`)
 - **Environment**:
   - OS: Linux (`x86_64`)
@@ -20,18 +20,18 @@
 | Verification Gate | Result | Summary |
 | :--- | :---: | :--- |
 | **1. Static Typecheck (`pnpm typecheck`)** | **PASS** | `0` errors across `@minipod/core`, `@minipod/ui`, `@minipod/host-node`, `@minipod/host-android` (`strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`) |
-| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **28 / 28 test files**, **115 / 115 tests passed** (incl. randomized multi-device CRDT property tests, `<podcast:images>` / `<item><image>` artwork parsing, `/api/image-proxy`, gesture-first `EpisodeRow` & `QueueList`, pointer-drag queue reorder, conditional `Manage downloads` / `DownloadsPage`, `Podcasts` branding across `en` / `zh-CN` / `ja`, & cross-platform auto-updater suites) |
+| **2. Unit, Property & Integration Suite (`pnpm test`)** | **PASS** | **28 / 28 test files**, **117 / 117 tests passed** (incl. randomized multi-device CRDT property tests, `<podcast:images>` / `<item><image>` artwork parsing, `/api/image-proxy` RAM+disk cache & ETag `304`, gesture-first `EpisodeRow` & `QueueList` with live swipe edge hints, live item-following pointer-drag queue reorder with neighbor slot shifting, grid-only `SubscriptionsGrid` with top-right `subs-settings-btn`, conditional `Manage downloads` / `DownloadsPage`, `Podcasts` branding across `en` / `zh-CN` / `ja`, & cross-platform auto-updater suites) |
 | **3. Zero-Native-Addon Gate (`pnpm check:native`)** | **PASS** | **0** `.node` binaries, **0** `binding.gyp`, **0** native build scripts across runtime tree |
 | **4. Production Web + Server Bundles (`pnpm build`)** | **PASS** | Built `@minipod/host-node` (`dist/server.mjs` + `dist/web` with `favicon.svg`, `icon-light-192.png`, `icon-dark-192.png`) & `@minipod/host-android` (`www` with adaptive icons) |
-| **5. Live Server & Playwright Browser E2E** | **PASS** | **83 / 83 end-to-end checks passed** (`39` core/UI/sync/updater E2E + `11` `v0.1.3` Timeline/Background/Artwork E2E + `12` `v0.1.4` `Podcasts` branding & 7A/7B adaptive icon E2E + `21` `v0.1.5` gesture `EpisodeRow`, pointer-drag `QueueList`, & conditional `Manage downloads` E2E checks; `[data-settings-row]` strictly `9`) |
-| **6. Standalone Android APK (`v0.1.5`) & Adaptive Icon / Background Playback** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.5.apk` (`7,120,468` bytes, `application-label:'Podcasts'`, `versionCode='6'`, `versionName='0.1.5'`, APK Signature v2, day/night `ic_launcher_background` `#F4F1EA` / `#18181B`, `ic_launcher_arcs` `#1C1917` / `#F4F4F5`, `ic_launcher_dot` `#FF4F00`, `ic_launcher_foreground_vector`, `ic_launcher_monochrome`, `mipmap-*` & `mipmap-night-*`) |
-| **7. Live Public GitHub Repository & Release (`v0.1.5`)** | **PASS** | Published `main` + annotated tag `v0.1.5` + GitHub Release `v0.1.5` with `minipod-v0.1.5.apk`, `app-release.apk`, and `minipod-v0.1.5-pc.tar.gz` |
+| **5. Live Server & Playwright Browser E2E** | **PASS** | **98 / 98 end-to-end checks passed** (`39` core/UI/sync/updater E2E + `11` `v0.1.3` Timeline/Background/Artwork E2E + `12` `v0.1.4` `Podcasts` branding & 7A/7B adaptive icon E2E + `21` `v0.1.5` gesture `EpisodeRow`, pointer-drag `QueueList`, & conditional `Manage downloads` E2E + `15` `v0.1.6` swipe edge hints, live item-following queue drag reorder, removed queue overflow menu, grid-only Subscriptions + `subs-settings-btn`, & 3-layer artwork cache E2E checks; `[data-settings-row]` strictly `9`) |
+| **6. Standalone Android APK (`v0.1.6`) & Adaptive Icon / Background Playback / Native Artwork Cache** | **PASS** | Built & verified `app-release.apk` / `minipod-v0.1.6.apk` (`7,125,400` bytes, `application-label:'Podcasts'`, `versionCode='7'`, `versionName='0.1.6'`, APK Signature v2, `BridgeWebViewClient.shouldInterceptRequest` native disk artwork cache, day/night `ic_launcher_background` `#F4F1EA` / `#18181B`, `ic_launcher_arcs` `#1C1917` / `#F4F4F5`, `ic_launcher_dot` `#FF4F00`, `ic_launcher_foreground_vector`, `ic_launcher_monochrome`, `mipmap-*` & `mipmap-night-*`) |
+| **7. Live Public GitHub Repository & Release (`v0.1.6`)** | **PASS** | Published `main` + annotated tag `v0.1.6` + GitHub Release `v0.1.6` with `minipod-v0.1.6.apk`, `app-release.apk`, and `minipod-v0.1.6-pc.tar.gz` |
 
 ---
 
 ## 1. Unit, Property-Based CRDT & Package Integration Suite (`pnpm test`)
 
-All **28 test suites (115 tests)** execute cleanly under Vitest `4.1.12`:
+All **28 test suites (117 tests)** execute cleanly under Vitest `4.1.12`:
 
 | Package | Test File | Tests | Key Coverage |
 | :--- | :--- | :---: | :--- |
@@ -47,7 +47,7 @@ All **28 test suites (115 tests)** execute cleanly under Vitest `4.1.12`:
 | `@minipod/host-node` | `src/db/SqliteSyncStore.test.ts` | 2 | `node:sqlite` WAL migrations, `SqliteSyncStore` transactional snapshot/apply, synced queue stub materialization, permanent feed move re-keying |
 | `@minipod/host-node` | `src/feeds/local-folder.test.ts` | 1 | Desktop `local-folder:` scanning, natural episode sort, embedded ID3/MP4 tag extraction, `folder.jpg` cover detection |
 | `@minipod/host-node` | `src/net/fetcher.test.ts` | 3 | Manual redirect chain capture, Basic Auth ISO-8859-1/UTF-8 challenge retry, `maxBodyBytes` streaming abort |
-| `@minipod/host-node` | `src/net/range-proxy.test.ts` | 3 | `/media/:episodeKey` local & remote HTTP `206 Partial Content`, `416 Range Not Satisfiable`, `HEAD`, Basic Auth header forwarding, ID3 `APIC` chapter image byte-slice streaming |
+| `@minipod/host-node` | `src/net/range-proxy.test.ts` | 4 | `/media/:episodeKey` local & remote HTTP `206 Partial Content`, `416 Range Not Satisfiable`, `HEAD`, Basic Auth header forwarding, ID3 `APIC` chapter image byte-slice streaming, `/api/image-proxy` persistent disk cache (`<dataDir>/artwork-cache`), `Cache-Control: immutable`, `ETag` `304 Not Modified`, and concurrent in-flight deduplication |
 | `@minipod/host-node` | `src/sync/LocalFolderFileProvider.test.ts` | 2 | Atomic `.tmp` + `fsync` + `rename` writes, SHA-256 `ETag` conditional checks, concurrent `conflict` detection |
 | `@minipod/host-node` | `src/server/server.test.ts` | 3 | Loopback `Host` DNS-rebinding (`403`), `Origin` CSRF (`403`), JSON `Content-Type` (`415`) guards, XML OPML import, single-fetch preview->subscribe, `/media` `206`, `/api/image-proxy` (`200` / hotlink bypass / `400` / `502` HTML error rejection), auto-delete download when played, SSE events, `flush: true` sync |
 | `@minipod/host-node` | `src/updater/self-updater.test.ts` | 3 | `parseCliArgs` (`update`, `--check`, `--force`), `POST /api/update/check` & `POST /api/update/apply` via `git pull --ff-only` in git worktrees, and atomic release tarball download outside git |
@@ -56,10 +56,10 @@ All **28 test suites (115 tests)** execute cleanly under Vitest `4.1.12`:
 | `@minipod/host-android` | `src/player/NativeAudioEngine.test.ts` | 1 | Media3 native service bridge (`nativeLoad`, `nativeSetQueue`, `nativeSetSleepTimer`, `nativeAdvanced` events) |
 | `@minipod/host-android` | `src/sync/SafFileProvider.test.ts` | 1 | Android SAF `content://` tree atomic sync file read/write & ETag probing |
 | `@minipod/host-android` | `src/capacitor-host.test.ts` | 4 | End-to-end `createCapacitorPlatformHost` native journal reconciliation, SAF local-folder + `APIC` chapter `data:` URLs + `ACTION_SEND` extraction, blank `imageUrl` fallback in `buildRemainingQueueSources`, and native GitHub release check + `downloadAndInstallApk` / `installApkFile` bridge |
-| `@minipod/ui` | `src/__tests__/subscriptions-and-back.test.tsx` | 8 | Adaptive `NavRail` vs `NavBar`, cover grid/list toggle, collapsible subscriptions (`> 6` grid / `> 4` list), unplayed Latest Episodes Timeline (`pubDate` DESC + right-swipe played dismiss + context menu podcast navigation), conditional `Manage downloads` (`subs-manage-downloads`) & `DownloadsPage` cleanup, ~450ms long-press & `onContextMenu` viewport-clamped `ContextMenu`, empty state, LIFO back navigation stack |
+| `@minipod/ui` | `src/__tests__/subscriptions-and-back.test.tsx` | 9 | Adaptive `NavRail` vs `NavBar`, grid-only subscriptions (`subs-grid`, `subs-list` & `subs-overflow-btn` absent), top-right `subs-settings-btn` direct Settings navigation, collapsible subscriptions (`> 6` grid), unplayed Latest Episodes Timeline (`pubDate` DESC + right-swipe played dismiss + context menu podcast navigation), conditional `Manage downloads` (`subs-manage-downloads`) & `DownloadsPage` swipe-left delete, ~450ms long-press & `onContextMenu` viewport-clamped `ContextMenu`, empty state, LIFO back navigation stack, and `artwork-cache.ts` LRU pin pool + candidate memory |
 | `@minipod/ui` | `src/__tests__/add-search-preview.test.tsx` | 5 | Top Charts country selector, federated source chips, HTML multi-feed radio disambiguation, 401 Basic Auth inline form, unsubscribed tap-to-stream preview & long-press `preview-ep-context-menu` |
-| `@minipod/ui` | `src/__tests__/podcast-detail.test.tsx` | 1 | `All` / `Unplayed` / `Downloaded` filter chips, 3s rewind resume, 4-element `EpisodeRow` (0 inline buttons, tap-to-play, long-press `ep-context-menu`, swipe-left `playNext`, swipe-right mark played & immediate dismiss + `Undo`), `loadOlder` pagination |
-| `@minipod/ui` | `src/__tests__/queue.test.tsx` | 1 | 0 inline buttons, tap-to-play, long-press `queue-context-menu`, compact `20×36px` pointer-drag reorder (`pointerdown` -> `pointermove` -> `pointerup`), swipe-left remove + `Undo` snackbar, synced stub display, Clear Queue |
+| `@minipod/ui` | `src/__tests__/podcast-detail.test.tsx` | 1 | `All` / `Unplayed` / `Downloaded` filter chips, 3s rewind resume, 4-element `EpisodeRow` (0 inline buttons, tap-to-play, long-press `ep-context-menu`, swipe-left `swipe-hint-left-*` `Play next` + `data-swipe-armed`, swipe-right `swipe-hint-right-*` `Mark played` & immediate dismiss + `Undo`), `loadOlder` pagination |
+| `@minipod/ui` | `src/__tests__/queue.test.tsx` | 1 | 0 inline buttons, 0 `queue-overflow-btn`, tap-to-play, long-press `queue-context-menu`, compact `20×36px` live item-following pointer-drag reorder (`data-drag-offset-y` + neighbor `data-shift-y`), swipe-left `swipe-hint-left-*` `Remove` + `Undo` snackbar, synced stub display |
 | `@minipod/ui` | `src/__tests__/player-and-engine.test.tsx` | 6 | Desktop transport, speed cycle & slider (`0.5x–3.0x`), keyboard shortcuts, active chapter highlight & seek, XSS-safe shownotes, `SleepTimer` 60s fade-out, `<ArtworkImage>` fallback + `/api/image-proxy` on `ExpandedPlayer` / `MiniPlayer` / `DesktopPlayerBar`, and persistent `document.body` video/audio media park across `ExpandedPlayer` close |
 | `@minipod/ui` | `src/__tests__/settings-and-sync.test.tsx` | 3 | Strict 9-row Settings invariant, Cloud Sync provider setup flows, EN / `zh-CN` runtime switching |
 | `@minipod/ui` | `src/__tests__/updater.test.tsx` | 3 | Throttled startup check + `<UpdateBanner />` per-version dismiss, Android `apkDownloadProgress` + unknown-sources permission (`Grant & install` -> `installApkFile`), PC `host.updater.apply()`, and strict 9-row Settings invariant |
@@ -205,21 +205,44 @@ Executed against a live `v0.1.5` `@minipod/host-node` server (`node:sqlite` WAL 
 | 20 | **Req #3c — Deleting Download Hides `subs-manage-downloads` Again** | Deleting download rendered `downloads-empty` (`暂无已下载的单集`), and navigating back hid `subs-manage-downloads` (`count === 0`) | **PASS** |
 | 21 | **Desktop (`1280×800`) Settings 9-Row Invariant & `v0.1.5` About** | Verified `document.title === "Podcasts"`, `[data-settings-row]` count === `9`, and `settings-about-dialog` displaying `"Podcasts"` + `"0.1.5"` | **PASS** |
 
+### 2.9 `v0.1.6` Swipe Edge Hints, Live Item-Following Queue Drag, Grid-Only Subscriptions + Settings Button & 3-Layer Artwork Cache E2E Matrix (15 / 15 Passed)
+
+Executed against a live `v0.1.6` `@minipod/host-node` server (`node:sqlite` WAL DB + `<dataDir>/artwork-cache/` + playable WAV audio & PNG artwork upstream server) in **Playwright Headless Chromium** across Mobile (`390×844`, `zh-CN`, touch enabled) and Desktop (`1280×800`, `en-US`) viewports:
+
+| # | `v0.1.6` E2E Verification Check | Verification Result | Status |
+| :---: | :--- | :--- | :---: |
+| 1 | **`GET /api/info` Version & Platform** | Returned `200 OK` with `appVersion === "0.1.6"` and `platform === "desktop"` | **PASS** |
+| 2 | **Req #5a — `/api/image-proxy` Disk Cache & Immutable Headers** | Verified `200 OK` (`Cache-Control: public, max-age=31536000, immutable`, `ETag: "<sha256>"`, `X-Content-Type-Options: nosniff`) and persistent `<hash>.bin` + `<hash>.json` written to `<dataDir>/artwork-cache/` | **PASS** |
+| 3 | **Req #5b — `/api/image-proxy` `ETag` `304 Not Modified`** | Conditional `If-None-Match: "<sha256>"` returned `304 Not Modified` with `0` upstream image requests (`upstreamHits: 1 -> 1`) | **PASS** |
+| 4 | **Req #4a (Mobile `zh-CN`) — Grid-Only Subscriptions & Header Buttons** | Rendered `subs-grid` (`count === 1`) with `subs-list === 0`, `subs-toggle-layout === 0`, `subs-overflow-btn === 0`, `subs-settings-btn === 1`, and `subs-manage-downloads === 0` when `downloadedCount === 0` | **PASS** |
+| 5 | **Req #4b (Mobile `zh-CN`) — Top-Right `subs-settings-btn` Navigation** | Clicking `subs-settings-btn` navigated directly to `settings-screen` (`[data-settings-row]` count === `9`) | **PASS** |
+| 6 | **Req #1a (Mobile `zh-CN`) — `EpisodeRow` Swipe-Left Edge Hint (`下一首播放`)** | Swiping left (`-36px` -> `-100px`) revealed sibling `swipe-hint-left-*` (`下一首播放`) anchored at the right edge, transitioned `data-swipe-armed` from `"false"` to `"true"` (`.is-armed`, `translateX = -75px`, `0` `<button>` inside row), and queued episode on release | **PASS** |
+| 7 | **Req #1b (Mobile `zh-CN`) — `EpisodeRow` Swipe-Right Edge Hint (`标为已播`)** | Swiping right (`+36px` -> `+100px`) revealed sibling `swipe-hint-right-*` (`标为已播`) anchored at the left edge, transitioned `data-swipe-armed` from `"false"` to `"true"` (`translateX = +75px`), and marked `PLAYED` + dismissed on release | **PASS** |
+| 8 | **Req #4c & #1c (Mobile `zh-CN`) — Conditional `subs-manage-downloads` & `DownloadsPage` Swipe-Left (`删除已下载文件`)** | Downloading an episode surfaced `subs-manage-downloads` in the Subscriptions header; clicking it opened `downloads-screen`; swiping left revealed `m-swipe-hint--danger` (`删除已下载文件`, `data-swipe-armed="true"`), deleted the download, and hid `subs-manage-downloads` again | **PASS** |
+| 9 | **Req #3a (Mobile `zh-CN`) — Queue Top-Right Menu Removed** | Verified `[data-testid="queue-overflow-btn"]` count is `0` on the Queue screen | **PASS** |
+| 10 | **Req #2a (Mobile `zh-CN`) — Live Queue Drag Moving Item + Shifting Neighbors** | Dragging `queue-handle-*` (`pointerdown` -> `pointermove` before `pointerup`) translated `queue-row-0` along Y (`data-drag-offset-y = 140`, `translateY = 140.0px`), shifted crossed neighbors `queue-row-1` & `queue-row-2` (`data-shift-y = -65`, `translateY = -65.0px`), had `0px` `border-top` drop line, and committed the new order on `pointerup` | **PASS** |
+| 11 | **Req #1d (Mobile `zh-CN`) — `QueueList` Swipe-Left Edge Hint (`从队列移除`)** | Swiping left (`-36px` -> `-100px`) on `queue-row-0` revealed `swipe-hint-left-*` (`从队列移除`, `m-swipe-hint--danger`, `unarmed="false" -> armed="true"`) and removed the row on release | **PASS** |
+| 12 | **Req #5c (Desktop `en-US`) — Zero Duplicate Upstream Image Downloads Across Screen Navigation** | Navigating `Subscriptions -> PodcastDetail -> Queue -> Subscriptions -> PodcastDetail` made **`0` new upstream image downloads** (`newUpstreamHits = {}`), kept all `<ArtworkImage>` elements warm (`loading="eager"`, `decoding="sync"`, `naturalWidth === 64`), and remembered `/api/image-proxy` for hotlink-protected artwork | **PASS** |
+| 13 | **Req #1e (Desktop `en-US`) — English `EpisodeRow` Swipe Edge Hints** | Verified `swipe-hint-left-*` (`"Play next"`, `data-swipe-armed="true"`) and `swipe-hint-right-*` (`"Mark played"`, `data-swipe-armed="true"`) on `PodcastDetail` | **PASS** |
+| 14 | **Req #1f, #2b & #3b (Desktop `en-US`) — Queue `'Remove'` Hint, Live Handle Drag & Zero Overflow Menu** | Verified `queue-overflow-btn === 0`, swipe-left hint `"Remove"` (`data-swipe-armed="true"`), and live handle drag (`dragOffsetY = 79px`, `neighborShiftY = -65px`) | **PASS** |
+| 15 | **Req #4d (Desktop `en-US`) — Grid-Only Subscriptions, `subs-settings-btn`, 9-Row Settings & `v0.1.6` About Dialog** | Verified `subs-list === 0`, `subs-overflow-btn === 0`, clicking `subs-settings-btn` opened Settings (`[data-settings-row] === 9`), and `settings-about-dialog` displayed `"Podcasts"` + `"0.1.6"` | **PASS** |
+
 ---
 
-## 3. Standalone Android APK (`v0.1.5`) & Adaptive Icon / Background Playback Verification
+## 3. Standalone Android APK (`v0.1.6`) & Adaptive Icon / Background Playback / Native Artwork Cache Verification
 
-Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.5`:
+Built via `pnpm build:apk:ci` (`cap sync android && ./gradlew assembleRelease`) and published to GitHub Release `v0.1.6`:
 
-- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.5.apk`)**:
+- **Release Artifact (`app-release.apk` & GitHub Release `minipod-v0.1.6.apk`)**:
   - Local Path: `packages/host-android/android/app/build/outputs/apk/release/app-release.apk`
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.5/minipod-v0.1.5.apk`
-  - Size: `7,120,468` bytes (`6.79 MiB`)
-  - SHA-256: `39fd8b782e785d5849ac0e1e9e20296145221af48ab3dc465723088f967bc76a`
-- **PC Standalone Release Bundle (`minipod-v0.1.5-pc.tar.gz`)**:
-  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.5/minipod-v0.1.5-pc.tar.gz`
-- **Manifest, Adaptive Day/Night Icon, `PlaybackService`, `FileProvider` & DEX Verification (`aapt2 dump badging`, `aapt2 dump resources`, `aapt2 dump xmltree`)**:
-  - Package & Display Label: `dev.minipod.app` (**`application-label:'Podcasts'`**, **`versionCode='6'`**, **`versionName='0.1.5'`**, `minSdkVersion='26'`, `targetSdkVersion='36'`), `assets/capacitor.config.json` `appName: "Podcasts"`
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.6/minipod-v0.1.6.apk`
+  - Size: `7,125,400` bytes (`6.80 MiB`)
+  - SHA-256: `fe87ec263fd6d5e8016b6b55b33eaaa5c5912d49e31f6524c37309c1e0fc8822`
+- **PC Standalone Release Bundle (`minipod-v0.1.6-pc.tar.gz`)**:
+  - Live Download URL: `https://github.com/codescv/minipod/releases/download/v0.1.6/minipod-v0.1.6-pc.tar.gz`
+- **Manifest, Adaptive Day/Night Icon, `PlaybackService`, `FileProvider`, Native WebView Artwork Cache & DEX Verification (`aapt2 dump badging`, `aapt2 dump resources`, `aapt2 dump xmltree`)**:
+  - Package & Display Label: `dev.minipod.app` (**`application-label:'Podcasts'`**, **`versionCode='7'`**, **`versionName='0.1.6'`**, `minSdkVersion='26'`, `targetSdkVersion='36'`), `assets/capacitor.config.json` `appName: "Podcasts"`
+  - Native WebView Artwork Cache (`MainActivity.java`): `BridgeWebViewClient.shouldInterceptRequest` intercepts remote artwork and `/api/image-proxy?url=...` requests, caching image bytes on disk under `getCacheDir()/artwork-cache/<sha256>.{bin,mime}` with per-hash lock deduplication, OkHttp (`User-Agent: Podcasts/0.1.6`), and `Cache-Control: public, max-age=31536000, immutable`
   - System-Theme-Adaptive Launcher Icon (**7A Light / 7B Dark**):
     - `color/ic_launcher_background`: default `() #fff4f1ea` (**7A `#F4F1EA`**), `(night) #ff18181b` (**7B `#18181B`**)
     - `color/ic_launcher_arcs`: default `() #ff1c1917` (**7A `#1C1917`**), `(night) #fff4f4f5` (**7B `#F4F4F5`**)
