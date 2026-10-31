@@ -91,6 +91,11 @@ export class NativeAudioEngine implements PlayerEngine {
   };
 
   private requestedEpisodeKey: EpisodeKey | undefined;
+  private pendingSeek: {
+    readonly episodeKey: EpisodeKey | undefined;
+    readonly targetMs: number;
+    readonly expiresAt: number;
+  } | null = null;
   private disposed = false;
 
   constructor(options: NativeAudioEngineOptions) {
@@ -145,10 +150,26 @@ export class NativeAudioEngine implements PlayerEngine {
 
   private applySnapshotFromPayload(payload: NativeMediaStatePayload, emitEvents: boolean): void {
     const prev = this.snapshot;
+    const rawPosMs = Math.max(0, Math.trunc(payload.positionMs));
+    let resolvedPosMs = rawPosMs;
+    if (this.pendingSeek !== null) {
+      if (
+        Date.now() >= this.pendingSeek.expiresAt ||
+        (payload.episodeKey !== undefined && payload.episodeKey !== this.pendingSeek.episodeKey)
+      ) {
+        this.pendingSeek = null;
+      } else if (Math.abs(rawPosMs - this.pendingSeek.targetMs) <= 2500) {
+        this.pendingSeek = null;
+        resolvedPosMs = rawPosMs;
+      } else {
+        resolvedPosMs = this.pendingSeek.targetMs;
+      }
+    }
+
     const next: PlayerSnapshot = {
       playing: payload.playing,
       buffering: payload.buffering,
-      positionMs: Math.max(0, Math.trunc(payload.positionMs)),
+      positionMs: resolvedPosMs,
       speed: clampSpeed(payload.speed),
       ...(payload.episodeKey !== undefined ? { episodeKey: payload.episodeKey } : {}),
       ...(payload.durationMs !== undefined && payload.durationMs > 0
@@ -213,6 +234,7 @@ export class NativeAudioEngine implements PlayerEngine {
 
   private handleNativeEnded(payload: NativeMediaEndedPayload): void {
     if (this.disposed) return;
+    this.pendingSeek = null;
     this.onNativeActivity?.();
 
     if (payload.autoAdvancedTo) {
@@ -264,6 +286,7 @@ export class NativeAudioEngine implements PlayerEngine {
   async load(item: PlayerLoadItem): Promise<void> {
     const speed = clampSpeed(item.speed);
     const startMs = Math.max(0, Math.trunc(item.startMs));
+    this.pendingSeek = null;
     this.requestedEpisodeKey = item.episodeKey;
     this.snapshot = {
       episodeKey: item.episodeKey,
@@ -271,7 +294,9 @@ export class NativeAudioEngine implements PlayerEngine {
       buffering: true,
       positionMs: startMs,
       speed,
-      ...(item.metadata.durationMs !== undefined ? { durationMs: item.metadata.durationMs } : {}),
+      ...(item.metadata.durationMs !== undefined && item.metadata.durationMs > 0
+        ? { durationMs: item.metadata.durationMs }
+        : {}),
     };
     this.emit({ type: 'state', snapshot: this.snapshot });
 
@@ -305,6 +330,7 @@ export class NativeAudioEngine implements PlayerEngine {
   }
 
   stop(): void {
+    this.pendingSeek = null;
     this.requestedEpisodeKey = undefined;
     this.snapshot = {
       playing: false,
@@ -319,10 +345,15 @@ export class NativeAudioEngine implements PlayerEngine {
   seekTo(ms: number): void {
     const clamped = Math.max(
       0,
-      this.snapshot.durationMs !== undefined
-        ? Math.min(Math.trunc(ms), this.snapshot.durationMs)
-        : Math.trunc(ms),
+      this.snapshot.durationMs !== undefined && this.snapshot.durationMs > 0
+        ? Math.min(Math.floor(ms), this.snapshot.durationMs)
+        : Math.floor(ms),
     );
+    this.pendingSeek = {
+      episodeKey: this.snapshot.episodeKey,
+      targetMs: clamped,
+      expiresAt: Date.now() + 1500,
+    };
     this.snapshot = {
       ...this.snapshot,
       positionMs: clamped,

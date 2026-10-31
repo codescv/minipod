@@ -139,4 +139,73 @@ describe('NativeAudioEngine', () => {
 
     engine.dispose();
   });
+
+  it('guards pending seekTo position against in-flight pre-seek media-state ticks until native player settles', async () => {
+    const { plugin, emitNative, media } = createMockMediaHarness();
+    const engine = new NativeAudioEngine({ plugin });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const events: PlayerEvent[] = [];
+    engine.subscribe((e) => events.push(e));
+
+    await engine.load({
+      episodeKey: 'e_seek_ep',
+      source: { kind: 'url', url: 'https://example.com/ep.mp3' },
+      startMs: 10_000,
+      speed: 1.0,
+      metadata: { title: 'Seek Episode', durationMs: 300_000 },
+      mediaType: 'AUDIO',
+    });
+    await engine.play();
+    emitNative('media-state', {
+      episodeKey: 'e_seek_ep',
+      playing: true,
+      buffering: false,
+      positionMs: 10_000,
+      durationMs: 300_000,
+      speed: 1.0,
+    });
+    expect(engine.getSnapshot().positionMs).toBe(10_000);
+
+    // User seeks to 120_000ms (2:00)
+    engine.seekTo(120_000);
+    expect(media.seekTo).toHaveBeenCalledWith({ positionMs: 120_000 });
+    expect(engine.getSnapshot().positionMs).toBe(120_000);
+
+    // An in-flight pre-seek `media-state` tick arrives right before native `seekToMs` executes
+    emitNative('media-state', {
+      episodeKey: 'e_seek_ep',
+      playing: true,
+      buffering: true,
+      positionMs: 10_000,
+      durationMs: 300_000,
+      speed: 1.0,
+    });
+    // `positionMs` MUST remain pinned at `120_000` instead of snapping backward to `10_000`!
+    expect(engine.getSnapshot().positionMs).toBe(120_000);
+
+    // Post-seek `media-state` arrives once ExoPlayer reaches the target position
+    emitNative('media-state', {
+      episodeKey: 'e_seek_ep',
+      playing: true,
+      buffering: false,
+      positionMs: 120_200,
+      durationMs: 300_000,
+      speed: 1.0,
+    });
+    expect(engine.getSnapshot().positionMs).toBe(120_200);
+
+    // Subsequent 1s playback ticks continue updating `positionMs` normally
+    emitNative('media-state', {
+      episodeKey: 'e_seek_ep',
+      playing: true,
+      buffering: false,
+      positionMs: 121_200,
+      durationMs: 300_000,
+      speed: 1.0,
+    });
+    expect(engine.getSnapshot().positionMs).toBe(121_200);
+
+    engine.dispose();
+  });
 });

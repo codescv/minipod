@@ -1,7 +1,7 @@
 {
   "name": "minipod-monorepo",
   "private": true,
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "MiniPod — ultra-minimalist podcast app (Android + PC Web App) with every AntennaPod discovery/feed source and zero-cost cloud file sync. 100% TypeScript, zero native Node addons.",
   "license": "MIT",
   "type": "module",

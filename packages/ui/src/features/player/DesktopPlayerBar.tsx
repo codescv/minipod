@@ -1,6 +1,7 @@
 /**
  * Persistent bottom Desktop Player Bar (`>= 840px`, `DESIGN.md` §4.6).
  */
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouteStore } from '../../app/routes';
 import { ArtworkImage, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
@@ -16,11 +17,67 @@ export function DesktopPlayerBar() {
   const toggleSideSheet = useRouteStore((s) => s.toggleSideSheet);
   const setSleepTimerSheetOpen = useRouteStore((s) => s.setSleepTimerSheetOpen);
 
+  const [scrubPositionMs, setScrubPositionMs] = useState<number | null>(null);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const isScrubbingRef = useRef(false);
+  const scrubValueRef = useRef<number | null>(null);
+
   const episode = player.episode;
+  const episodeKey = episode?.episodeKey;
   const durationMs = player.snapshot.durationMs ?? episode?.durationMs ?? 0;
   const positionMs = player.snapshot.positionMs;
+  const displayPositionMs = scrubPositionMs ?? positionMs;
+  const sliderMax = Math.max(durationMs > 0 ? durationMs : 3_600_000, displayPositionMs, 1000);
   const sleepActive = player.sleepTimer.timer.mode !== 'off';
   const showInlineVideo = Boolean(episode?.mediaType === 'VIDEO' && player.engine.capabilities.video);
+
+  useEffect(() => {
+    isScrubbingRef.current = false;
+    scrubValueRef.current = null;
+    setIsScrubbing(false);
+    setScrubPositionMs(null);
+  }, [episodeKey]);
+
+  const startScrub = useCallback(
+    (e: { stopPropagation(): void }) => {
+      if (!episode) return;
+      e.stopPropagation();
+      isScrubbingRef.current = true;
+      setIsScrubbing(true);
+    },
+    [episode],
+  );
+
+  const commitScrub = useCallback(() => {
+    if (!isScrubbingRef.current) return;
+    isScrubbingRef.current = false;
+    setIsScrubbing(false);
+    const committed = scrubValueRef.current;
+    scrubValueRef.current = null;
+    setScrubPositionMs(null);
+    if (committed !== null) {
+      player.seekTo(committed);
+    }
+  }, [player]);
+
+  useEffect(() => {
+    if (!isScrubbing && scrubPositionMs === null) return;
+    const handleWindowRelease = () => {
+      commitScrub();
+    };
+    window.addEventListener('pointerup', handleWindowRelease);
+    window.addEventListener('pointercancel', handleWindowRelease);
+    window.addEventListener('touchend', handleWindowRelease);
+    window.addEventListener('touchcancel', handleWindowRelease);
+    window.addEventListener('mouseup', handleWindowRelease);
+    return () => {
+      window.removeEventListener('pointerup', handleWindowRelease);
+      window.removeEventListener('pointercancel', handleWindowRelease);
+      window.removeEventListener('touchend', handleWindowRelease);
+      window.removeEventListener('touchcancel', handleWindowRelease);
+      window.removeEventListener('mouseup', handleWindowRelease);
+    };
+  }, [isScrubbing, scrubPositionMs, commitScrub]);
 
   return (
     <div style={{ flex: 'none', position: 'relative' }} data-testid="desktop-player-bar">
@@ -120,7 +177,7 @@ export function DesktopPlayerBar() {
           />
 
           <span style={{ font: 'var(--md-sys-typescale-label-small)', minWidth: 42, textAlign: 'right' }}>
-            {formatClock(positionMs)}
+            {formatClock(displayPositionMs)}
           </span>
 
           <div className="m-seek-wrap">
@@ -128,13 +185,31 @@ export function DesktopPlayerBar() {
               className="m-seek-slider"
               type="range"
               min={0}
-              max={Math.max(durationMs, positionMs, 1000)}
+              max={sliderMax}
               step={1000}
               disabled={!episode}
               aria-label={t('player.seek')}
               data-testid="desktop-seek-slider"
-              value={positionMs}
-              onChange={(e) => player.seekTo(Number.parseInt(e.target.value, 10))}
+              value={displayPositionMs}
+              onPointerDown={startScrub}
+              onTouchStart={startScrub}
+              onMouseDown={startScrub}
+              onPointerUp={commitScrub}
+              onPointerCancel={commitScrub}
+              onTouchEnd={commitScrub}
+              onTouchCancel={commitScrub}
+              onMouseUp={commitScrub}
+              onBlur={commitScrub}
+              onChange={(e) => {
+                const nextMs = Number.parseInt(e.target.value, 10);
+                if (!Number.isFinite(nextMs)) return;
+                if (isScrubbingRef.current) {
+                  scrubValueRef.current = nextMs;
+                  setScrubPositionMs(nextMs);
+                } else {
+                  player.seekTo(nextMs);
+                }
+              }}
             />
             {durationMs > 0 && player.chapters.length > 0 && (
               <div className="m-seek-ticks">
@@ -159,7 +234,7 @@ export function DesktopPlayerBar() {
               minWidth: 48,
             }}
           >
-            {episode ? formatRemainingClock(positionMs, durationMs || undefined) : '--:--'}
+            {episode ? formatRemainingClock(displayPositionMs, durationMs || undefined) : '--:--'}
           </span>
         </div>
 

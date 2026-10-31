@@ -25,6 +25,7 @@ import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
+import androidx.media3.common.Timeline;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.datasource.DataSpec;
 import androidx.media3.datasource.DefaultDataSource;
@@ -32,6 +33,7 @@ import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.datasource.ResolvingDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.extractor.DefaultExtractorsFactory;
 import androidx.media3.session.DefaultMediaNotificationProvider;
 import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
@@ -379,13 +381,17 @@ public class PlaybackService extends MediaSessionService {
             }
         );
 
+        DefaultExtractorsFactory extractorsFactory = new DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+            .setConstantBitrateSeekingAlwaysEnabled(true);
+
         AudioAttributes audioAttrs = new AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
             .setUsage(C.USAGE_MEDIA)
             .build();
 
         player = new ExoPlayer.Builder(this)
-            .setMediaSourceFactory(new DefaultMediaSourceFactory(resolvingFactory))
+            .setMediaSourceFactory(new DefaultMediaSourceFactory(resolvingFactory, extractorsFactory))
             .setAudioAttributes(audioAttrs, true)
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
@@ -615,7 +621,13 @@ public class PlaybackService extends MediaSessionService {
 
     public void seekToMs(long positionMs) {
         long clamped = Math.max(0L, positionMs);
+        if (player.getPlaybackState() == Player.STATE_IDLE && player.getMediaItemCount() > 0) {
+            player.prepare();
+        }
         player.seekTo(clamped);
+        if (player.isPlaying()) {
+            scheduleTicks();
+        }
         writeCurrentCheckpoint();
         emitCurrentState();
     }
@@ -693,6 +705,19 @@ public class PlaybackService extends MediaSessionService {
     // -------------------------------------------------------------------------
 
     private final Player.Listener playerListener = new Player.Listener() {
+        @Override
+        public void onTimelineChanged(Timeline timeline, int reason) {
+            if (player == null) return;
+            long d = player.getDuration();
+            if (d != C.TIME_UNSET && d > 0L && d != lastKnownDurationMs) {
+                lastKnownDurationMs = d;
+                if (activeEpisodeKey != null) {
+                    durationHintByEpisodeKey.put(activeEpisodeKey, d);
+                }
+                emitCurrentState();
+            }
+        }
+
         @Override
         public void onIsPlayingChanged(boolean isPlaying) {
             if (isPlaying) {

@@ -380,4 +380,86 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     htmlEngine.dispose();
     expect(document.body.querySelector('[data-minipod-media-park="true"]')).toBeNull();
   });
+
+  it('supports direct change seeking and smooth pointer-drag scrubbing without snapping back on live playback ticks in ExpandedPlayer', async () => {
+    const mobile = renderMiniPod({ width: 390 });
+    fireEvent.click(await screen.findByText('Syntax & Signal'));
+    const mobileEpRows = await screen.findAllByTestId(/^episode-row-/);
+    fireEvent.click(mobileEpRows[0]!);
+    await waitFor(() => expect(mobile.engine.getSnapshot().playing).toBe(true));
+
+    fireEvent.click(await screen.findByTestId('mini-player'));
+    const expandedSlider = (await screen.findByTestId('expanded-seek-slider')) as HTMLInputElement;
+
+    const mobileSeekSpy = vi.spyOn(mobile.engine, 'seekTo');
+
+    // Direct change (keyboard / accessibility / non-pointer) seeks immediately
+    fireEvent.change(expandedSlider, { target: { value: '60000' } });
+    expect(mobileSeekSpy).toHaveBeenCalledTimes(1);
+    expect(mobileSeekSpy).toHaveBeenLastCalledWith(60_000);
+    expect(mobile.engine.getSnapshot().positionMs).toBe(60_000);
+    expect(expandedSlider.value).toBe('60000');
+
+    mobileSeekSpy.mockClear();
+
+    // Pointer drag: pointerDown -> multiple drag changes while live 1s playback ticks arrive -> pointerUp
+    fireEvent.pointerDown(expandedSlider);
+    fireEvent.change(expandedSlider, { target: { value: '120000' } });
+    expect(expandedSlider.value).toBe('120000');
+    expect(screen.getByTestId('expanded-player')).toHaveTextContent('2:00');
+    expect(mobileSeekSpy).not.toHaveBeenCalled();
+
+    // Live 1s playback tick arrives mid-drag at old position 61_000ms -> slider & clock MUST NOT snap back!
+    act(() => {
+      mobile.engine.emitPosition(61_000);
+    });
+    expect(expandedSlider.value).toBe('120000');
+    expect(screen.getByTestId('expanded-player')).toHaveTextContent('2:00');
+
+    // Continue dragging to 245_000ms (4:05)
+    fireEvent.change(expandedSlider, { target: { value: '245000' } });
+    expect(expandedSlider.value).toBe('245000');
+    expect(screen.getByTestId('expanded-player')).toHaveTextContent('4:05');
+    expect(mobileSeekSpy).not.toHaveBeenCalled();
+
+    // Release finger -> commits a single seekTo(245_000)
+    fireEvent.pointerUp(expandedSlider);
+    expect(mobileSeekSpy).toHaveBeenCalledTimes(1);
+    expect(mobileSeekSpy).toHaveBeenCalledWith(245_000);
+    expect(mobile.engine.getSnapshot().positionMs).toBe(245_000);
+    expect(expandedSlider.value).toBe('245000');
+  });
+
+  it('supports direct change seeking and smooth pointer-drag scrubbing without snapping back on live playback ticks in DesktopPlayerBar', async () => {
+    const desktop = renderMiniPod({ width: 1200 });
+    fireEvent.click(await screen.findByText('Syntax & Signal'));
+    const desktopEpRows = await screen.findAllByTestId(/^episode-row-/);
+    fireEvent.click(desktopEpRows[0]!);
+    await waitFor(() => expect(desktop.engine.getSnapshot().playing).toBe(true));
+
+    const desktopSlider = screen.getByTestId('desktop-seek-slider') as HTMLInputElement;
+    const desktopSeekSpy = vi.spyOn(desktop.engine, 'seekTo');
+
+    fireEvent.change(desktopSlider, { target: { value: '90000' } });
+    expect(desktopSeekSpy).toHaveBeenCalledTimes(1);
+    expect(desktopSeekSpy).toHaveBeenCalledWith(90_000);
+    expect(desktop.engine.getSnapshot().positionMs).toBe(90_000);
+
+    desktopSeekSpy.mockClear();
+
+    fireEvent.pointerDown(desktopSlider);
+    fireEvent.change(desktopSlider, { target: { value: '180000' } });
+    act(() => {
+      desktop.engine.emitPosition(91_000);
+    });
+    expect(desktopSlider.value).toBe('180000');
+    fireEvent.change(desktopSlider, { target: { value: '300000' } });
+    expect(desktopSeekSpy).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(desktopSlider);
+    expect(desktopSeekSpy).toHaveBeenCalledTimes(1);
+    expect(desktopSeekSpy).toHaveBeenCalledWith(300_000);
+    expect(desktop.engine.getSnapshot().positionMs).toBe(300_000);
+    expect(desktopSlider.value).toBe('300000');
+  });
 });

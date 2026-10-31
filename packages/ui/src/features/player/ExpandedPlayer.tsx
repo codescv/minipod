@@ -1,7 +1,7 @@
 /**
  * Full-height Expanded Player sheet on mobile (`DESIGN.md` §4.6).
  */
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouteStore } from '../../app/routes';
 import { ArtworkImage, BottomSheet, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
@@ -21,13 +21,64 @@ export function ExpandedPlayer() {
 
   const [chaptersOpen, setChaptersOpen] = useState(true);
   const [notesOpen, setNotesOpen] = useState(false);
+  const [scrubPositionMs, setScrubPositionMs] = useState<number | null>(null);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const isScrubbingRef = useRef(false);
+  const scrubValueRef = useRef<number | null>(null);
 
   const episode = player.episode;
+  const episodeKey = episode?.episodeKey;
   const durationMs = player.snapshot.durationMs ?? episode?.durationMs ?? 0;
   const positionMs = player.snapshot.positionMs;
+  const displayPositionMs = scrubPositionMs ?? positionMs;
+  const sliderMax = Math.max(durationMs > 0 ? durationMs : 3_600_000, displayPositionMs, 1000);
   const isVideoInline = episode?.mediaType === 'VIDEO' && player.engine.capabilities.video;
   const isAudioOnlyVideo = episode?.mediaType === 'VIDEO' && !player.engine.capabilities.video;
   const sleepActive = player.sleepTimer.timer.mode !== 'off';
+
+  useEffect(() => {
+    isScrubbingRef.current = false;
+    scrubValueRef.current = null;
+    setIsScrubbing(false);
+    setScrubPositionMs(null);
+  }, [episodeKey]);
+
+  const startScrub = useCallback((e: { stopPropagation(): void }) => {
+    e.stopPropagation();
+    isScrubbingRef.current = true;
+    setIsScrubbing(true);
+  }, []);
+
+  const commitScrub = useCallback(() => {
+    if (!isScrubbingRef.current) return;
+    isScrubbingRef.current = false;
+    setIsScrubbing(false);
+    const committed = scrubValueRef.current;
+    scrubValueRef.current = null;
+    setScrubPositionMs(null);
+    if (committed !== null) {
+      player.seekTo(committed);
+    }
+  }, [player]);
+
+  useEffect(() => {
+    if (!isScrubbing && scrubPositionMs === null) return;
+    const handleWindowRelease = () => {
+      commitScrub();
+    };
+    window.addEventListener('pointerup', handleWindowRelease);
+    window.addEventListener('pointercancel', handleWindowRelease);
+    window.addEventListener('touchend', handleWindowRelease);
+    window.addEventListener('touchcancel', handleWindowRelease);
+    window.addEventListener('mouseup', handleWindowRelease);
+    return () => {
+      window.removeEventListener('pointerup', handleWindowRelease);
+      window.removeEventListener('pointercancel', handleWindowRelease);
+      window.removeEventListener('touchend', handleWindowRelease);
+      window.removeEventListener('touchcancel', handleWindowRelease);
+      window.removeEventListener('mouseup', handleWindowRelease);
+    };
+  }, [isScrubbing, scrubPositionMs, commitScrub]);
 
   return (
     <BottomSheet
@@ -122,12 +173,30 @@ export function ExpandedPlayer() {
                 className="m-seek-slider"
                 type="range"
                 min={0}
-                max={Math.max(durationMs, positionMs, 1000)}
+                max={sliderMax}
                 step={1000}
                 aria-label={t('player.seek')}
                 data-testid="expanded-seek-slider"
-                value={positionMs}
-                onChange={(e) => player.seekTo(Number.parseInt(e.target.value, 10))}
+                value={displayPositionMs}
+                onPointerDown={startScrub}
+                onTouchStart={startScrub}
+                onMouseDown={startScrub}
+                onPointerUp={commitScrub}
+                onPointerCancel={commitScrub}
+                onTouchEnd={commitScrub}
+                onTouchCancel={commitScrub}
+                onMouseUp={commitScrub}
+                onBlur={commitScrub}
+                onChange={(e) => {
+                  const nextMs = Number.parseInt(e.target.value, 10);
+                  if (!Number.isFinite(nextMs)) return;
+                  if (isScrubbingRef.current) {
+                    scrubValueRef.current = nextMs;
+                    setScrubPositionMs(nextMs);
+                  } else {
+                    player.seekTo(nextMs);
+                  }
+                }}
               />
               {durationMs > 0 && player.chapters.length > 0 && (
                 <div className="m-seek-ticks">
@@ -152,8 +221,8 @@ export function ExpandedPlayer() {
                 color: 'var(--md-sys-color-on-surface-variant)',
               }}
             >
-              <span>{formatClock(positionMs)}</span>
-              <span>{formatRemainingClock(positionMs, durationMs || undefined)}</span>
+              <span>{formatClock(displayPositionMs)}</span>
+              <span>{formatRemainingClock(displayPositionMs, durationMs || undefined)}</span>
             </div>
           </div>
 

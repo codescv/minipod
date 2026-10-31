@@ -2098,13 +2098,41 @@ public class MiniPodPlugin extends Plugin {
     }
 
     private static int safeInt(PluginCall call, String key, int fallback) {
-        Integer v = call.getInt(key, fallback);
-        return v != null ? v : fallback;
+        JSObject data = call.getData();
+        if (data == null || !data.has(key) || data.isNull(key)) {
+            return fallback;
+        }
+        Object raw = data.opt(key);
+        if (raw instanceof Number) {
+            return ((Number) raw).intValue();
+        }
+        if (raw instanceof String) {
+            try {
+                return (int) Math.round(Double.parseDouble(((String) raw).trim()));
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return data.optInt(key, fallback);
     }
 
     private static long safeLong(PluginCall call, String key, long fallback) {
-        Long v = call.getLong(key, fallback);
-        return v != null ? v : fallback;
+        JSObject data = call.getData();
+        if (data == null || !data.has(key) || data.isNull(key)) {
+            return fallback;
+        }
+        Object raw = data.opt(key);
+        if (raw instanceof Number) {
+            return ((Number) raw).longValue();
+        }
+        if (raw instanceof String) {
+            try {
+                return Math.round(Double.parseDouble(((String) raw).trim()));
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return data.optLong(key, fallback);
     }
 
     private static boolean sameOriginHostPort(HttpUrl a, HttpUrl b) {
