@@ -144,11 +144,12 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
 
     const queueCtxMenu = screen.getByTestId('queue-context-menu');
     expect(queueCtxMenu).toBeInTheDocument();
-    // Strictly 3 items in `queue-context-menu`: Move to top, Download / Delete download, Remove
-    expect(queueCtxMenu.querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    // Strictly 4 items in `queue-context-menu`: Move to top, Download / Delete download, Remove, View details
+    expect(queueCtxMenu.querySelectorAll('[role="menuitem"]')).toHaveLength(4);
     expect(screen.getByTestId(`queue-move-top-${thirdKey}`)).toBeInTheDocument();
     expect(screen.getByTestId(`queue-download-${thirdKey}`)).toHaveTextContent('Delete download');
     expect(screen.getByTestId(`queue-remove-${thirdKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`queue-view-details-${thirdKey}`)).toHaveTextContent('View details');
     expect(screen.queryByTestId(`queue-move-up-${thirdKey}`)).not.toBeInTheDocument();
     expect(screen.queryByTestId(`queue-move-down-${thirdKey}`)).not.toBeInTheDocument();
     expect(screen.queryByTestId(`queue-mark-played-${thirdKey}`)).not.toBeInTheDocument();
@@ -276,7 +277,7 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     expect(screen.queryByTestId(`inline-undo-${secondKey}`)).not.toBeInTheDocument();
   });
 
-  it('localizes strictly 3 queue context menu items in zh-CN (置顶 / 下载 / 移除) and handles top-row & downloading disabled states', async () => {
+  it('localizes strictly 4 queue context menu items in zh-CN (置顶 / 下载 / 移除 / 查看详情) and handles top-row & downloading disabled states', async () => {
     const { host } = renderMiniPod({
       width: 390,
       hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
@@ -291,11 +292,12 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     // Row 0 (`firstKey` is DONE): `置顶` is disabled at idx 0, `删除已下载文件` enabled, `从队列移除` enabled
     fireEvent.contextMenu(screen.getByTestId('queue-row-0'), { clientX: 120, clientY: 160 });
     const menu0 = screen.getByTestId('queue-context-menu');
-    expect(menu0.querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    expect(menu0.querySelectorAll('[role="menuitem"]')).toHaveLength(4);
     expect(screen.getByTestId(`queue-move-top-${firstKey}`)).toHaveTextContent('置顶');
     expect(screen.getByTestId(`queue-move-top-${firstKey}`)).toBeDisabled();
     expect(screen.getByTestId(`queue-download-${firstKey}`)).toHaveTextContent('删除已下载文件');
     expect(screen.getByTestId(`queue-remove-${firstKey}`)).toHaveTextContent('从队列移除');
+    expect(screen.getByTestId(`queue-view-details-${firstKey}`)).toHaveTextContent('查看详情');
     fireEvent.keyDown(window, { key: 'Escape' });
 
     // Row 1 (`secondKey` set to RUNNING): `停止下载` is enabled, `置顶` is enabled
@@ -314,7 +316,7 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       '停止下载',
     );
     fireEvent.contextMenu(screen.getByTestId('queue-row-1'), { clientX: 120, clientY: 220 });
-    expect(screen.getByTestId('queue-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(3);
+    expect(screen.getByTestId('queue-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(4);
     expect(screen.getByTestId(`queue-move-top-${secondKey}`)).not.toBeDisabled();
     expect(screen.getByTestId(`queue-download-${secondKey}`)).toHaveTextContent('停止下载');
     expect(screen.getByTestId(`queue-download-${secondKey}`)).not.toBeDisabled();
@@ -324,6 +326,109 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     await waitFor(async () => {
       expect(await host.queue.list()).toHaveLength(2);
     });
+  });
+  it('opens `episode-detail-sheet` from `queue-view-details-*` with Play, queue toggle, Go to podcast & Shownotes (stays functional after removal)', async () => {
+    const { host, engine } = renderMiniPod({ width: 1024 });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    const q = await host.queue.list();
+    expect(q).toHaveLength(3);
+    const firstKey = q[0]!.episode.episodeKey;
+    const firstTitle = q[0]!.episode.title;
+
+    fireEvent.contextMenu(screen.getByTestId('queue-row-0'), { clientX: 120, clientY: 160 });
+    const menu = screen.getByTestId('queue-context-menu');
+    expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(4);
+    expect(screen.getByTestId(`queue-view-details-${firstKey}`)).toHaveTextContent('View details');
+    fireEvent.click(screen.getByTestId(`queue-view-details-${firstKey}`));
+
+    const sheet = await screen.findByTestId('episode-detail-sheet');
+    expect(sheet).toHaveAttribute('aria-label', 'View details');
+    expect(sheet).toHaveTextContent('View details');
+    expect(sheet).toHaveTextContent(firstTitle);
+    expect(screen.queryByTestId('queue-context-menu')).not.toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-close-${firstKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-shownotes-${firstKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-open-podcast-${firstKey}`)).toHaveTextContent('Go to podcast');
+    expect(screen.queryByTestId(`ep-open-video-${firstKey}`)).not.toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-queue-${firstKey}`)).toHaveTextContent('Remove from queue');
+
+    // Play / Pause toggles playback of this queue episode
+    expect(screen.getByTestId(`ep-detail-play-${firstKey}`)).toHaveTextContent('Play');
+    fireEvent.click(screen.getByTestId(`ep-detail-play-${firstKey}`));
+    await waitFor(() => {
+      expect(engine.getSnapshot().playing).toBe(true);
+    });
+    expect(engine.getSnapshot().episodeKey).toBe(firstKey);
+    await waitFor(() => {
+      expect(screen.getByTestId(`ep-detail-play-${firstKey}`)).toHaveTextContent('Pause');
+    });
+
+    // Removing from queue keeps the sheet open & functional (now offers `Add to queue`)
+    fireEvent.click(screen.getByTestId(`ep-detail-queue-${firstKey}`));
+    await waitFor(async () => {
+      expect(await host.queue.list()).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId(`ep-detail-queue-${firstKey}`)).toHaveTextContent('Add to queue');
+    });
+    expect(screen.getByTestId('episode-detail-sheet')).toHaveTextContent(firstTitle);
+
+    fireEvent.click(screen.getByTestId(`ep-detail-queue-${firstKey}`));
+    await waitFor(async () => {
+      const after = await host.queue.list();
+      expect(after).toHaveLength(3);
+      expect(after.some((r) => r.episode.episodeKey === firstKey)).toBe(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId(`ep-detail-queue-${firstKey}`)).toHaveTextContent('Remove from queue');
+    });
+
+    // Close button dismisses the sheet
+    fireEvent.click(screen.getByTestId(`ep-detail-close-${firstKey}`));
+    await waitFor(() => {
+      expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
+    });
+
+    // `Go to podcast` closes the sheet and opens the podcast detail screen
+    fireEvent.contextMenu(screen.getByTestId('queue-row-0'), { clientX: 120, clientY: 160 });
+    const key0 = (await host.queue.list())[0]!.episode.episodeKey;
+    fireEvent.click(screen.getByTestId(`queue-view-details-${key0}`));
+    fireEvent.click(await screen.findByTestId(`ep-open-podcast-${key0}`));
+    expect(await screen.findByTestId('podcast-detail-screen')).toBeInTheDocument();
+    expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
+  });
+
+  it('localizes the queue `查看详情` detail sheet in zh-CN and closes it with Escape', async () => {
+    const { host } = renderMiniPod({
+      width: 390,
+      hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
+    });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    const q = await host.queue.list();
+    const secondKey = q[1]!.episode.episodeKey;
+
+    fireEvent.contextMenu(screen.getByTestId('queue-row-1'), { clientX: 120, clientY: 220 });
+    expect(screen.getByTestId('queue-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(4);
+    expect(screen.getByTestId(`queue-view-details-${secondKey}`)).toHaveTextContent('查看详情');
+    fireEvent.click(screen.getByTestId(`queue-view-details-${secondKey}`));
+
+    const sheet = await screen.findByTestId('episode-detail-sheet');
+    expect(sheet).toHaveAttribute('aria-label', '查看详情');
+    expect(sheet).toHaveTextContent(q[1]!.episode.title);
+    expect(screen.getByTestId(`ep-detail-play-${secondKey}`)).toHaveTextContent('播放');
+    expect(screen.getByTestId(`ep-detail-queue-${secondKey}`)).toHaveTextContent('移出队列');
+    expect(screen.getByTestId(`ep-open-podcast-${secondKey}`)).toHaveTextContent('查看播客节目');
+    expect(screen.getByTestId(`ep-detail-shownotes-${secondKey}`)).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
+    });
+    expect(await host.queue.list()).toHaveLength(3);
   });
   it('stops a single RUNNING/QUEUED episode download via context menu `Stop download` or by tapping the progress ring (without playing)', async () => {
     const { host, engine } = renderMiniPod({ width: 1024 });

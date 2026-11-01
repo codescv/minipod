@@ -280,6 +280,74 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     expect(reappearedBtn.getAttribute('aria-label')).toBe('管理下载 (1)');
   });
 
+  it('shows strictly `Delete download` + `View details` (no queue toggle) in the DownloadsPage long-press `ep-context-menu` and deletes the download', async () => {
+    const { host } = renderMiniPod({
+      width: 1024,
+      hostOptions: { initialSettings: { uiLanguage: 'zh-CN' } },
+    });
+    expect(await screen.findByText('Syntax & Signal')).toBeInTheDocument();
+    fireEvent.click(await screen.findByTestId('subs-manage-downloads'));
+    expect(await screen.findByTestId('downloads-screen')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId('downloads-count')).toHaveTextContent('2');
+    });
+
+    const dlRows = within(screen.getByTestId('downloads-list')).getAllByTestId(/^episode-row-/);
+    const firstDlKey = dlRows[0]!.getAttribute('data-testid')!.replace('episode-row-', '');
+    const secondDlKey = dlRows[1]!.getAttribute('data-testid')!.replace('episode-row-', '');
+
+    // Right-click: `删除已下载文件` + `查看详情` only, no `ep-queue-btn-*`
+    fireEvent.contextMenu(dlRows[0]!, { clientX: 180, clientY: 160 });
+    const dlMenu = await screen.findByTestId('ep-context-menu');
+    expect(within(dlMenu).getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getByTestId(`ep-delete-download-${firstDlKey}`)).toHaveTextContent('删除已下载文件');
+    expect(screen.getByTestId(`ep-view-details-${firstDlKey}`)).toHaveTextContent('查看详情');
+    expect(screen.queryByTestId(`ep-queue-btn-${firstDlKey}`)).not.toBeInTheDocument();
+
+    // `查看详情` opens `episode-detail-sheet`
+    fireEvent.click(screen.getByTestId(`ep-view-details-${firstDlKey}`));
+    expect(await screen.findByTestId('episode-detail-sheet')).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-shownotes-${firstDlKey}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`ep-detail-close-${firstDlKey}`));
+    await waitFor(() => {
+      expect(screen.queryByTestId('episode-detail-sheet')).not.toBeInTheDocument();
+    });
+
+    // `删除已下载文件` deletes the file and reloads DownloadsPage (`2 -> 1`)
+    const deleteSpy = vi.spyOn(host.episodes, 'deleteDownload');
+    fireEvent.contextMenu(dlRows[0]!, { clientX: 180, clientY: 160 });
+    fireEvent.click(await screen.findByTestId(`ep-delete-download-${firstDlKey}`));
+    await waitFor(() => {
+      expect(screen.getByTestId('downloads-count')).toHaveTextContent('1');
+    });
+    expect(deleteSpy).toHaveBeenCalledWith(firstDlKey);
+    expect((await host.episodes.get(firstDlKey)).episode.downloadState).not.toBe('DONE');
+    expect(screen.queryByTestId(`episode-row-${firstDlKey}`)).not.toBeInTheDocument();
+
+    // Long-press (~450ms) on the remaining row opens the same 2-item downloads menu
+    const remainingRow = screen.getByTestId(`episode-row-${secondDlKey}`);
+    vi.useFakeTimers();
+    fireEvent(
+      remainingRow,
+      new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientX: 180, clientY: 160 }),
+    );
+    act(() => {
+      vi.advanceTimersByTime(460);
+    });
+    fireEvent(
+      remainingRow,
+      new MouseEvent('pointerup', { bubbles: true, cancelable: true, button: 0, clientX: 180, clientY: 160 }),
+    );
+    vi.useRealTimers();
+    const lpMenu = screen.getByTestId('ep-context-menu');
+    expect(within(lpMenu).getAllByRole('menuitem')).toHaveLength(2);
+    expect(screen.getByTestId(`ep-delete-download-${secondDlKey}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`ep-view-details-${secondDlKey}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`ep-queue-btn-${secondDlKey}`)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`ep-delete-download-${secondDlKey}`));
+    expect(await screen.findByTestId('downloads-empty')).toBeInTheDocument();
+  });
+
   it('computes flexible multi-column cover grid and collapses after 2 rows (12 on 6-col desktop, 8 on 4-col phone like OnePlus 13T) with Show all (N) / Show less toggle', async () => {
     expect(MAX_SUBS_COLLAPSED_ROWS).toBe(2);
     // Compact phones (360px, 390px OnePlus 13T, 412px) -> 4 columns per row (8 max before collapse)

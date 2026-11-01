@@ -47,6 +47,11 @@ export interface EpisodeRowProps {
   readonly swipeLeftHintLabel?: string | undefined;
   readonly swipeLeftHintIcon?: IconName | undefined;
   readonly swipeLeftHintTone?: 'primary' | 'danger' | undefined;
+  /**
+   * v0.1.24 Manage Downloads mode: when set, the long-press `ep-context-menu` shows
+   * `Delete download` (`ep-delete-download-*`) + `View details` instead of the queue toggle.
+   */
+  readonly onDeleteDownload?: (() => void) | undefined;
   readonly onChanged: () => void;
 }
 
@@ -64,6 +69,7 @@ export function EpisodeRow({
   swipeLeftHintLabel,
   swipeLeftHintIcon,
   swipeLeftHintTone,
+  onDeleteDownload,
   onChanged,
 }: EpisodeRowProps) {
   void _allowDownloads;
@@ -214,26 +220,40 @@ export function EpisodeRow({
   const leftHintIcon: IconName = swipeLeftHintIcon ?? 'playlistAdd';
   const leftHintTone = swipeLeftHintTone ?? 'primary';
 
-  const menuItems: MenuEntry[] = [
-    {
-      key: 'toggle-queue',
-      label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
-      icon: inQueue ? 'queueMusic' : 'playlistAdd',
-      testId: `ep-queue-btn-${episode.episodeKey}`,
-      onSelect: () => {
-        void handleToggleQueue();
-      },
+  const viewDetailsItem: MenuEntry = {
+    key: 'view-details',
+    label: t('detail.viewDetails'),
+    icon: 'shownotes',
+    testId: `ep-view-details-${episode.episodeKey}`,
+    onSelect: () => {
+      setDetailsOpen(true);
     },
-    {
-      key: 'view-details',
-      label: t('detail.viewDetails'),
-      icon: 'shownotes',
-      testId: `ep-view-details-${episode.episodeKey}`,
-      onSelect: () => {
-        setDetailsOpen(true);
-      },
-    },
-  ];
+  };
+  const menuItems: MenuEntry[] = onDeleteDownload
+    ? [
+        {
+          key: 'delete-download',
+          label: t('detail.deleteDownload'),
+          icon: 'delete',
+          testId: `ep-delete-download-${episode.episodeKey}`,
+          onSelect: () => {
+            onDeleteDownload();
+          },
+        },
+        viewDetailsItem,
+      ]
+    : [
+        {
+          key: 'toggle-queue',
+          label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
+          icon: inQueue ? 'queueMusic' : 'playlistAdd',
+          testId: `ep-queue-btn-${episode.episodeKey}`,
+          onSelect: () => {
+            void handleToggleQueue();
+          },
+        },
+        viewDetailsItem,
+      ];
 
   const dateStr = formatShortDate(episode.pubDate, locale);
   const remStr =

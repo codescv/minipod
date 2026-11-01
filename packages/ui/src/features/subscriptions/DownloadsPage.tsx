@@ -2,7 +2,8 @@
  * Manage Downloads screen (`管理下载` / `Manage downloads`):
  * - Opened from top-right `⋮` menu (`subs-manage-downloads` / `detail-manage-downloads` / `queue-manage-downloads`)
  *   when >= 1 downloaded episode exists across subscribed feeds.
- * - Supports single-episode delete (via long-press context menu `ep-download-*` or swipe-left) and `Delete all`.
+ * - Supports single-episode delete (via long-press `ep-context-menu` `Delete download` /
+ *   `ep-delete-download-*`, which replaces the queue toggle here, or swipe-left) and `Delete all`.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { dispatchBackNavigation } from '../../app/back';
@@ -164,6 +165,11 @@ export function DownloadsPage() {
               swipeLeftHintIcon="delete"
               swipeLeftHintTone="danger"
               onSwipeLeftOverride={() => {
+                void host.episodes
+                  .deleteDownload(item.row.episode.episodeKey)
+                  .then(() => loadDownloads());
+              }}
+              onDeleteDownload={() => {
                 void host.episodes
                   .deleteDownload(item.row.episode.episodeKey)
                   .then(() => loadDownloads());

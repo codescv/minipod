@@ -5,6 +5,7 @@
  * - Zero inline play or `⋮` row buttons:
  *   - Tap / click row directly plays (or pauses if current)
  *   - Long-press (~450ms) / right-click / `ContextMenu` opens `<ContextMenu testId="queue-context-menu">`
+ *     (`Move to top` / download / `Remove` / `View details`; v0.1.24 `查看详情` opens `episode-detail-sheet`)
  *   - Swipe-left (`deltaX < -64px`) reveals right-edge `Remove` / `从队列移除` action hint and removes with Undo snackbar
  * - Compact `20×36` drag handle (`queue-handle-*`) with live item-following Pointer/Touch drag-to-reorder
  *   and real-time neighbor slot shifting (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
@@ -14,10 +15,12 @@ import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
+  BottomSheet,
   Button,
   ContextMenu,
   cx,
   Icon,
+  IconButton,
   Menu,
   nonEmptyUrl,
   preloadArtworkUrls,
@@ -29,7 +32,7 @@ import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
-import { formatHumanDuration, formatShortDate } from '../../lib/format';
+import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import { getHostViewCache } from '../../stores/view-cache';
@@ -67,6 +70,7 @@ export function QueueList() {
   const t = useT();
   const player = usePlayer();
   const openDownloads = useRouteStore((s) => s.openDownloads);
+  const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const downloadedCount = useDownloadedCount();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
@@ -88,6 +92,9 @@ export function QueueList() {
     readonly y: number;
   } | null>(null);
   const [pendingUndo, setPendingUndo] = useState<PendingQueueInlineUndo | null>(null);
+  /** v0.1.24 `查看详情` sheet target; `detailsSnapshot` keeps it functional after queue removal. */
+  const [detailsEpisodeKey, setDetailsEpisodeKey] = useState<EpisodeKey | null>(null);
+  const [detailsSnapshot, setDetailsSnapshot] = useState<QueueRow | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<ActiveHandleDrag | null>(null);
@@ -629,9 +636,105 @@ export function QueueList() {
                 void handleRemoveWithUndo(idx);
               },
             },
+            {
+              key: 'view-details',
+              label: t('detail.viewDetails'),
+              icon: 'shownotes',
+              testId: `queue-view-details-${epKey}`,
+              onSelect: () => {
+                setDetailsSnapshot(contextTargetRow);
+                setDetailsEpisodeKey(epKey);
+              },
+            },
           ];
         })()
       : [];
+
+  const closeDetails = useCallback(() => {
+    setDetailsEpisodeKey(null);
+    setDetailsSnapshot(null);
+  }, []);
+
+  // Prefer the live queue row (fresh progress / download state); fall back to the snapshot taken
+  // when the sheet opened so the sheet stays functional if the episode leaves the queue meanwhile.
+  const detailsLiveRow =
+    detailsEpisodeKey !== null
+      ? rows.find((r) => r.episode.episodeKey === detailsEpisodeKey)
+      : undefined;
+  const detailsRow =
+    detailsLiveRow ??
+    (detailsSnapshot && detailsSnapshot.episode.episodeKey === detailsEpisodeKey
+      ? detailsSnapshot
+      : undefined);
+  const detailsSheet = (() => {
+    if (!detailsRow) return null;
+    const episode = detailsRow.episode;
+    const epKey = episode.episodeKey;
+    const inQueue = detailsLiveRow !== undefined;
+    const feed = feedsByKey.get(episode.feedKey);
+    const podcastName = detailsRow.entry.stub?.feedTitle ?? feed?.title ?? '';
+    const primaryCoverUrl =
+      nonEmptyUrl(episode.imageUrl) ?? nonEmptyUrl(detailsRow.entry.stub?.imageUrl);
+    const feedCoverUrl = nonEmptyUrl(feed?.imageUrl) ?? nonEmptyUrl(detailsRow.entry.stub?.imageUrl);
+    const isCurrent = player.episode?.episodeKey === epKey;
+    const isPlaying = isCurrent && player.snapshot.playing;
+    const dur =
+      (isCurrent ? player.snapshot.durationMs : undefined) ??
+      detailsRow.progress?.durationMs ??
+      episode.durationMs ??
+      detailsRow.entry.stub?.durationMs;
+    const pos = isCurrent
+      ? player.snapshot.positionMs
+      : detailsRow.progress?.state === 'IN_PROGRESS'
+        ? detailsRow.progress.positionMs
+        : 0;
+    const dateStr = formatShortDate(episode.pubDate ?? detailsRow.entry.stub?.pubDate, locale);
+    const remStr =
+      dur && pos > 0 && dur > pos
+        ? t('detail.timeLeft', { time: formatHumanDuration(dur - pos) })
+        : dur
+          ? formatHumanDuration(dur)
+          : '';
+    const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
+    const shownotesHtml = sanitizeShownotesHtml(episode.description);
+    return {
+      episode,
+      epKey,
+      inQueue,
+      feed,
+      podcastName,
+      primaryCoverUrl,
+      feedCoverUrl,
+      isCurrent,
+      isPlaying,
+      dateStr,
+      remStr,
+      isAudioOnlyVideo,
+      shownotesHtml,
+    };
+  })();
+
+  const handleDetailsPlayToggle = () => {
+    if (!detailsSheet) return;
+    if (detailsSheet.isCurrent) {
+      void player.togglePlayPause();
+    } else {
+      void player.playEpisode(detailsSheet.episode, {
+        feedTitle: detailsSheet.podcastName,
+        feedImageUrl: detailsSheet.feedCoverUrl,
+      });
+    }
+  };
+
+  const handleDetailsToggleQueue = async () => {
+    if (!detailsSheet) return;
+    if (detailsSheet.inQueue) {
+      await host.queue.remove(detailsSheet.epKey);
+    } else {
+      await host.queue.add(detailsSheet.epKey);
+    }
+    await loadQueue();
+  };
 
   return (
     <div className="m-page" data-testid="queue-screen">
@@ -808,6 +911,173 @@ export function QueueList() {
         items={contextMenuItems}
         testId="queue-context-menu"
       />
+
+      <BottomSheet
+        open={detailsEpisodeKey !== null}
+        onClose={closeDetails}
+        title={t('detail.viewDetails')}
+        testId="episode-detail-sheet"
+      >
+        {detailsSheet && (
+          <div
+            style={{
+              padding: '16px 20px calc(24px + var(--m-safe-bottom))',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 14,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h2 style={{ margin: 0, font: 'var(--md-sys-typescale-title-medium)' }}>
+                {t('detail.viewDetails')}
+              </h2>
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                data-testid={`ep-detail-close-${detailsSheet.epKey}`}
+                onClick={closeDetails}
+              />
+            </div>
+
+            <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
+              <div
+                style={{
+                  width: 64,
+                  height: 64,
+                  borderRadius: 'var(--md-sys-shape-corner-medium)',
+                  overflow: 'hidden',
+                  background: 'var(--md-sys-color-surface-container-high)',
+                  color: 'var(--md-sys-color-on-surface-variant)',
+                  display: 'grid',
+                  placeItems: 'center',
+                  flex: 'none',
+                }}
+              >
+                <ArtworkImage
+                  src={detailsSheet.primaryCoverUrl}
+                  fallbackSrc={detailsSheet.feedCoverUrl}
+                  allowProxyFallback={allowProxy}
+                  style={{ width: 64, height: 64, objectFit: 'cover', display: 'block' }}
+                  placeholder={<Icon name="podcasts" size={28} />}
+                />
+              </div>
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <div
+                  style={{
+                    font: 'var(--md-sys-typescale-title-medium)',
+                    color: 'var(--md-sys-color-on-surface)',
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {detailsSheet.episode.title}
+                </div>
+                {detailsSheet.podcastName && (
+                  <div
+                    style={{
+                      font: 'var(--md-sys-typescale-body-medium)',
+                      color: 'var(--md-sys-color-on-surface-variant)',
+                    }}
+                  >
+                    {detailsSheet.podcastName}
+                  </div>
+                )}
+                {(detailsSheet.dateStr || detailsSheet.remStr) && (
+                  <div className="m-episode-row__meta">
+                    {detailsSheet.dateStr && <span>{detailsSheet.dateStr}</span>}
+                    {detailsSheet.dateStr && detailsSheet.remStr && <span>·</span>}
+                    {detailsSheet.remStr && <span>{detailsSheet.remStr}</span>}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              <Button
+                variant="filled"
+                icon={detailsSheet.isPlaying ? 'pause' : 'play'}
+                data-testid={`ep-detail-play-${detailsSheet.epKey}`}
+                onClick={() => {
+                  handleDetailsPlayToggle();
+                }}
+              >
+                {detailsSheet.isPlaying ? t('detail.pause') : t('detail.play')}
+              </Button>
+              <Button
+                variant="tonal"
+                icon={detailsSheet.inQueue ? 'queueMusic' : 'playlistAdd'}
+                data-testid={`ep-detail-queue-${detailsSheet.epKey}`}
+                onClick={() => {
+                  void handleDetailsToggleQueue();
+                }}
+              >
+                {detailsSheet.inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')}
+              </Button>
+              {detailsSheet.feed && (
+                <Button
+                  variant="outlined"
+                  icon="podcasts"
+                  data-testid={`ep-open-podcast-${detailsSheet.epKey}`}
+                  onClick={() => {
+                    const feedKey = detailsSheet.episode.feedKey;
+                    closeDetails();
+                    openPodcastDetail(feedKey);
+                  }}
+                >
+                  {t('detail.goToPodcast')}
+                </Button>
+              )}
+              {detailsSheet.isAudioOnlyVideo && detailsSheet.episode.enclosureUrl && (
+                <Button
+                  variant="outlined"
+                  icon="openExternal"
+                  data-testid={`ep-open-video-${detailsSheet.epKey}`}
+                  onClick={() => {
+                    if (detailsSheet.episode.enclosureUrl) {
+                      void host.files.openExternal(detailsSheet.episode.enclosureUrl);
+                    }
+                  }}
+                >
+                  {t('detail.openInVideoPlayer')}
+                </Button>
+              )}
+            </div>
+
+            <div
+              style={{
+                borderTop: '1px solid var(--md-sys-color-outline-variant)',
+                paddingTop: 12,
+              }}
+            >
+              {detailsSheet.shownotesHtml ? (
+                <div
+                  className="m-shownotes"
+                  data-testid={`ep-detail-shownotes-${detailsSheet.epKey}`}
+                  onClick={(e) => {
+                    const target = (e.target as HTMLElement | null)?.closest?.('a');
+                    if (target && host.info.capabilities.openExternal) {
+                      const href = target.getAttribute('href');
+                      if (href && /^https?:\/\//i.test(href)) {
+                        e.preventDefault();
+                        void host.files.openExternal(href);
+                      }
+                    }
+                  }}
+                  // Safe: `sanitizeShownotesHtml` strips scripts/styles/iframes/handlers and whitelists benign tags
+                  dangerouslySetInnerHTML={{ __html: detailsSheet.shownotesHtml }}
+                />
+              ) : (
+                <div
+                  className="m-empty"
+                  style={{ padding: '20px 12px' }}
+                  data-testid={`ep-detail-shownotes-${detailsSheet.epKey}`}
+                >
+                  {t('player.noShownotes')}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </BottomSheet>
     </div>
   );
 }
