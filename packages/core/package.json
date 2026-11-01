@@ -1,6 +1,6 @@
 {
   "name": "@minipod/core",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "MiniPod platform-neutral core: shared types + PlatformHost contract, AntennaPod discovery searchers, pure-TS RSS/Atom/RDF/OPML/HTML parsers, binary chapter readers, CRDT cloud-file sync engine and providers. Runs unchanged in Node 22+ and browsers (no Node-only imports).",
   "license": "MIT",
   "type": "module",

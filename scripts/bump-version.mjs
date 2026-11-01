@@ -69,6 +69,9 @@ patchIfExists('packages/ui/src/features/updater/updater.ts', (src) =>
     .replace(/currentVersion: '[0-9]+\.[0-9]+\.[0-9]+'/g, `currentVersion: '${nextVersion}'`)
     .replace(/appVersion \|\| '[0-9]+\.[0-9]+\.[0-9]+'/g, `appVersion || '${nextVersion}'`),
 );
+patchIfExists('packages/ui/src/features/settings/agent-feedback.ts', (src) =>
+  src.replace(/cleaned \|\| '[0-9]+\.[0-9]+\.[0-9]+'/, `cleaned || '${nextVersion}'`),
+);
 
 let nextVersionCode = 1;
 patchIfExists('packages/host-android/android/app/build.gradle', (gradle) =>
