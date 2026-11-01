@@ -113,7 +113,7 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     const settingsScreen = await screen.findByTestId('settings-screen');
     expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(8);
     expect(settingsScreen.querySelectorAll('.m-settings-row')).toHaveLength(8);
-    expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.21');
+    expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.22');
 
     const feedbackBtn = screen.getByTestId('settings-feedback-btn');
     expect(feedbackBtn).toHaveTextContent('反馈给 Agent');
@@ -123,7 +123,7 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     expect(screen.queryByTestId('settings-about-dialog')).not.toBeInTheDocument();
     expect(await screen.findByTestId('settings-feedback-dialog')).toBeInTheDocument();
     expect(screen.getByTestId('settings-feedback-subject-preview')).toHaveTextContent(
-      'minipod: [v0.1.21]',
+      'minipod: [v0.1.22]',
     );
 
     const emailInput = screen.getByTestId('settings-feedback-email-input') as HTMLInputElement;
@@ -167,12 +167,12 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     expect(launchedUrl.startsWith('mailto:agent@example.com?subject=')).toBe(true);
     const parsed = new URL(launchedUrl);
     expect(parsed.searchParams.get('subject')).toBe(
-      'minipod: [v0.1.21] Support chapter artwork zoom',
+      'minipod: [v0.1.22] Support chapter artwork zoom',
     );
     expect(parsed.searchParams.get('body')).toContain(
       'Support chapter artwork zoom\nTap cover inside chapter list',
     );
-    expect(parsed.searchParams.get('body')).toContain('App: Podcasts (minipod) v0.1.21');
+    expect(parsed.searchParams.get('body')).toContain('App: Podcasts (minipod) v0.1.22');
   });
 
   it('contains zero corporate or personal email leakage anywhere in packages/', () => {

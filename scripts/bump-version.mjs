@@ -72,6 +72,12 @@ patchIfExists('packages/ui/src/features/updater/updater.ts', (src) =>
 patchIfExists('packages/ui/src/features/settings/agent-feedback.ts', (src) =>
   src.replace(/cleaned \|\| '[0-9]+\.[0-9]+\.[0-9]+'/, `cleaned || '${nextVersion}'`),
 );
+patchIfExists('packages/ui/src/__tests__/agent-feedback.test.tsx', (src) =>
+  src
+    .replace(/toHaveTextContent\('v[0-9]+\.[0-9]+\.[0-9]+'\)/g, `toHaveTextContent('v${nextVersion}')`)
+    .replace(/minipod: \[v[0-9]+\.[0-9]+\.[0-9]+\]/g, `minipod: [v${nextVersion}]`)
+    .replace(/App: Podcasts \(minipod\) v[0-9]+\.[0-9]+\.[0-9]+/g, `App: Podcasts (minipod) v${nextVersion}`),
+);
 
 let nextVersionCode = 1;
 patchIfExists('packages/host-android/android/app/build.gradle', (gradle) =>
