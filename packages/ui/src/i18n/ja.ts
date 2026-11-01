@@ -33,6 +33,8 @@ export const ja: Messages = {
   'detail.viewDetails': '詳細を表示',
   'queue.moveToTop': '先頭へ移動',
   'queue.downloadAll': 'すべてダウンロード',
+  'queue.stopAll': 'すべて停止',
+  'detail.stopDownload': 'ダウンロードを停止',
   'queue.cached': 'ダウンロード済み',
   'queue.caching': 'ダウンロード中',
   'queue.cachingProgress': 'ダウンロード中 {percent}%',

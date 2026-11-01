@@ -717,4 +717,55 @@ describe('CapacitorPlatformHost', () => {
 
     await host.dispose();
   });
+  it('stops an in-flight download via deleteDownload: cancels natively, deletes deterministic files, and settles to NONE (never FAILED)', async () => {
+    const harness = createTestPluginHarness();
+    let rejectHttp: ((err: Error) => void) | null = null;
+    harness.plugin.httpToFile = vi.fn(
+      () =>
+        new Promise<{ path: string; size: number }>((_resolve, reject) => {
+          rejectHttp = reject;
+        }),
+    );
+    harness.plugin.cancelDownload = vi.fn(async () => {
+      rejectHttp?.(Object.assign(new Error('Download cancelled'), { code: 'cancelled' }));
+    });
+
+    const { host, db } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-download-cancel-test',
+      preferences: createMemoryPreferences(),
+    });
+    const events: { episodeKey: string; state: string }[] = [];
+    const unsub = host.subscribe((ev) => {
+      if (ev.type === 'download-updated') events.push({ episodeKey: ev.episodeKey, state: ev.state });
+    });
+
+    const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+    const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+
+    const downloadPromise = host.episodes.download(ep1Key);
+    await vi.waitFor(() => {
+      expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(1);
+    });
+    expect((await db.get('episodes', ep1Key))?.downloadState).toBe('QUEUED');
+
+    await host.episodes.deleteDownload(ep1Key);
+    await expect(downloadPromise).resolves.toBeUndefined();
+
+    expect(harness.plugin.cancelDownload).toHaveBeenCalledWith({ episodeKey: ep1Key });
+    expect(harness.deletedLocalFiles).toContain(`downloads/${ep1Key}.mp3`);
+    expect(harness.deletedLocalFiles).toContain(`downloads/${ep1Key}.mp3.part`);
+    expect((await db.get('episodes', ep1Key))?.downloadState).toBe('NONE');
+    const ep1States = events.filter((e) => e.episodeKey === ep1Key).map((e) => e.state);
+    expect(ep1States).not.toContain('FAILED');
+    expect(ep1States[ep1States.length - 1]).toBe('NONE');
+
+    // Late native progress for the cancelled download is ignored (no flip back to RUNNING)
+    harness.emitNative('download-progress', { episodeKey: ep1Key, bytesDownloaded: 10, totalBytes: 100 });
+    expect(events.filter((e) => e.episodeKey === ep1Key).at(-1)?.state).toBe('NONE');
+
+    unsub();
+    await host.dispose();
+  });
 });

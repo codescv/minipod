@@ -46,6 +46,7 @@ const PATHS = {
   sortAsc: 'M4 18h16v-2H4v2zM4 6v2h4V6H4zm0 7h10v-2H4v2zm15-4v7h-2V9h-2.5L18 5.5 21.5 9H19z',
   mail: 'M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z',
   send: 'M2.01 21L23 12 2.01 3 2 10l15 2-15 2z',
+  stop: 'M6 6h12v12H6z',
 } as const;
 
 export type IconName = keyof typeof PATHS;

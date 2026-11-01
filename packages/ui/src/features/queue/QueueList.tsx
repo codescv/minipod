@@ -14,6 +14,7 @@ import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
+  Button,
   ContextMenu,
   cx,
   Icon,
@@ -472,6 +473,58 @@ export function QueueList() {
     await loadQueue();
   }, [canDownload, downloadableRows, host.episodes, loadQueue]);
 
+  const downloadingRows = canDownload
+    ? rows.filter(
+        (r) => r.episode.downloadState === 'RUNNING' || r.episode.downloadState === 'QUEUED',
+      )
+    : [];
+
+  /** Optimistically flips the given episodes to `downloadState: 'NONE'` and clears their progress. */
+  const markDownloadsStopped = useCallback(
+    (keySet: ReadonlySet<EpisodeKey>) => {
+      setDownloadProgressByKey((prev) => {
+        let changed = false;
+        const next = new Map(prev);
+        for (const key of keySet) {
+          if (next.delete(key)) changed = true;
+        }
+        return changed ? next : prev;
+      });
+      setRows((prev) => {
+        if (!prev.some((r) => keySet.has(r.episode.episodeKey))) return prev;
+        const next = prev.map((r) =>
+          keySet.has(r.episode.episodeKey)
+            ? { ...r, episode: { ...r.episode, downloadState: 'NONE' as const } }
+            : r,
+        );
+        getHostViewCache(host).queueRows = next;
+        return next;
+      });
+    },
+    [host],
+  );
+
+  const handleStopDownload = useCallback(
+    async (epKey: EpisodeKey) => {
+      markDownloadsStopped(new Set([epKey]));
+      try {
+        await host.episodes.deleteDownload(epKey);
+      } finally {
+        await loadQueue();
+      }
+    },
+    [host.episodes, loadQueue, markDownloadsStopped],
+  );
+
+  const handleStopAllDownloads = useCallback(async () => {
+    if (!canDownload || downloadingRows.length === 0) return;
+    const keys = downloadingRows.map((r) => r.episode.episodeKey);
+    const keySet = new Set(keys);
+    markDownloadsStopped(keySet);
+    await Promise.allSettled(keys.map((key) => host.episodes.deleteDownload(key)));
+    await loadQueue();
+  }, [canDownload, downloadingRows, host.episodes, loadQueue, markDownloadsStopped]);
+
   const headerMenuItems: MenuEntry[] = [
     {
       key: 'download-all',
@@ -483,6 +536,19 @@ export function QueueList() {
         void handleDownloadAll();
       },
     },
+    ...(downloadingRows.length > 0
+      ? [
+          {
+            key: 'stop-all',
+            label: t('queue.stopAll'),
+            icon: 'stop' as const,
+            testId: 'queue-stop-all',
+            onSelect: () => {
+              void handleStopAllDownloads();
+            },
+          },
+        ]
+      : []),
     ...(downloadedCount > 0
       ? [
           {
@@ -518,11 +584,13 @@ export function QueueList() {
               : dlState === 'RUNNING' || dlState === 'QUEUED'
                 ? {
                     key: 'download',
-                    label: t('detail.downloading'),
-                    icon: 'download',
-                    disabled: true,
+                    label: t('detail.stopDownload'),
+                    icon: 'stop',
+                    disabled: !canDownload,
                     testId: `queue-download-${epKey}`,
-                    onSelect: () => {},
+                    onSelect: () => {
+                      void handleStopDownload(epKey);
+                    },
                   }
                 : {
                     key: 'download',
@@ -571,6 +639,18 @@ export function QueueList() {
         <h1 className="m-appbar__title" data-testid="queue-header-title">
           {headerText}
         </h1>
+        {downloadingRows.length > 0 && (
+          <Button
+            variant="text"
+            icon="stop"
+            data-testid="queue-stop-all-btn"
+            onClick={() => {
+              void handleStopAllDownloads();
+            }}
+          >
+            {t('queue.stopAll')}
+          </Button>
+        )}
         <Menu label={t('common.more')} items={headerMenuItems} testId="queue-overflow-btn" />
       </header>
 
@@ -655,6 +735,10 @@ export function QueueList() {
                   downloadProgress={rawProgress}
                   cachedLabel={t('queue.cached')}
                   cachingLabel={cachingLabel}
+                  stopDownloadLabel={t('detail.stopDownload')}
+                  onStopDownload={() => {
+                    void handleStopDownload(epKey);
+                  }}
                   isCurrent={isCurrent}
                   isPlaying={isPlaying}
                   draggingIdx={draggingIdx}
@@ -739,6 +823,8 @@ function QueueRowItem({
   downloadProgress,
   cachedLabel,
   cachingLabel,
+  stopDownloadLabel,
+  onStopDownload,
   isCurrent,
   isPlaying,
   draggingIdx,
@@ -768,6 +854,8 @@ function QueueRowItem({
   readonly downloadProgress?: number | undefined;
   readonly cachedLabel: string;
   readonly cachingLabel: string;
+  readonly stopDownloadLabel: string;
+  readonly onStopDownload: () => void;
   readonly isCurrent: boolean;
   readonly isPlaying: boolean;
   readonly draggingIdx: number | null;
@@ -1051,12 +1139,32 @@ function QueueRowItem({
               {isCacheDownloading && (
                 <span
                   className="m-queue-cache-status is-downloading"
-                  role="img"
-                  aria-label={cachingLabel}
-                  title={cachingLabel}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={stopDownloadLabel}
+                  title={`${cachingLabel} · ${stopDownloadLabel}`}
                   data-testid={`queue-cache-status-${epKey}`}
                   data-cache-state="downloading"
                   data-cache-progress={progressPercent}
+                  style={{ cursor: 'pointer' }}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onTouchStart={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onStopDownload();
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onStopDownload();
+                    }
+                  }}
                 >
                   <svg
                     width={14}
@@ -1088,6 +1196,7 @@ function QueueRowItem({
                       )}
                       transform="rotate(-90 7 7)"
                     />
+                    <rect x="5" y="5" width="4" height="4" rx="0.7" fill="currentColor" />
                   </svg>
                 </span>
               )}

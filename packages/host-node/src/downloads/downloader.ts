@@ -342,6 +342,13 @@ export class EpisodeDownloader {
     if (row.download_path) {
       this.deleteFilesByPaths([row.download_path]);
     }
+    if (active || row.enclosure_url) {
+      // An in-flight (or interrupted) download has `download_path = NULL` in SQLite, so also
+      // clean up the deterministic destination + `.part` temp file left behind by the abort.
+      const ext = chooseExtension(row.enclosure_url ?? '', row.enclosure_mime ?? undefined);
+      const destPath = join(this.downloadsDir, `${episodeKey}.${ext}`);
+      this.deleteFilesByPaths([destPath]);
+    }
     this.episodesRepo.setDownloadState(episodeKey, 'NONE', null);
     this.deps.emit({ type: 'download-updated', episodeKey, state: 'NONE' });
     this.deps.emit({ type: 'episodes-changed', feedKey: row.feed_key });

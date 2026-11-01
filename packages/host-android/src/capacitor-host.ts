@@ -945,9 +945,12 @@ export async function createCapacitorPlatformHost(
 
   // Download progress listener (coalesced <= 2/s per episode)
   const lastDownloadEmitAt = new Map<EpisodeKey, number>();
+  // Episodes whose in-flight download was stopped by the user (`deleteDownload` while RUNNING/QUEUED)
+  const cancelledDownloads = new Set<EpisodeKey>();
   const dlListenerHandle: PluginListenerHandle = await plugin.addListener(
     'download-progress',
     (ev) => {
+      if (cancelledDownloads.has(ev.episodeKey)) return;
       const now = Date.now();
       const prev = lastDownloadEmitAt.get(ev.episodeKey) ?? 0;
       if (now - prev < DOWNLOAD_EVENT_MIN_INTERVAL_MS) return;
@@ -1388,8 +1391,14 @@ export async function createCapacitorPlatformHost(
         const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
         const destPath = `downloads/${episodeKey}.${ext}`;
 
+        cancelledDownloads.delete(episodeKey);
         await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
         emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
+
+        const settleCancelled = async (): Promise<void> => {
+          await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
+          emit({ type: 'download-updated', episodeKey, state: 'NONE' });
+        };
 
         try {
           const res = await plugin.httpToFile({
@@ -1399,12 +1408,22 @@ export async function createCapacitorPlatformHost(
             headers: { 'User-Agent': userAgent },
             ...(creds !== undefined ? { auth: creds } : {}),
           });
+          if (cancelledDownloads.has(episodeKey)) {
+            // User stopped the download right as it finished: discard the file and stay `NONE`.
+            await plugin.deleteLocalFile({ path: res.path }).catch(() => undefined);
+            await settleCancelled();
+            return;
+          }
           await syncStore.setEpisodeDownloadState(episodeKey, 'DONE', res.path);
           emit({ type: 'download-updated', episodeKey, state: 'DONE', progress: 1 });
           emit({ type: 'episodes-changed', feedKey: ep.feedKey });
           await syncNativeQueue();
         } catch (err) {
           const wrapped = MiniPodError.wrap(err, 'network');
+          if (cancelledDownloads.has(episodeKey) || wrapped.code === 'cancelled') {
+            await settleCancelled();
+            return;
+          }
           await syncStore.setEpisodeDownloadState(episodeKey, 'FAILED');
           emit({
             type: 'download-updated',
@@ -1421,9 +1440,23 @@ export async function createCapacitorPlatformHost(
       async deleteDownload(episodeKey: EpisodeKey): Promise<void> {
         const ep = await syncStore.getEpisodeRecord(episodeKey);
         if (!ep) return;
+        // Mark first so a racing `httpToFile` resolution/rejection settles to `NONE` (never `FAILED`).
+        cancelledDownloads.add(episodeKey);
         await plugin.cancelDownload({ episodeKey }).catch(() => undefined);
         if (ep.downloadPath) {
           await plugin.deleteLocalFile({ path: ep.downloadPath }).catch(() => undefined);
+        }
+        if (
+          ep.enclosureUrl &&
+          !ep.feedKey.startsWith('l_') &&
+          !ep.enclosureUrl.startsWith('content://')
+        ) {
+          // In-flight downloads have no `downloadPath` yet: remove the deterministic target + `.part`.
+          const { cleanUrl } = extractUrlCredentials(ep.enclosureUrl);
+          const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
+          const deterministic = `downloads/${episodeKey}.${ext}`;
+          await plugin.deleteLocalFile({ path: deterministic }).catch(() => undefined);
+          await plugin.deleteLocalFile({ path: `${deterministic}.part` }).catch(() => undefined);
         }
         await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
         emit({ type: 'download-updated', episodeKey, state: 'NONE' });

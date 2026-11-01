@@ -298,7 +298,7 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     expect(screen.getByTestId(`queue-remove-${firstKey}`)).toHaveTextContent('从队列移除');
     fireEvent.keyDown(window, { key: 'Escape' });
 
-    // Row 1 (`secondKey` set to RUNNING): `下载中…` is disabled, `置顶` is enabled
+    // Row 1 (`secondKey` set to RUNNING): `停止下载` is enabled, `置顶` is enabled
     act(() => {
       host.emit({
         type: 'download-updated',
@@ -307,16 +307,125 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
         progress: 0.3,
       });
     });
+    // Top-right `停止全部` appears while any queue episode is downloading
+    expect(screen.getByTestId('queue-stop-all-btn')).toHaveTextContent('停止全部');
+    expect(screen.getByTestId(`queue-cache-status-${secondKey}`)).toHaveAttribute(
+      'aria-label',
+      '停止下载',
+    );
     fireEvent.contextMenu(screen.getByTestId('queue-row-1'), { clientX: 120, clientY: 220 });
     expect(screen.getByTestId('queue-context-menu').querySelectorAll('[role="menuitem"]')).toHaveLength(3);
     expect(screen.getByTestId(`queue-move-top-${secondKey}`)).not.toBeDisabled();
-    expect(screen.getByTestId(`queue-download-${secondKey}`)).toHaveTextContent('下载中…');
-    expect(screen.getByTestId(`queue-download-${secondKey}`)).toBeDisabled();
+    expect(screen.getByTestId(`queue-download-${secondKey}`)).toHaveTextContent('停止下载');
+    expect(screen.getByTestId(`queue-download-${secondKey}`)).not.toBeDisabled();
 
     // Remove row 1 via `queue-remove-*`
     fireEvent.click(screen.getByTestId(`queue-remove-${secondKey}`));
     await waitFor(async () => {
       expect(await host.queue.list()).toHaveLength(2);
     });
+  });
+  it('stops a single RUNNING/QUEUED episode download via context menu `Stop download` or by tapping the progress ring (without playing)', async () => {
+    const { host, engine } = renderMiniPod({ width: 1024 });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    const q = await host.queue.list();
+    const secondKey = q[1]!.episode.episodeKey;
+    const thirdKey = q[2]!.episode.episodeKey;
+    const deleteSpy = vi.spyOn(host.episodes, 'deleteDownload');
+
+    // No downloads in flight -> no top-right `Stop all`
+    expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
+
+    act(() => {
+      host.emit({ type: 'download-updated', episodeKey: secondKey, state: 'RUNNING', progress: 0.4 });
+      host.emit({ type: 'download-updated', episodeKey: thirdKey, state: 'QUEUED', progress: 0 });
+    });
+
+    // Context menu on RUNNING row: `Stop download` enabled
+    fireEvent.contextMenu(screen.getByTestId('queue-row-1'), { clientX: 120, clientY: 220 });
+    const stopItem = screen.getByTestId(`queue-download-${secondKey}`);
+    expect(stopItem).toHaveTextContent('Stop download');
+    expect(stopItem).not.toBeDisabled();
+    fireEvent.click(stopItem);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${secondKey}`)).not.toBeInTheDocument();
+    });
+    expect(deleteSpy).toHaveBeenCalledWith(secondKey);
+    expect((await host.queue.list()).find((r) => r.episode.episodeKey === secondKey)?.episode.downloadState).toBe('NONE');
+
+    // Tapping the QUEUED row's progress ring (with a stop square) stops it without starting playback
+    act(() => {
+      host.emit({ type: 'download-updated', episodeKey: thirdKey, state: 'QUEUED', progress: 0 });
+    });
+    const ring = screen.getByTestId(`queue-cache-status-${thirdKey}`);
+    expect(ring).toHaveAttribute('role', 'button');
+    expect(ring).toHaveAttribute('aria-label', 'Stop download');
+    expect(ring.querySelectorAll('circle')).toHaveLength(2);
+    expect(ring.querySelectorAll('rect')).toHaveLength(1);
+    expect(screen.getByTestId('queue-row-2').querySelectorAll('button')).toHaveLength(0);
+    fireEvent.pointerDown(ring);
+    fireEvent.click(ring);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
+    });
+    expect(deleteSpy).toHaveBeenCalledWith(thirdKey);
+    expect(engine.getSnapshot().playing).toBe(false);
+    expect(engine.getSnapshot().episodeKey).not.toBe(thirdKey);
+    expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
+  });
+
+  it('shows top-right `Stop all` (button + overflow menu item) while downloads are in flight and stops all of them', async () => {
+    const { host } = renderMiniPod({ width: 1024 });
+
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    const q = await host.queue.list();
+    const secondKey = q[1]!.episode.episodeKey;
+    const thirdKey = q[2]!.episode.episodeKey;
+    const deleteSpy = vi.spyOn(host.episodes, 'deleteDownload');
+
+    // Overflow menu has no `Stop all` without active downloads
+    fireEvent.click(screen.getByTestId('queue-overflow-btn'));
+    expect(screen.getByTestId('queue-download-all')).toBeInTheDocument();
+    expect(screen.queryByTestId('queue-stop-all')).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    const startBoth = () => {
+      act(() => {
+        host.emit({ type: 'download-updated', episodeKey: secondKey, state: 'RUNNING', progress: 0.2 });
+        host.emit({ type: 'download-updated', episodeKey: thirdKey, state: 'QUEUED', progress: 0 });
+      });
+    };
+
+    // 1) Top-right header button
+    startBoth();
+    const stopAllBtn = screen.getByTestId('queue-stop-all-btn');
+    expect(stopAllBtn).toHaveTextContent('Stop all');
+    fireEvent.click(stopAllBtn);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${secondKey}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
+    });
+    expect(deleteSpy).toHaveBeenCalledWith(secondKey);
+    expect(deleteSpy).toHaveBeenCalledWith(thirdKey);
+
+    // 2) Overflow menu item `queue-stop-all`
+    deleteSpy.mockClear();
+    startBoth();
+    fireEvent.click(screen.getByTestId('queue-overflow-btn'));
+    const stopAllItem = screen.getByTestId('queue-stop-all');
+    expect(stopAllItem).toHaveTextContent('Stop all');
+    fireEvent.click(stopAllItem);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`queue-cache-status-${secondKey}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
+    });
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect((await host.queue.list()).find((r) => r.episode.episodeKey === secondKey)?.episode.downloadState).toBe('NONE');
+    expect((await host.queue.list()).find((r) => r.episode.episodeKey === thirdKey)?.episode.downloadState).toBe('NONE');
   });
 });

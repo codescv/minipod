@@ -64,6 +64,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -106,6 +107,10 @@ public class MiniPodPlugin extends Plugin {
 
     private final ExecutorService ioPool = Executors.newCachedThreadPool();
     private final Map<String, Call> activeDownloadCalls = new ConcurrentHashMap<>();
+    /** `.part` temp files of in-flight downloads so `cancelDownload` can remove them. */
+    private final Map<String, File> activeDownloadPartFiles = new ConcurrentHashMap<>();
+    /** Episode keys whose in-flight download was stopped via `cancelDownload`. */
+    private final Set<String> cancelledDownloadKeys = ConcurrentHashMap.newKeySet();
 
     private final OkHttpClient okHttp = new OkHttpClient.Builder()
         .followRedirects(false)
@@ -548,6 +553,11 @@ public class MiniPodPlugin extends Plugin {
 
     @PluginMethod
     public void httpToFile(PluginCall call) {
+        String startKey = call.getString("episodeKey");
+        if (startKey != null) {
+            // Cleared synchronously (plugin thread) so a later `cancelDownload` is never lost.
+            cancelledDownloadKeys.remove(startKey);
+        }
         ioPool.execute(() -> {
             String episodeKey = call.getString("episodeKey");
             String rawUrl = call.getString("url");
@@ -569,6 +579,7 @@ public class MiniPodPlugin extends Plugin {
                 return;
             }
             File partFile = new File(finalFile.getAbsolutePath() + ".part");
+            activeDownloadPartFiles.put(episodeKey, partFile);
             long existingBytes = partFile.exists() ? partFile.length() : 0L;
             long resumeFrom = safeLong(call, "resumeFrom", existingBytes);
 
@@ -612,6 +623,9 @@ public class MiniPodPlugin extends Plugin {
                         byte[] buf = new byte[16_384];
                         int n;
                         while ((n = in.read(buf)) != -1) {
+                            if (cancelledDownloadKeys.contains(episodeKey)) {
+                                throw new IOException("Canceled");
+                            }
                             raf.write(buf, 0, n);
                             written += n;
                             long now = System.currentTimeMillis();
@@ -627,6 +641,9 @@ public class MiniPodPlugin extends Plugin {
                         raf.getFD().sync();
                     }
 
+                    if (cancelledDownloadKeys.contains(episodeKey)) {
+                        throw new IOException("Canceled");
+                    }
                     if (finalFile.exists() && !finalFile.delete()) {
                         throw new IOException("Unable to replace existing file " + finalFile);
                     }
@@ -644,13 +661,20 @@ public class MiniPodPlugin extends Plugin {
                     resp.close();
                 }
             } catch (Exception e) {
-                call.reject(
-                    e.getMessage() != null ? e.getMessage() : "Episode download failed",
-                    "network",
-                    e
-                );
+                if (cancelledDownloadKeys.contains(episodeKey)) {
+                    //noinspection ResultOfMethodCallIgnored
+                    partFile.delete();
+                    call.reject("Download cancelled", "cancelled", e);
+                } else {
+                    call.reject(
+                        e.getMessage() != null ? e.getMessage() : "Episode download failed",
+                        "network",
+                        e
+                    );
+                }
             } finally {
                 activeDownloadCalls.remove(episodeKey);
+                activeDownloadPartFiles.remove(episodeKey, partFile);
             }
         });
     }
@@ -731,9 +755,15 @@ public class MiniPodPlugin extends Plugin {
     public void cancelDownload(PluginCall call) {
         String episodeKey = call.getString("episodeKey");
         if (episodeKey != null) {
+            cancelledDownloadKeys.add(episodeKey);
             Call active = activeDownloadCalls.remove(episodeKey);
             if (active != null) {
                 active.cancel();
+            }
+            File partFile = activeDownloadPartFiles.remove(episodeKey);
+            if (partFile != null && partFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                partFile.delete();
             }
         }
         call.resolve();
