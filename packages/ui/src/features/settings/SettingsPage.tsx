@@ -4,6 +4,13 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings, SyncProviderConfig, SyncStatus } from '@minipod/core';
+import {
+  AGENT_FEEDBACK_EMAIL_PLACEHOLDER,
+  buildAgentFeedbackMailto,
+  isValidFeedbackEmail,
+  loadAgentFeedbackEmail,
+  saveAgentFeedbackEmail,
+} from './agent-feedback';
 import { isGoogleDriveSafUri } from './CloudSyncSetup';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
@@ -38,6 +45,9 @@ export function SettingsPage() {
   const [deviceDialogOpen, setDeviceDialogOpen] = useState(false);
   const [deviceDraft, setDeviceDraft] = useState(settings.sync.deviceName);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackEmail, setFeedbackEmail] = useState(() => loadAgentFeedbackEmail());
+  const [feedbackText, setFeedbackText] = useState('');
 
   const updateStatus = useUpdateStore((s) => s.status);
   const updateRelease = useUpdateStore((s) => s.release);
@@ -146,6 +156,54 @@ export function SettingsPage() {
     const xml = await host.feeds.exportOpml();
     await host.files.saveTextFile('minipod-subscriptions.opml', xml, 'text/x-opml');
     showSnackbar(t('opml.exportedSnack'));
+  };
+
+  const handleOpenFeedback = useCallback(() => {
+    setFeedbackEmail(loadAgentFeedbackEmail());
+    setFeedbackOpen(true);
+  }, []);
+
+  const handleSaveFeedbackEmail = () => {
+    const trimmed = feedbackEmail.trim();
+    if (!trimmed) {
+      saveAgentFeedbackEmail('');
+      setFeedbackEmail('');
+      showSnackbar(t('feedback.emailClearedSnack'));
+      return;
+    }
+    if (!isValidFeedbackEmail(trimmed)) {
+      showSnackbar(t('feedback.emailInvalidSnack'));
+      return;
+    }
+    const saved = saveAgentFeedbackEmail(trimmed);
+    setFeedbackEmail(saved);
+    showSnackbar(t('feedback.emailSavedSnack'));
+  };
+
+  const handleSendFeedbackEmail = async () => {
+    const trimmedEmail = feedbackEmail.trim();
+    if (!isValidFeedbackEmail(trimmedEmail)) {
+      showSnackbar(t('feedback.emailInvalidSnack'));
+      return;
+    }
+    const savedEmail = saveAgentFeedbackEmail(trimmedEmail);
+    setFeedbackEmail(savedEmail);
+    const mailtoUrl = buildAgentFeedbackMailto({
+      email: savedEmail,
+      appVersion: host.info.appVersion,
+      feedbackText,
+      platform: host.info.platform,
+      os: host.info.os,
+    });
+    try {
+      await host.files.openExternal(mailtoUrl);
+    } catch {
+      if (typeof window !== 'undefined' && typeof window.location?.assign === 'function') {
+        window.location.assign(mailtoUrl);
+      }
+    }
+    setFeedbackText('');
+    setFeedbackOpen(false);
   };
 
   return (
@@ -291,7 +349,7 @@ export function SettingsPage() {
         <h2 className="m-settings-heading">{t('settings.sectionAbout')}</h2>
 
         <div
-          className="m-settings-row m-settings-row--clickable"
+          className="m-settings-row m-settings-row--clickable m-settings-row--about"
           data-settings-row="8"
           data-testid="settings-row-about"
           onClick={() => setAboutOpen(true)}
@@ -353,9 +411,17 @@ export function SettingsPage() {
           </div>
 
           <div
-            style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 'none' }}
+            className="m-settings-row__actions"
             onClick={(e) => e.stopPropagation()}
           >
+            <Button
+              variant="outlined"
+              icon="mail"
+              data-testid="settings-feedback-btn"
+              onClick={handleOpenFeedback}
+            >
+              {t('feedback.openButton')}
+            </Button>
             {updateStatus === 'available' && updateRelease ? (
               <Button
                 variant="filled"
@@ -442,6 +508,17 @@ export function SettingsPage() {
           <>
             <Button
               variant="text"
+              icon="mail"
+              data-testid="settings-about-feedback-btn"
+              onClick={() => {
+                setAboutOpen(false);
+                handleOpenFeedback();
+              }}
+            >
+              {t('feedback.openButton')}
+            </Button>
+            <Button
+              variant="text"
               icon="openExternal"
               onClick={() => {
                 void host.files.openExternal('https://github.com/codescv/minipod');
@@ -458,6 +535,81 @@ export function SettingsPage() {
           <div>Platform: {host.info.platform} ({host.info.os})</div>
           <div>Device ID: {host.info.deviceId}</div>
           {host.info.dataDir && <div>Data directory: {host.info.dataDir}</div>}
+        </div>
+      </Dialog>
+
+      {/* Agent Feedback Dialog */}
+      <Dialog
+        open={feedbackOpen}
+        onClose={() => setFeedbackOpen(false)}
+        title={t('feedback.dialogTitle')}
+        testId="settings-feedback-dialog"
+        actions={
+          <>
+            <Button
+              variant="text"
+              data-testid="settings-feedback-cancel-btn"
+              onClick={() => setFeedbackOpen(false)}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="filled"
+              icon="send"
+              data-testid="settings-feedback-send-btn"
+              onClick={() => {
+                void handleSendFeedbackEmail();
+              }}
+            >
+              {t('feedback.sendEmail')}
+            </Button>
+          </>
+        }
+      >
+        <div className="m-field">
+          <label className="m-field__label" htmlFor="minipod-agent-feedback-email">
+            {t('feedback.emailLabel')}
+          </label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              id="minipod-agent-feedback-email"
+              className="m-field__input"
+              style={{ flex: '1 1 200px', minWidth: 0 }}
+              type="email"
+              placeholder={AGENT_FEEDBACK_EMAIL_PLACEHOLDER}
+              aria-label={t('feedback.emailLabel')}
+              data-testid="settings-feedback-email-input"
+              value={feedbackEmail}
+              onChange={(e) => setFeedbackEmail(e.target.value)}
+            />
+            <Button
+              variant="tonal"
+              data-testid="settings-feedback-save-email-btn"
+              onClick={handleSaveFeedbackEmail}
+            >
+              {t('feedback.saveEmail')}
+            </Button>
+          </div>
+          <span className="m-field__hint">{t('feedback.emailHint')}</span>
+        </div>
+
+        <div className="m-field">
+          <label className="m-field__label" htmlFor="minipod-agent-feedback-message">
+            {t('feedback.messageLabel')}
+          </label>
+          <textarea
+            id="minipod-agent-feedback-message"
+            className="m-field__input m-field__textarea"
+            rows={4}
+            placeholder={t('feedback.messagePlaceholder')}
+            aria-label={t('feedback.messageLabel')}
+            data-testid="settings-feedback-message-input"
+            value={feedbackText}
+            onChange={(e) => setFeedbackText(e.target.value)}
+          />
+          <span className="m-field__hint" data-testid="settings-feedback-subject-preview">
+            {t('feedback.subjectPreview', { version: host.info.appVersion.replace(/^v/i, '') })}
+          </span>
         </div>
       </Dialog>
     </div>

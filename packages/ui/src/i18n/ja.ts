@@ -50,4 +50,10 @@ export const ja: Messages = {
   'update.upToDateSnack': 'Podcasts v{version} は最新です',
   'update.updateNow': '今すぐ更新',
   'update.checkForUpdates': 'アップデートを確認',
+  'feedback.openButton': 'Agent にフィードバック',
+  'feedback.dialogTitle': 'Agent にフィードバックを送信',
+  'feedback.emailLabel': 'Agent フィードバック用メール',
+  'feedback.saveEmail': 'メールを保存',
+  'feedback.messageLabel': 'フィードバック内容',
+  'feedback.sendEmail': 'メールを送信',
 };

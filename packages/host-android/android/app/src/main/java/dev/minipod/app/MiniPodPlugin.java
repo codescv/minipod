@@ -228,7 +228,20 @@ public class MiniPodPlugin extends Plugin {
             return;
         }
         try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url.trim()));
+            Uri uri = Uri.parse(url.trim());
+            String scheme = uri.getScheme();
+            if (scheme != null && "mailto".equalsIgnoreCase(scheme)) {
+                try {
+                    Intent sendToIntent = new Intent(Intent.ACTION_SENDTO, uri);
+                    sendToIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    getContext().startActivity(sendToIntent);
+                    call.resolve();
+                    return;
+                } catch (ActivityNotFoundException ignored) {
+                    // Fall back to ACTION_VIEW when no SENDTO handler is registered
+                }
+            }
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             getContext().startActivity(intent);
             call.resolve();

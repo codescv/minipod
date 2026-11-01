@@ -1315,6 +1315,25 @@ button:disabled {
   color: var(--md-sys-color-on-surface-variant);
 }
 
+.m-settings-row__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: none;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 560px) {
+  .m-settings-row--about {
+    flex-wrap: wrap;
+  }
+  .m-settings-row--about .m-settings-row__actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
 .m-radio-card {
   display: flex;
   flex-direction: column;
@@ -1384,6 +1403,18 @@ button:disabled {
   border: 1px solid var(--md-sys-color-outline);
   background: var(--md-sys-color-surface);
   color: var(--md-sys-color-on-surface);
+}
+
+.m-field__textarea {
+  min-height: 96px;
+  resize: vertical;
+  font: var(--md-sys-typescale-body-medium);
+  line-height: 1.45;
+}
+
+.m-field__hint {
+  font: var(--md-sys-typescale-body-small);
+  color: var(--md-sys-color-on-surface-variant);
 }
 
 .m-scrim {

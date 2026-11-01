@@ -89,6 +89,22 @@ export {
 export { resolveLocale, translate, useLocale, useT } from './i18n';
 export { UpdateBanner } from './features/updater/UpdateBanner';
 export {
+  AGENT_FEEDBACK_EMAIL_KEY,
+  AGENT_FEEDBACK_EMAIL_PLACEHOLDER,
+  AGENT_FEEDBACK_PROJECT_ALIAS,
+  isValidFeedbackEmail,
+  loadAgentFeedbackEmail,
+  saveAgentFeedbackEmail,
+  normalizeFeedbackVersion,
+  extractFeedbackSummary,
+  buildAgentFeedbackSubject,
+  buildAgentFeedbackBody,
+  buildAgentFeedbackMailto,
+  type AgentFeedbackSubjectOptions,
+  type AgentFeedbackBodyOptions,
+  type AgentFeedbackMailtoOptions,
+} from './features/settings/agent-feedback';
+export {
   useUpdateStore,
   GITHUB_REPO,
   GITHUB_RELEASE_API_URL,

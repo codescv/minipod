@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach } from 'vitest';
 import { useRouteStore } from './app/routes';
+import { AGENT_FEEDBACK_EMAIL_KEY } from './features/settings/agent-feedback';
 import { DISMISSED_UPDATE_TAG_KEY, useUpdateStore } from './features/updater/updater';
 import { useSettingsStore } from './stores/settings';
 import { useSnackbarStore } from './stores/snackbar';
@@ -10,6 +11,7 @@ afterEach(() => {
   cleanup();
   try {
     localStorage.removeItem(DISMISSED_UPDATE_TAG_KEY);
+    localStorage.removeItem(AGENT_FEEDBACK_EMAIL_KEY);
   } catch {
     // ignore
   }
