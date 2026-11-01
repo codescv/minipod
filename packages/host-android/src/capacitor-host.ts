@@ -633,10 +633,15 @@ export async function createCapacitorPlatformHost(
     }
 
     const slice = rows.slice(startIndex);
+    // Offline (Airplane Mode): only hand downloaded/local files to the native playlist. A remote
+    // URL would be pre-buffered by ExoPlayer right after a local file, fail, and drop the whole
+    // player (including the playing local episode) to IDLE.
+    const online = deps.schedulerHost.isOnline();
     const items: QueueItemSource[] = [];
     for (const row of slice) {
       try {
         const source = await resolveMediaSourceForEpisode(row.episode.episodeKey);
+        if (!online && source.kind !== 'file') continue;
         const feedRec = await syncStore.getFeedRecord(row.episode.feedKey);
         const startMs = computeResumePositionMs(row.progress);
         const artworkUrl = row.episode.imageUrl?.trim() || feedRec?.imageUrl?.trim() || undefined;
@@ -665,6 +670,20 @@ export async function createCapacitorPlatformHost(
     engine.setQueue(items);
   };
   pushNativeQueueFn = syncNativeQueue;
+
+  // Refresh the native playlist when connectivity changes (re-add remote items once back online).
+  let removeConnectivityListeners: (() => void) | null = null;
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    const onConnectivityChanged = (): void => {
+      void syncNativeQueue().catch(() => undefined);
+    };
+    window.addEventListener('online', onConnectivityChanged);
+    window.addEventListener('offline', onConnectivityChanged);
+    removeConnectivityListeners = () => {
+      window.removeEventListener('online', onConnectivityChanged);
+      window.removeEventListener('offline', onConnectivityChanged);
+    };
+  }
 
   // Discovery & URL Resolver (`@minipod/core`)
   const searcherRegistry = createSearcherRegistry({
@@ -1081,7 +1100,11 @@ export async function createCapacitorPlatformHost(
 
   const lifecycleUnsub = deps.onAppLifecycle?.({
     onForeground: () => {
+      // Re-read native playback state (never clobbers a paused position with 0 when the service
+      // was stopped in the background) and refresh the native queue for current connectivity.
+      void engine.syncStateFromNative().catch(() => undefined);
       void reconcileJournal().then(() => {
+        void syncNativeQueue().catch(() => undefined);
         if (syncEngine.getProvider()) {
           syncScheduler.request('foreground');
         }
@@ -2061,6 +2084,7 @@ export async function createCapacitorPlatformHost(
       disposed = true;
       bgRefreshUnsub?.();
       lifecycleUnsub?.();
+      removeConnectivityListeners?.();
       syncScheduler.dispose();
       engine.dispose();
       await Promise.all([

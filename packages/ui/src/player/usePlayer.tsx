@@ -50,6 +50,8 @@ export interface PlayEpisodeOptions {
   readonly feedImageUrl?: string | undefined;
   readonly inlineChapters?: readonly Chapter[] | undefined;
   readonly startAtZero?: boolean | undefined;
+  /** Resume at this exact position (e.g. the paused UI position) instead of the saved progress. */
+  readonly resumeAtMs?: number | undefined;
 }
 
 export interface PlayerContextValue {
@@ -117,6 +119,31 @@ export function PlayerProvider({
   sleepTimerRef.current = sleepTimer;
   const lastSavedAtRef = useRef(0);
   const suppressAutoAdvanceForKeyRef = useRef<string | null>(null);
+  const feedTitleRef = useRef(feedTitle);
+  feedTitleRef.current = feedTitle;
+  const feedImageUrlRef = useRef(feedImageUrl);
+  feedImageUrlRef.current = feedImageUrl;
+  /** Until this time, a paused `positionMs: 0` is intentional (user seek to 0 / fresh load). */
+  const allowZeroUntilRef = useRef(0);
+
+  /**
+   * True when a paused `positionMs: 0` for the current episode is a transient native idle/reset
+   * (e.g. `PlaybackService` stopped while paused in the background) that must not clobber the
+   * known paused position back to 0:00.
+   */
+  const isTransientZero = useCallback(
+    (next: { readonly playing: boolean; readonly positionMs: number; readonly episodeKey?: string | undefined }) => {
+      const curEp = episodeRef.current;
+      if (!curEp) return false;
+      if (next.playing || next.positionMs !== 0) return false;
+      if (next.episodeKey && next.episodeKey !== curEp.episodeKey) return false;
+      if (Date.now() < allowZeroUntilRef.current) return false;
+      const prev = snapshotRef.current;
+      if (prev.episodeKey !== curEp.episodeKey || prev.positionMs <= 0) return false;
+      return !isEpisodeNearEnd(prev.positionMs, prev.durationMs ?? curEp.durationMs);
+    },
+    [],
+  );
 
   const syncNativeQueue = useCallback(async () => {
     if (!engine.capabilities.nativeQueue || !engine.setQueue) return;
@@ -194,7 +221,9 @@ export function PlayerProvider({
 
       // Compute resume point (3s rewind for IN_PROGRESS)
       let startMs = 0;
-      if (!options?.startAtZero) {
+      if (!options?.startAtZero && options?.resumeAtMs !== undefined && options.resumeAtMs > 0) {
+        startMs = Math.floor(options.resumeAtMs);
+      } else if (!options?.startAtZero) {
         try {
           const existingProg = await host.progress.get(target.episodeKey);
           startMs = computeResumePositionMs(existingProg);
@@ -231,6 +260,9 @@ export function PlayerProvider({
       setChapterArtworkUrl(undefined);
       setChapters(options?.inlineChapters ?? []);
       suppressAutoAdvanceForKeyRef.current = null;
+      if (startMs === 0) {
+        allowZeroUntilRef.current = Date.now() + 2000;
+      }
 
       await engine.load({
         episodeKey: target.episodeKey,
@@ -327,7 +359,20 @@ export function PlayerProvider({
     return engine.subscribe((ev) => {
       if (ev.type === 'state') {
         const prev = snapshotRef.current;
-        setSnapshot(ev.snapshot);
+        let nextSnap = ev.snapshot;
+        const curEp = episodeRef.current;
+        if (curEp && isTransientZero(nextSnap)) {
+          // Never clobber the paused position with a transient native idle `0` state.
+          const durationMs = nextSnap.durationMs ?? prev.durationMs ?? curEp.durationMs;
+          nextSnap = {
+            ...nextSnap,
+            episodeKey: curEp.episodeKey,
+            positionMs: prev.positionMs,
+            ...(durationMs !== undefined ? { durationMs } : {}),
+          };
+        }
+        snapshotRef.current = nextSnap;
+        setSnapshot(nextSnap);
 
         // Save immediately on transition from playing -> paused
         if (prev.playing && !ev.snapshot.playing && ev.snapshot.episodeKey) {
@@ -343,6 +388,9 @@ export function PlayerProvider({
           });
         }
       } else if (ev.type === 'position') {
+        if (isTransientZero({ playing: engine.getSnapshot().playing, positionMs: ev.positionMs, episodeKey: ev.episodeKey })) {
+          return;
+        }
         setSnapshot((s) => ({
           ...s,
           episodeKey: ev.episodeKey,
@@ -439,7 +487,46 @@ export function PlayerProvider({
         })();
       }
     });
-  }, [engine, host, saveProgressSafe]);
+  }, [engine, host, saveProgressSafe, isTransientZero]);
+
+  // Hydrate the current episode when the engine already has an active/paused track (e.g. the
+  // WebView reloaded while `PlaybackService` kept a paused episode).
+  const hydratingKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = snapshot.episodeKey;
+    if (!key || episodeRef.current || hydratingKeyRef.current === key) return;
+    hydratingKeyRef.current = key;
+    void (async () => {
+      try {
+        const row = await host.episodes.get(key);
+        if (episodeRef.current) return;
+        let title = '';
+        let feedImg: string | undefined;
+        try {
+          const feed = await host.feeds.get(row.episode.feedKey);
+          title = nonEmptyUrl(feed.title) ?? '';
+          feedImg = nonEmptyUrl(feed.imageUrl);
+        } catch {
+          // ignore
+        }
+        if (episodeRef.current) return;
+        episodeRef.current = row.episode;
+        setEpisode(row.episode);
+        setFeedTitle(title);
+        setEpisodeImageUrl(nonEmptyUrl(row.episode.imageUrl));
+        setFeedImageUrl(feedImg);
+        setChapterArtworkUrl(undefined);
+        const chs = await host.episodes.chapters(key).catch(() => []);
+        if (episodeRef.current?.episodeKey === key) {
+          setChapters(chs);
+        }
+      } catch {
+        // ignore
+      } finally {
+        hydratingKeyRef.current = null;
+      }
+    })();
+  }, [snapshot.episodeKey, host]);
 
   // Flush progress on `pagehide` / hidden visibility change
   useEffect(() => {
@@ -464,6 +551,45 @@ export function PlayerProvider({
   useHostEvents((event) => {
     if (event.type === 'queue-changed') {
       void syncNativeQueue();
+    } else if (event.type === 'progress-changed' && !event.fromSync) {
+      // Local progress change (e.g. native journal reconciled on foreground resume): reflect the
+      // exact native checkpoint while paused instead of showing 0:00.
+      const curEp = episodeRef.current;
+      if (!curEp || curEp.episodeKey !== event.episodeKey) return;
+      if (engine.getSnapshot().playing) return;
+      void host.progress
+        .get(event.episodeKey)
+        .then((prog) => {
+          if (
+            !prog ||
+            prog.state !== 'IN_PROGRESS' ||
+            prog.positionMs <= 0 ||
+            episodeRef.current?.episodeKey !== event.episodeKey ||
+            engine.getSnapshot().playing ||
+            prog.positionMs === snapshotRef.current.positionMs
+          ) {
+            return;
+          }
+          const posMs = prog.positionMs;
+          const engSnap = engine.getSnapshot();
+          if (
+            engSnap.episodeKey === event.episodeKey &&
+            Math.abs(engSnap.positionMs - posMs) > 1500
+          ) {
+            engine.seekTo(posMs);
+          }
+          setSnapshot((s) => {
+            const next: PlayerSnapshot = {
+              ...s,
+              episodeKey: event.episodeKey,
+              positionMs: posMs,
+              ...(prog.durationMs ? { durationMs: prog.durationMs } : {}),
+            };
+            snapshotRef.current = next;
+            return next;
+          });
+        })
+        .catch(() => undefined);
     } else if (event.type === 'progress-changed' && event.fromSync) {
       const curEp = episodeRef.current;
       if (!curEp || curEp.episodeKey !== event.episodeKey) return;
@@ -525,19 +651,56 @@ export function PlayerProvider({
     };
   }, [episode, activeChapterIndex, chapters, host]);
 
+  /**
+   * Self-healing resume: if the engine lost the current episode (native service stopped/reset
+   * while paused in the background), reload it at the paused position instead of calling
+   * `play()` on an unloaded engine (which left the Play button dead at 0:00).
+   */
+  const resumeCurrent = useCallback(async () => {
+    const curEp = episodeRef.current;
+    if (!curEp) return;
+    const uiSnap = snapshotRef.current;
+    const uiPosMs = uiSnap.episodeKey === curEp.episodeKey ? uiSnap.positionMs : 0;
+    const reload = () =>
+      playEpisodeRef.current(curEp, {
+        feedTitle: feedTitleRef.current || undefined,
+        feedImageUrl: feedImageUrlRef.current,
+        ...(uiPosMs > 0 ? { resumeAtMs: uiPosMs } : {}),
+      });
+
+    const snap = engine.getSnapshot();
+    if (!snap.episodeKey || snap.episodeKey !== curEp.episodeKey) {
+      await reload();
+      return;
+    }
+    if (snap.positionMs === 0 && uiPosMs > 0) {
+      engine.seekTo(uiPosMs);
+    }
+    try {
+      await engine.play();
+    } catch {
+      await reload();
+      return;
+    }
+    const after = engine.getSnapshot();
+    if (!after.playing && !after.buffering) {
+      await reload();
+    }
+  }, [engine]);
+
   const togglePlayPause = useCallback(async () => {
     if (!episodeRef.current) return;
     if (engine.getSnapshot().playing) {
       engine.pause();
     } else {
-      await engine.play();
+      await resumeCurrent();
     }
-  }, [engine]);
+  }, [engine, resumeCurrent]);
 
   const play = useCallback(async () => {
     if (!episodeRef.current) return;
-    await engine.play();
-  }, [engine]);
+    await resumeCurrent();
+  }, [resumeCurrent]);
 
   const pause = useCallback(() => {
     engine.pause();
@@ -545,6 +708,9 @@ export function PlayerProvider({
 
   const seekTo = useCallback(
     (ms: number) => {
+      if (ms < 1000) {
+        allowZeroUntilRef.current = Date.now() + 2000;
+      }
       engine.seekTo(ms);
       const snap = engine.getSnapshot();
       if (snap.episodeKey) {

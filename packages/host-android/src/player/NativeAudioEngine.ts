@@ -91,6 +91,14 @@ export class NativeAudioEngine implements PlayerEngine {
   };
 
   private requestedEpisodeKey: EpisodeKey | undefined;
+  /**
+   * Last item handed to `load()` (kept in sync with the latest known position) so `play()` can
+   * transparently reload it when Android stopped/reset `PlaybackService` while paused in the
+   * background (e.g. Airplane Mode + downloaded audio).
+   */
+  private lastLoadedItem: PlayerLoadItem | null = null;
+  /** Last native queue so autonomous advances keep `lastLoadedItem` accurate. */
+  private lastQueueItems: readonly QueueItemSource[] = [];
   private pendingSeek: {
     readonly episodeKey: EpisodeKey | undefined;
     readonly targetMs: number;
@@ -166,15 +174,30 @@ export class NativeAudioEngine implements PlayerEngine {
       }
     }
 
+    // Transient native idle state (service stopped/restarted while paused in the background, or
+    // an empty player): never wipe the known paused episode/position back to 0:00.
+    const transientIdle =
+      payload.episodeKey === undefined &&
+      !payload.playing &&
+      rawPosMs === 0 &&
+      prev.episodeKey !== undefined;
+    const episodeKey: EpisodeKey | undefined = transientIdle
+      ? prev.episodeKey
+      : payload.episodeKey;
+    const durationMs =
+      payload.durationMs !== undefined && payload.durationMs > 0
+        ? Math.trunc(payload.durationMs)
+        : transientIdle
+          ? prev.durationMs
+          : undefined;
+
     const next: PlayerSnapshot = {
       playing: payload.playing,
       buffering: payload.buffering,
-      positionMs: resolvedPosMs,
-      speed: clampSpeed(payload.speed),
-      ...(payload.episodeKey !== undefined ? { episodeKey: payload.episodeKey } : {}),
-      ...(payload.durationMs !== undefined && payload.durationMs > 0
-        ? { durationMs: Math.trunc(payload.durationMs) }
-        : {}),
+      positionMs: transientIdle ? prev.positionMs : resolvedPosMs,
+      speed: transientIdle ? prev.speed : clampSpeed(payload.speed),
+      ...(episodeKey !== undefined ? { episodeKey } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
     };
 
     const autonomousAdvance =
@@ -185,9 +208,11 @@ export class NativeAudioEngine implements PlayerEngine {
 
     if (autonomousAdvance) {
       this.requestedEpisodeKey = next.episodeKey;
+      this.adoptQueuedItem(next.episodeKey);
     }
 
     this.snapshot = next;
+    this.rememberPosition(next);
 
     if (!emitEvents) return;
 
@@ -226,6 +251,30 @@ export class NativeAudioEngine implements PlayerEngine {
     }
   }
 
+  /** Keeps `lastLoadedItem.startMs` at the latest known position of that episode. */
+  private rememberPosition(snap: PlayerSnapshot): void {
+    const item = this.lastLoadedItem;
+    if (item === null || snap.episodeKey !== item.episodeKey) return;
+    if (snap.positionMs > 0 && snap.positionMs !== item.startMs) {
+      this.lastLoadedItem = { ...item, startMs: snap.positionMs };
+    }
+  }
+
+  private adoptQueuedItem(episodeKey: EpisodeKey | undefined): void {
+    if (episodeKey === undefined) return;
+    if (this.lastLoadedItem?.episodeKey === episodeKey) return;
+    const queued = this.lastQueueItems.find((q) => q.episodeKey === episodeKey);
+    if (!queued) return;
+    this.lastLoadedItem = {
+      episodeKey: queued.episodeKey,
+      source: queued.source,
+      startMs: queued.startMs,
+      speed: this.snapshot.speed,
+      metadata: queued.metadata,
+      mediaType: this.lastLoadedItem?.mediaType ?? 'AUDIO',
+    };
+  }
+
   private handleNativeState(payload: NativeMediaStatePayload): void {
     if (this.disposed) return;
     this.onNativeActivity?.();
@@ -239,6 +288,7 @@ export class NativeAudioEngine implements PlayerEngine {
 
     if (payload.autoAdvancedTo) {
       this.requestedEpisodeKey = payload.autoAdvancedTo;
+      this.adoptQueuedItem(payload.autoAdvancedTo);
       this.emit({
         type: 'nativeAdvanced',
         from: payload.episodeKey,
@@ -288,6 +338,7 @@ export class NativeAudioEngine implements PlayerEngine {
     const startMs = Math.max(0, Math.trunc(item.startMs));
     this.pendingSeek = null;
     this.requestedEpisodeKey = item.episodeKey;
+    this.lastLoadedItem = { ...item, startMs, speed };
     this.snapshot = {
       episodeKey: item.episodeKey,
       playing: false,
@@ -312,12 +363,85 @@ export class NativeAudioEngine implements PlayerEngine {
   }
 
   async play(): Promise<void> {
-    await this.plugin.media.play();
+    const item = this.lastLoadedItem;
+    if (item !== null && !this.snapshot.episodeKey) {
+      await this.reloadAndPlay(item);
+      return;
+    }
+
+    const result = await this.plugin.media.play();
+    if (item !== null) {
+      let native: NativeMediaStatePayload | null = result ? result : null;
+      if (native === null) {
+        try {
+          native = await this.plugin.media.getState();
+        } catch {
+          native = null;
+        }
+      }
+      // `PlaybackService` was stopped/reset while paused in the background (nothing loaded, or
+      // stuck idle): reload the last item at the paused position instead of staying at 0:00.
+      if (
+        native &&
+        (native.episodeKey === undefined || (!native.playing && !native.buffering))
+      ) {
+        await this.reloadAndPlay(item);
+        return;
+      }
+    }
     this.snapshot = {
       ...this.snapshot,
       playing: true,
     };
     this.emit({ type: 'state', snapshot: this.snapshot });
+  }
+
+  private async reloadAndPlay(item: PlayerLoadItem): Promise<void> {
+    const sameEpisode = this.snapshot.episodeKey === item.episodeKey || !this.snapshot.episodeKey;
+    const startMs =
+      sameEpisode && this.snapshot.positionMs > 0 ? this.snapshot.positionMs : item.startMs;
+    const speed = clampSpeed(this.snapshot.speed);
+    this.pendingSeek = null;
+    this.requestedEpisodeKey = item.episodeKey;
+    this.lastLoadedItem = { ...item, startMs, speed };
+    const state = await this.plugin.media.load({
+      episodeKey: item.episodeKey,
+      source: item.source,
+      startMs,
+      speed,
+      metadata: item.metadata,
+      playWhenReady: true,
+    });
+    if (state) {
+      this.applySnapshotFromPayload(state, true);
+    }
+    await this.plugin.media.play();
+    this.snapshot = {
+      ...this.snapshot,
+      episodeKey: item.episodeKey,
+      playing: true,
+      positionMs: this.snapshot.positionMs > 0 ? this.snapshot.positionMs : startMs,
+    };
+    this.emit({ type: 'state', snapshot: this.snapshot });
+  }
+
+  /**
+   * Re-reads native `PlaybackService` state (e.g. on app foreground) without ever clobbering a
+   * known paused position to 0 when the service reports no loaded episode.
+   */
+  async syncStateFromNative(): Promise<PlayerSnapshot> {
+    try {
+      const state = await this.plugin.media.getState();
+      if (!this.disposed && state) {
+        if (state.episodeKey !== undefined && this.requestedEpisodeKey === undefined) {
+          this.requestedEpisodeKey = state.episodeKey;
+        }
+        this.applySnapshotFromPayload(state, true);
+      }
+    } catch {
+      // Service not reachable; keep current snapshot.
+    }
+    return this.snapshot;
   }
 
   pause(): void {
@@ -332,6 +456,7 @@ export class NativeAudioEngine implements PlayerEngine {
   stop(): void {
     this.pendingSeek = null;
     this.requestedEpisodeKey = undefined;
+    this.lastLoadedItem = null;
     this.snapshot = {
       playing: false,
       buffering: false,
@@ -396,6 +521,7 @@ export class NativeAudioEngine implements PlayerEngine {
   }
 
   setQueue(items: readonly QueueItemSource[]): void {
+    this.lastQueueItems = items;
     void this.plugin.media
       .setQueue({
         items: items.map((item) => ({

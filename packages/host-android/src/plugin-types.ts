@@ -229,7 +229,8 @@ export interface MiniPodPlugin {
   readonly media: {
     load(payload: NativeMediaLoadPayload): Promise<NativeMediaStatePayload>;
     setQueue(opts: { readonly items: readonly NativeMediaQueuePayloadItem[] }): Promise<void>;
-    play(): Promise<void>;
+    /** Resolves with the native state after `play()` (older natives resolve `void`). */
+    play(): Promise<NativeMediaStatePayload | void>;
     pause(): Promise<void>;
     seekTo(opts: { readonly positionMs: number }): Promise<void>;
     setSpeed(opts: { readonly speed: number }): Promise<void>;
@@ -280,7 +281,7 @@ export interface MiniPodNativeBridge {
 
   mediaLoad(payload: NativeMediaLoadPayload): Promise<NativeMediaStatePayload>;
   mediaSetQueue(opts: { items: readonly NativeMediaQueuePayloadItem[] }): Promise<void>;
-  mediaPlay(): Promise<void>;
+  mediaPlay(): Promise<NativeMediaStatePayload | void>;
   mediaPause(): Promise<void>;
   mediaSeekTo(opts: { positionMs: number }): Promise<void>;
   mediaSetSpeed(opts: { speed: number }): Promise<void>;

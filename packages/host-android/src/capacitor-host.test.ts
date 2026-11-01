@@ -768,4 +768,199 @@ describe('CapacitorPlatformHost', () => {
     unsub();
     await host.dispose();
   });
+
+  describe('Airplane Mode: downloaded audio -> background -> pause -> foreground -> Play (v0.1.21 bug)', () => {
+    async function setupOfflinePlayback(dbName: string) {
+      const harness = createTestPluginHarness();
+      let visible = true;
+      let online = true;
+      let foreground: (() => void) | null = null;
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory: new IDBFactory(),
+        dbName,
+        preferences: createMemoryPreferences(),
+        schedulerHost: {
+          now: () => Date.now(),
+          setTimeout: (fn, ms) => {
+            const id = setTimeout(fn, ms);
+            return () => clearTimeout(id);
+          },
+          setInterval: (fn, ms) => {
+            const id = setInterval(fn, ms);
+            return () => clearInterval(id);
+          },
+          isVisible: () => visible,
+          isMetered: () => false,
+          isOnline: () => online,
+        },
+        onAppLifecycle: (handlers) => {
+          foreground = handlers.onForeground;
+          return () => {
+            foreground = null;
+          };
+        },
+      });
+      const feed = await bundle.host.feeds.subscribe('https://pod.example.com/rss.xml');
+      const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+      const ep2Key = deriveEpisodeKey(feed.feedKey, 'ep-2');
+      await bundle.host.queue.add(ep1Key);
+      await bundle.host.queue.add(ep2Key);
+      // ep-1 is downloaded (local file); ep-2 is remote-only
+      await bundle.host.episodes.download(ep1Key);
+
+      // Enter Airplane Mode and start playing the downloaded episode
+      online = false;
+      const source = await bundle.host.playback.sourceFor(ep1Key);
+      expect(source.kind).toBe('file');
+      await bundle.engine.load({
+        episodeKey: ep1Key,
+        source,
+        startMs: 0,
+        speed: 1,
+        metadata: { title: 'Episode One', durationMs: 120_000 },
+        mediaType: 'AUDIO',
+      });
+      await bundle.engine.play();
+      harness.emitNative('media-state', {
+        episodeKey: ep1Key,
+        playing: true,
+        buffering: false,
+        positionMs: 41_000,
+        durationMs: 120_000,
+        speed: 1,
+      });
+
+      // Go to background and pause at 42 s
+      visible = false;
+      harness.emitNative('media-state', {
+        episodeKey: ep1Key,
+        playing: false,
+        buffering: false,
+        positionMs: 42_000,
+        durationMs: 120_000,
+        speed: 1,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+
+      return {
+        harness,
+        bundle,
+        ep1Key,
+        ep2Key,
+        setVisible: (v: boolean) => {
+          visible = v;
+        },
+        setOnline: (v: boolean) => {
+          online = v;
+        },
+        fireForeground: () => foreground?.(),
+      };
+    }
+
+    it('only hands downloaded files to the native queue while offline (no remote preloading)', async () => {
+      const ctx = await setupOfflinePlayback('host-offline-queue-test');
+
+      const offlineSources = await ctx.bundle.host.playback.queueSources();
+      expect(offlineSources.every((s) => s.source.kind === 'file')).toBe(true);
+      expect(offlineSources.map((s) => s.episodeKey)).not.toContain(ctx.ep2Key);
+
+      ctx.setOnline(true);
+      const onlineSources = await ctx.bundle.host.playback.queueSources();
+      expect(onlineSources.map((s) => s.episodeKey)).toEqual([ctx.ep2Key]);
+      expect(onlineSources[0]?.source.kind).toBe('url');
+
+      await ctx.bundle.host.dispose();
+    });
+
+    it('keeps the paused position when the native service was stopped, and Play reloads from it', async () => {
+      const ctx = await setupOfflinePlayback('host-offline-service-stopped-test');
+      const { harness, bundle, ep1Key } = ctx;
+      expect(bundle.engine.getSnapshot()).toMatchObject({ episodeKey: ep1Key, positionMs: 42_000, playing: false });
+
+      // Android stops the paused PlaybackService: a fresh/empty service reports idle 0 state
+      harness.emitNative('media-state', { playing: false, buffering: false, positionMs: 0, speed: 1 });
+      expect(bundle.engine.getSnapshot()).toMatchObject({
+        episodeKey: ep1Key,
+        positionMs: 42_000,
+        durationMs: 120_000,
+        playing: false,
+      });
+
+      // Foreground: native getState reports nothing loaded -> still never drops to 0
+      ctx.setVisible(true);
+      ctx.fireForeground();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(harness.plugin.media.getState).toHaveBeenCalled();
+      expect(bundle.engine.getSnapshot().positionMs).toBe(42_000);
+      expect(bundle.engine.getSnapshot().episodeKey).toBe(ep1Key);
+
+      // Tap Play: native play() on an empty service returns idle -> engine reloads at 42 s
+      vi.mocked(harness.plugin.media.load).mockClear();
+      vi.mocked(harness.plugin.media.play).mockImplementationOnce(async () => ({
+        playing: false,
+        buffering: false,
+        positionMs: 0,
+        speed: 1,
+      }));
+      await bundle.engine.play();
+
+      expect(harness.plugin.media.load).toHaveBeenCalledTimes(1);
+      expect(harness.plugin.media.load).toHaveBeenCalledWith(
+        expect.objectContaining({
+          episodeKey: ep1Key,
+          startMs: 42_000,
+          playWhenReady: true,
+          source: expect.objectContaining({ kind: 'file' }),
+        }),
+      );
+      expect(bundle.engine.getSnapshot()).toMatchObject({ episodeKey: ep1Key, playing: true, positionMs: 42_000 });
+
+      await bundle.host.dispose();
+    });
+
+    it('resumes in place without reloading when the native service is still alive (or restored its saved track)', async () => {
+      const ctx = await setupOfflinePlayback('host-offline-service-alive-test');
+      const { harness, bundle, ep1Key } = ctx;
+
+      vi.mocked(harness.plugin.media.getState).mockImplementation(async () => ({
+        episodeKey: ep1Key,
+        playing: false,
+        buffering: false,
+        positionMs: 42_000,
+        durationMs: 120_000,
+        speed: 1,
+      }));
+      ctx.setVisible(true);
+      ctx.fireForeground();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(bundle.engine.getSnapshot()).toMatchObject({ episodeKey: ep1Key, positionMs: 42_000 });
+
+      vi.mocked(harness.plugin.media.load).mockClear();
+      vi.mocked(harness.plugin.media.play).mockImplementationOnce(async () => ({
+        episodeKey: ep1Key,
+        playing: false,
+        buffering: true,
+        positionMs: 42_000,
+        durationMs: 120_000,
+        speed: 1,
+      }));
+      await bundle.engine.play();
+      expect(harness.plugin.media.load).not.toHaveBeenCalled();
+      expect(bundle.engine.getSnapshot()).toMatchObject({ episodeKey: ep1Key, playing: true, positionMs: 42_000 });
+
+      await bundle.host.dispose();
+    });
+
+    it('reloads when native play() resolves void but getState shows no loaded episode', async () => {
+      const ctx = await setupOfflinePlayback('host-offline-void-play-test');
+      const { harness, bundle, ep1Key } = ctx;
+      vi.mocked(harness.plugin.media.load).mockClear();
+      await bundle.engine.play();
+      expect(harness.plugin.media.load).toHaveBeenCalledWith(
+        expect.objectContaining({ episodeKey: ep1Key, startMs: 42_000, playWhenReady: true }),
+      );
+      await bundle.host.dispose();
+    });
+  });
 });

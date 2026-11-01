@@ -1262,7 +1262,7 @@ public class MiniPodPlugin extends Plugin {
     public void mediaPlay(PluginCall call) {
         PlaybackService.execute(getContext(), true, svc -> {
             svc.play();
-            call.resolve();
+            call.resolve(svc.buildStateObject());
         });
     }
 
@@ -1343,6 +1343,13 @@ public class MiniPodPlugin extends Plugin {
     public void mediaGetState(PluginCall call) {
         PlaybackService svc = PlaybackService.peekInstance();
         if (svc == null) {
+            // Service was stopped while paused in the background: report the saved paused
+            // episode/position instead of wiping the UI back to 0:00.
+            JSObject saved = PlaybackService.readSavedIdleState(getContext());
+            if (saved != null) {
+                call.resolve(saved);
+                return;
+            }
             JSObject idle = new JSObject();
             idle.put("playing", false);
             idle.put("buffering", false);

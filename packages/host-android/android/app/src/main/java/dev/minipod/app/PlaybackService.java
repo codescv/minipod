@@ -8,6 +8,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -69,6 +72,8 @@ public class PlaybackService extends MediaSessionService {
     public static final int NOTIFICATION_ID = 1001;
     private static final String KEY_CURRENT = "current";
     private static final String KEY_COMPLETED = "completed";
+    /** Full `TrackSpec` (+ latest `positionMs`) of the active episode so a restarted service can resume. */
+    private static final String KEY_LAST_TRACK = "lastTrack";
 
     private static final long STATE_TICK_MS = 1_000L;
     private static final long JOURNAL_CHECKPOINT_MS = 5_000L;
@@ -152,7 +157,12 @@ public class PlaybackService extends MediaSessionService {
     private boolean foregroundStarted = false;
 
     @Nullable private String activeEpisodeKey;
+    @Nullable private TrackSpec activeTrackSpec;
+    /** Spec of playlist item 0 (set by `loadTrack` / restore); queued items follow it. */
+    @Nullable private TrackSpec primaryTrackSpec;
+    private final List<TrackSpec> queuedSpecs = new ArrayList<>();
     private long lastKnownDurationMs = 0L;
+    private long lastKnownPositionMs = 0L;
     private long lastJournalWriteElapsedMs = 0L;
 
     // Sleep timer state (main thread only)
@@ -292,6 +302,44 @@ public class PlaybackService extends MediaSessionService {
         }
     }
 
+    /**
+     * Saved idle state (`episodeKey`, `positionMs`, `durationMs`, `speed`) from `KEY_LAST_TRACK` /
+     * `KEY_CURRENT`, used by `mediaGetState()` when the service is not running so the UI never
+     * resets to `0:00` after Android stopped a paused background `PlaybackService`.
+     */
+    @Nullable
+    public static JSObject readSavedIdleState(Context context) {
+        synchronized (JOURNAL_LOCK) {
+            SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String lastStr = prefs.getString(KEY_LAST_TRACK, null);
+            TrackSpec spec = parseTrackSpecJson(lastStr);
+            if (spec == null) return null;
+            JSONObject lastJson = parseJson(lastStr);
+            long lastWallMs = lastJson != null ? lastJson.optLong("wallMs", 0L) : 0L;
+            long posMs = spec.startMs;
+            long durMs = spec.durationMs;
+            JSONObject cur = parseJson(prefs.getString(KEY_CURRENT, null));
+            if (cur != null
+                && spec.episodeKey.equals(cur.optString("episodeKey"))
+                && cur.optLong("wallMs", 0L) >= lastWallMs) {
+                posMs = Math.max(0L, cur.optLong("positionMs", posMs));
+                long d = cur.optLong("durationMs", 0L);
+                if (d > 0L) durMs = d;
+            }
+            JSObject out = new JSObject();
+            out.put("episodeKey", spec.episodeKey);
+            out.put("playing", false);
+            out.put("buffering", false);
+            out.put("positionMs", posMs);
+            if (durMs > 0L) {
+                out.put("durationMs", durMs);
+            }
+            out.put("speed", (double) spec.speed);
+            return out;
+        }
+    }
+
     public static void clearJournal(Context context, long upToWallMs) {
         synchronized (JOURNAL_LOCK) {
             SharedPreferences prefs = context.getApplicationContext()
@@ -406,6 +454,10 @@ public class PlaybackService extends MediaSessionService {
             .setSessionActivity(sessionActivityPendingIntent)
             .build();
         addSession(mediaSession);
+
+        // Restore the last paused track (without preparing) so a fresh service started by
+        // `mediaPlay` / `mediaSeekTo` after Android killed it in the background can resume.
+        restoreLastTrackIfNeeded(false);
 
         if (!PENDING_ACTIONS.isEmpty()) {
             List<ServiceAction> drained = new ArrayList<>(PENDING_ACTIONS);
@@ -558,10 +610,16 @@ public class PlaybackService extends MediaSessionService {
         }
 
         activeEpisodeKey = spec.episodeKey;
+        activeTrackSpec = spec;
+        primaryTrackSpec = spec;
+        lastKnownPositionMs = spec.startMs;
         lastKnownDurationMs = spec.durationMs > 0 ? spec.durationMs : 0L;
         if (spec.durationMs > 0) {
             durationHintByEpisodeKey.put(spec.episodeKey, spec.durationMs);
         }
+
+        // Local files only need a CPU wake lock; remote streams also need a WifiLock.
+        applyWakeModeFor(spec);
 
         MediaItem item = toMediaItem(spec);
         float clampedSpeed = Math.max(0.5f, Math.min(3.0f, spec.speed));
@@ -570,6 +628,7 @@ public class PlaybackService extends MediaSessionService {
         player.setMediaItem(item, spec.startMs);
         player.prepare();
         player.setPlayWhenReady(spec.playWhenReady);
+        persistLastTrack(spec.startMs);
 
         JSObject state = buildStateObject();
         emitStateObject(state);
@@ -578,6 +637,12 @@ public class PlaybackService extends MediaSessionService {
 
     public void setQueueTracks(List<TrackSpec> items) {
         startMsByEpisodeKey.clear();
+        queuedSpecs.clear();
+        queuedSpecs.addAll(items);
+        // Offline (e.g. Airplane Mode): never hand remote URLs to ExoPlayer. It would pre-buffer
+        // the next playlist item right after a local file is fully buffered, fail with a network
+        // `PlaybackException` and drop the *whole* player (incl. the playing local file) to IDLE.
+        boolean online = isNetworkConnected();
         List<MediaItem> nextItems = new ArrayList<>(items.size());
         for (TrackSpec spec : items) {
             if (spec.episodeKey.equals(activeEpisodeKey)) {
@@ -586,6 +651,9 @@ public class PlaybackService extends MediaSessionService {
             startMsByEpisodeKey.put(spec.episodeKey, spec.startMs);
             if (spec.durationMs > 0) {
                 durationHintByEpisodeKey.put(spec.episodeKey, spec.durationMs);
+            }
+            if (!online && !"file".equals(spec.sourceKind)) {
+                continue;
             }
             nextItems.add(toMediaItem(spec));
         }
@@ -601,12 +669,27 @@ public class PlaybackService extends MediaSessionService {
     }
 
     public void play() {
-        if (player.getPlaybackState() == Player.STATE_IDLE && player.getMediaItemCount() > 0) {
+        if (player.getMediaItemCount() == 0 || activeEpisodeKey == null) {
+            restoreLastTrackIfNeeded(true);
+        }
+        if (player.getMediaItemCount() == 0) {
+            emitCurrentState();
+            return;
+        }
+        if (player.getPlaybackState() == Player.STATE_IDLE) {
+            // Recover from a previous error (e.g. offline preload failure) at the paused position.
+            long currentPos = Math.max(0L, player.getCurrentPosition());
+            long targetPos = Math.max(currentPos, lastKnownPositionMs);
+            if (targetPos > 0L && Math.abs(currentPos - targetPos) > 500L) {
+                player.seekTo(targetPos);
+            }
             player.prepare();
         }
         if (player.getPlaybackState() == Player.STATE_ENDED) {
             player.seekTo(0L);
+            lastKnownPositionMs = 0L;
         }
+        player.setVolume(1.0f);
         player.play();
         scheduleTicks();
         emitCurrentState();
@@ -621,10 +704,18 @@ public class PlaybackService extends MediaSessionService {
 
     public void seekToMs(long positionMs) {
         long clamped = Math.max(0L, positionMs);
-        if (player.getPlaybackState() == Player.STATE_IDLE && player.getMediaItemCount() > 0) {
+        if (player.getMediaItemCount() == 0 || activeEpisodeKey == null) {
+            restoreLastTrackIfNeeded(true);
+        }
+        if (player.getMediaItemCount() == 0) {
+            emitCurrentState();
+            return;
+        }
+        if (player.getPlaybackState() == Player.STATE_IDLE) {
             player.prepare();
         }
         player.seekTo(clamped);
+        lastKnownPositionMs = clamped;
         if (player.isPlaying()) {
             scheduleTicks();
         }
@@ -675,7 +766,12 @@ public class PlaybackService extends MediaSessionService {
         player.stop();
         player.clearMediaItems();
         activeEpisodeKey = null;
+        activeTrackSpec = null;
+        primaryTrackSpec = null;
+        queuedSpecs.clear();
         lastKnownDurationMs = 0L;
+        lastKnownPositionMs = 0L;
+        clearLastTrack(null);
         emitCurrentState();
     }
 
@@ -686,7 +782,13 @@ public class PlaybackService extends MediaSessionService {
         }
         boolean playing = player != null && player.isPlaying();
         boolean buffering = player != null && player.getPlaybackState() == Player.STATE_BUFFERING;
-        long posMs = player != null ? Math.max(0L, player.getCurrentPosition()) : 0L;
+        long posMs;
+        if (player != null && player.getMediaItemCount() > 0) {
+            posMs = Math.max(0L, player.getCurrentPosition());
+        } else {
+            // Empty player (fresh service / restore failed): keep the last known position instead of 0.
+            posMs = activeEpisodeKey != null ? lastKnownPositionMs : 0L;
+        }
         long durMs = resolveCurrentDurationMs();
         float speed = player != null ? player.getPlaybackParameters().speed : 1.0f;
 
@@ -787,6 +889,7 @@ public class PlaybackService extends MediaSessionService {
                     player.pause();
                     player.setVolume(1.0f);
                     activeEpisodeKey = nextKey;
+                    adoptQueuedSpec(nextKey);
                     Long resumeStart = startMsByEpisodeKey.get(nextKey);
                     if (resumeStart != null && resumeStart > 0L) {
                         player.seekTo(resumeStart);
@@ -806,6 +909,7 @@ public class PlaybackService extends MediaSessionService {
 
                 // Autonomous marathon auto-advance to `nextKey`!
                 activeEpisodeKey = nextKey;
+                adoptQueuedSpec(nextKey);
                 lastKnownDurationMs = durationHintByEpisodeKey.getOrDefault(nextKey, 0L);
                 Long resumeStart = startMsByEpisodeKey.get(nextKey);
                 if (resumeStart != null && resumeStart > 0L) {
@@ -822,6 +926,7 @@ public class PlaybackService extends MediaSessionService {
                 emitCurrentState();
             } else if (nextKey != null && !nextKey.isEmpty()) {
                 activeEpisodeKey = nextKey;
+                adoptQueuedSpec(nextKey);
                 lastKnownDurationMs = durationHintByEpisodeKey.getOrDefault(nextKey, 0L);
                 emitCurrentState();
             }
@@ -831,6 +936,24 @@ public class PlaybackService extends MediaSessionService {
         public void onPlayerError(PlaybackException error) {
             writeCurrentCheckpoint();
             acquireFlushWakeLock();
+
+            // A later (remote) playlist item failed while pre-buffering/transitioning after a local
+            // file: drop the trailing items so the local item is not poisoned by the network error.
+            TrackSpec primary = primaryTrackSpec;
+            if (primary != null
+                && "file".equals(primary.sourceKind)
+                && player != null
+                && player.getCurrentMediaItemIndex() > 0
+                && player.getMediaItemCount() > 1) {
+                try {
+                    player.removeMediaItems(1, player.getMediaItemCount());
+                    activeEpisodeKey = primary.episodeKey;
+                    activeTrackSpec = primary;
+                    applyWakeModeFor(primary);
+                } catch (Exception ignored) {
+                    // ignore
+                }
+            }
 
             JSObject errShape = new JSObject();
             errShape.put("code", "network");
@@ -950,6 +1073,12 @@ public class PlaybackService extends MediaSessionService {
     }
 
     private void emitCurrentState() {
+        if (player != null && player.getMediaItemCount() > 0) {
+            long pos = Math.max(0L, player.getCurrentPosition());
+            if (pos > 0L || player.getPlaybackState() != Player.STATE_IDLE) {
+                lastKnownPositionMs = pos;
+            }
+        }
         emitStateObject(buildStateObject());
     }
 
@@ -977,7 +1106,16 @@ public class PlaybackService extends MediaSessionService {
 
     private void writeCurrentCheckpoint() {
         if (activeEpisodeKey == null || player == null) return;
-        long posMs = Math.max(0L, player.getCurrentPosition());
+        long posMs;
+        if (player.getMediaItemCount() > 0) {
+            posMs = Math.max(0L, player.getCurrentPosition());
+            if (posMs == 0L && player.getPlaybackState() == Player.STATE_IDLE && lastKnownPositionMs > 0L) {
+                posMs = lastKnownPositionMs;
+            }
+        } else {
+            posMs = lastKnownPositionMs;
+        }
+        lastKnownPositionMs = posMs;
         long durMs = resolveCurrentDurationMs();
         long wallMs = System.currentTimeMillis();
         lastJournalWriteElapsedMs = SystemClock.elapsedRealtime();
@@ -994,7 +1132,17 @@ public class PlaybackService extends MediaSessionService {
 
                 SharedPreferences prefs = getApplicationContext()
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-                prefs.edit().putString(KEY_CURRENT, cur.toString()).apply();
+                SharedPreferences.Editor editor = prefs.edit().putString(KEY_CURRENT, cur.toString());
+                if (activeTrackSpec != null
+                    && activeEpisodeKey.equals(activeTrackSpec.episodeKey)
+                    && player.getPlaybackState() != Player.STATE_ENDED) {
+                    float speed = player.getPlaybackParameters().speed;
+                    editor.putString(
+                        KEY_LAST_TRACK,
+                        trackSpecToJson(activeTrackSpec, posMs, durMs, speed).toString()
+                    );
+                }
+                editor.apply();
             } catch (JSONException ignored) {
                 // ignore
             }
@@ -1036,10 +1184,216 @@ public class PlaybackService extends MediaSessionService {
                         editor.remove(KEY_CURRENT);
                     }
                 }
+                JSONObject last = parseJson(prefs.getString(KEY_LAST_TRACK, null));
+                if (last != null && episodeKey.equals(last.optString("episodeKey"))) {
+                    editor.remove(KEY_LAST_TRACK);
+                }
                 editor.apply();
             } catch (JSONException ignored) {
                 // ignore
             }
+        }
+    }
+
+    /** Updates `activeTrackSpec` when ExoPlayer advances to a queued item (keeps restore data accurate). */
+    private void adoptQueuedSpec(String episodeKey) {
+        if (activeTrackSpec != null && activeTrackSpec.episodeKey.equals(episodeKey)) return;
+        if (primaryTrackSpec != null && primaryTrackSpec.episodeKey.equals(episodeKey)) {
+            activeTrackSpec = primaryTrackSpec;
+            applyWakeModeFor(primaryTrackSpec);
+            return;
+        }
+        for (TrackSpec spec : queuedSpecs) {
+            if (spec.episodeKey.equals(episodeKey)) {
+                activeTrackSpec = spec;
+                applyWakeModeFor(spec);
+                return;
+            }
+        }
+    }
+
+    private void applyWakeModeFor(TrackSpec spec) {
+        if (player == null) return;
+        try {
+            player.setWakeMode("file".equals(spec.sourceKind) ? C.WAKE_MODE_LOCAL : C.WAKE_MODE_NETWORK);
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+
+    private boolean isNetworkConnected() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            Network network = cm.getActiveNetwork();
+            if (network == null) return false;
+            NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+            return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    /**
+     * Re-loads the last active track into an empty player (fresh service after Android stopped it
+     * while paused in the background, or after `STATE_IDLE` lost the media item) at the last
+     * checkpointed position. Returns true if a track was restored.
+     */
+    private boolean restoreLastTrackIfNeeded(boolean prepareNow) {
+        if (player == null) return false;
+        if (player.getMediaItemCount() > 0 && activeEpisodeKey != null) return false;
+
+        TrackSpec spec = activeTrackSpec;
+        long resumePosMs = lastKnownPositionMs;
+        long savedDurMs = 0L;
+        float savedSpeed = spec != null ? spec.speed : 1.0f;
+        if (spec == null) {
+            synchronized (JOURNAL_LOCK) {
+                SharedPreferences prefs = getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONObject lastJson = parseJson(prefs.getString(KEY_LAST_TRACK, null));
+                spec = parseTrackSpecJson(lastJson != null ? lastJson.toString() : null);
+                if (spec == null) return false;
+                resumePosMs = spec.startMs;
+                savedSpeed = spec.speed;
+                if (lastJson != null) {
+                    resumePosMs = Math.max(resumePosMs, lastJson.optLong("positionMs", 0L));
+                }
+                long lastWallMs = lastJson != null ? lastJson.optLong("wallMs", 0L) : 0L;
+                JSONObject cur = parseJson(prefs.getString(KEY_CURRENT, null));
+                if (cur != null
+                    && spec.episodeKey.equals(cur.optString("episodeKey"))
+                    && cur.optLong("wallMs", 0L) >= lastWallMs) {
+                    long p = cur.optLong("positionMs", -1L);
+                    if (p >= 0L) resumePosMs = p;
+                    savedDurMs = cur.optLong("durationMs", 0L);
+                }
+            }
+        }
+
+        activeTrackSpec = spec;
+        primaryTrackSpec = spec;
+        activeEpisodeKey = spec.episodeKey;
+        long durMs = savedDurMs > 0L ? savedDurMs : spec.durationMs;
+        lastKnownDurationMs = Math.max(0L, durMs);
+        if (durMs > 0L) {
+            durationHintByEpisodeKey.put(spec.episodeKey, durMs);
+        }
+        resumePosMs = Math.max(0L, resumePosMs);
+        lastKnownPositionMs = resumePosMs;
+
+        if (player.getMediaItemCount() == 0) {
+            applyWakeModeFor(spec);
+            float clampedSpeed = Math.max(0.5f, Math.min(3.0f, savedSpeed));
+            player.setPlaybackParameters(new PlaybackParameters(clampedSpeed));
+            player.setMediaItem(toMediaItem(spec), resumePosMs);
+            if (prepareNow) {
+                player.prepare();
+            }
+        }
+        return true;
+    }
+
+    private void persistLastTrack(long positionMs) {
+        if (activeTrackSpec == null || player == null) return;
+        synchronized (JOURNAL_LOCK) {
+            try {
+                JSONObject json = trackSpecToJson(
+                    activeTrackSpec,
+                    positionMs,
+                    resolveCurrentDurationMs(),
+                    player.getPlaybackParameters().speed
+                );
+                getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_LAST_TRACK, json.toString())
+                    .apply();
+            } catch (JSONException ignored) {
+                // ignore
+            }
+        }
+    }
+
+    private void clearLastTrack(@Nullable String onlyIfEpisodeKey) {
+        synchronized (JOURNAL_LOCK) {
+            SharedPreferences prefs = getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            if (onlyIfEpisodeKey != null) {
+                JSONObject last = parseJson(prefs.getString(KEY_LAST_TRACK, null));
+                if (last == null || !onlyIfEpisodeKey.equals(last.optString("episodeKey"))) return;
+            }
+            prefs.edit().remove(KEY_LAST_TRACK).apply();
+        }
+    }
+
+    private static JSONObject trackSpecToJson(TrackSpec spec, long positionMs, long durationMs, float speed)
+        throws JSONException {
+        JSONObject o = new JSONObject();
+        o.put("episodeKey", spec.episodeKey);
+        o.put("sourceKind", spec.sourceKind);
+        o.put("uriOrPath", spec.uriOrPath);
+        if (spec.mime != null) o.put("mime", spec.mime);
+        JSONObject headers = new JSONObject();
+        for (Map.Entry<String, String> e : spec.headers.entrySet()) {
+            headers.put(e.getKey(), e.getValue());
+        }
+        o.put("headers", headers);
+        o.put("startMs", Math.max(0L, positionMs));
+        o.put("positionMs", Math.max(0L, positionMs));
+        o.put("speed", (double) speed);
+        o.put("title", spec.title);
+        if (spec.artist != null) o.put("artist", spec.artist);
+        if (spec.album != null) o.put("album", spec.album);
+        if (spec.artworkUrl != null) o.put("artworkUrl", spec.artworkUrl);
+        o.put("durationMs", durationMs > 0L ? durationMs : spec.durationMs);
+        o.put("wallMs", System.currentTimeMillis());
+        return o;
+    }
+
+    @Nullable
+    private static TrackSpec parseTrackSpecJson(@Nullable String json) {
+        JSONObject o = parseJson(json);
+        if (o == null) return null;
+        String episodeKey = o.optString("episodeKey", "");
+        String uriOrPath = o.optString("uriOrPath", "");
+        if (episodeKey.isEmpty() || uriOrPath.isEmpty()) return null;
+        Map<String, String> headers = new HashMap<>();
+        JSONObject h = o.optJSONObject("headers");
+        if (h != null) {
+            JSONArray names = h.names();
+            if (names != null) {
+                for (int i = 0; i < names.length(); i++) {
+                    String k = names.optString(i);
+                    headers.put(k, h.optString(k));
+                }
+            }
+        }
+        long pos = Math.max(o.optLong("startMs", 0L), o.optLong("positionMs", 0L));
+        return new TrackSpec(
+            episodeKey,
+            o.optString("sourceKind", "url"),
+            uriOrPath,
+            o.has("mime") && !o.isNull("mime") ? o.optString("mime") : null,
+            headers,
+            pos,
+            (float) o.optDouble("speed", 1.0),
+            o.optString("title", ""),
+            o.has("artist") && !o.isNull("artist") ? o.optString("artist") : null,
+            o.has("album") && !o.isNull("album") ? o.optString("album") : null,
+            o.has("artworkUrl") && !o.isNull("artworkUrl") ? o.optString("artworkUrl") : null,
+            o.optLong("durationMs", 0L),
+            false
+        );
+    }
+
+    @Nullable
+    private static JSONObject parseJson(@Nullable String json) {
+        if (json == null || json.isEmpty()) return null;
+        try {
+            return new JSONObject(json);
+        } catch (JSONException ignored) {
+            return null;
         }
     }
 

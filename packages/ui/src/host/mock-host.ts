@@ -1608,6 +1608,15 @@ export class MockPlayerEngine implements PlayerEngine {
     });
   }
 
+  /**
+   * Test helper: replace the raw engine snapshot and emit a `state` event, e.g. to simulate a
+   * native `PlaybackService` that was stopped/reset while paused in the background (idle, 0 ms).
+   */
+  emitRawState(snapshot: PlayerSnapshot): void {
+    this.snapshot = snapshot;
+    this.emit({ type: 'state', snapshot: this.snapshot });
+  }
+
   /** Test helper: simulate natural track completion. */
   emitEnded(): void {
     const epKey = this.snapshot.episodeKey;
