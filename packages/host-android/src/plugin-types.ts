@@ -56,6 +56,16 @@ export interface MiniPodHttpToFileResponse {
   readonly mime?: string;
 }
 
+/** v0.1.23 Agent Feedback `ACTION_SEND` payload (`MiniPodPlugin.sendFeedbackEmail`). */
+export interface NativeFeedbackEmailOptions {
+  readonly to: string;
+  readonly subject: string;
+  readonly body: string;
+  readonly attachmentBase64?: string;
+  readonly attachmentName?: string;
+  readonly attachmentMimeType?: string;
+}
+
 export interface SafPickOptions {
   readonly mode: 'open' | 'create' | 'tree';
   readonly mime?: string;
@@ -248,6 +258,8 @@ export interface MiniPodPlugin {
   };
 
   openExternal(opts: { readonly url: string }): Promise<void>;
+  /** v0.1.23: `ACTION_SEND` Agent Feedback email with optional FileProvider image attachment. */
+  sendFeedbackEmail?(opts: NativeFeedbackEmailOptions): Promise<void>;
   getLaunchIntent(): Promise<DeepLinkPayload | null>;
 
   downloadAndInstallApk?(opts: {
@@ -300,6 +312,7 @@ export interface MiniPodNativeBridge {
   authGoogleSignIn(opts: GoogleSignInOptions): Promise<GoogleSignInResult>;
 
   openExternal(opts: { url: string }): Promise<void>;
+  sendFeedbackEmail(opts: NativeFeedbackEmailOptions): Promise<void>;
   getLaunchIntent(): Promise<{ hasIntent: boolean; action?: 'view' | 'send'; uri?: string; mimeType?: string; text?: string }>;
   downloadAndInstallApk(opts: { url: string; version: string }): Promise<ApkInstallResult>;
   installApkFile(opts: { filePath: string }): Promise<ApkInstallResult>;
@@ -367,6 +380,7 @@ export function wrapNativeBridge(bridge: MiniPodNativeBridge): MiniPodPlugin {
     },
 
     openExternal: (opts) => bridge.openExternal(opts),
+    sendFeedbackEmail: (opts) => bridge.sendFeedbackEmail(opts),
     downloadAndInstallApk: (opts) => bridge.downloadAndInstallApk(opts),
     installApkFile: (opts) => bridge.installApkFile(opts),
     async getLaunchIntent() {

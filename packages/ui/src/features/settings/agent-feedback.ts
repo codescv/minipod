@@ -48,7 +48,7 @@ export function saveAgentFeedbackEmail(
 
 export function normalizeFeedbackVersion(appVersion: string): string {
   const cleaned = appVersion.trim().replace(/^v/i, '');
-  return `v${cleaned || '0.1.22'}`;
+  return `v${cleaned || '0.1.23'}`;
 }
 
 export function extractFeedbackSummary(feedbackText: string, maxLength = 72): string {
@@ -80,6 +80,8 @@ export interface AgentFeedbackBodyOptions {
   readonly appVersion: string;
   readonly platform?: string | undefined;
   readonly os?: string | undefined;
+  /** Selected image attachment file name (v0.1.23), listed as `Attachment: <name>`. */
+  readonly attachmentName?: string | undefined;
 }
 
 export function buildAgentFeedbackBody(options: AgentFeedbackBodyOptions): string {
@@ -91,6 +93,10 @@ export function buildAgentFeedbackBody(options: AgentFeedbackBodyOptions): strin
       options.os ? `Platform: ${options.platform} (${options.os})` : `Platform: ${options.platform}`,
     );
   }
+  const attachmentName = options.attachmentName?.trim();
+  if (attachmentName) {
+    metaLines.push(`Attachment: ${attachmentName}`);
+  }
   const footer = `---\n${metaLines.join('\n')}`;
   return trimmed ? `${trimmed}\n\n${footer}` : `\n\n${footer}`;
 }
@@ -99,12 +105,22 @@ export interface AgentFeedbackMailtoOptions {
   readonly email: string;
   readonly appVersion: string;
   readonly feedbackText: string;
+  /** Explicit 标题 / Title; falls back to the first non-empty line of `feedbackText`. */
   readonly summary?: string | undefined;
   readonly platform?: string | undefined;
   readonly os?: string | undefined;
+  readonly attachmentName?: string | undefined;
 }
 
-export function buildAgentFeedbackMailto(options: AgentFeedbackMailtoOptions): string {
+export interface AgentFeedbackEmail {
+  readonly to: string;
+  readonly subject: string;
+  readonly body: string;
+  readonly mailtoUrl: string;
+}
+
+/** Builds recipient, subject, body and the equivalent `mailto:` URI in one pass. */
+export function buildAgentFeedbackEmail(options: AgentFeedbackMailtoOptions): AgentFeedbackEmail {
   const normalizedEmail = options.email.trim();
   if (!isValidFeedbackEmail(normalizedEmail)) {
     throw new Error('Invalid Agent feedback email address');
@@ -119,6 +135,64 @@ export function buildAgentFeedbackMailto(options: AgentFeedbackMailtoOptions): s
     appVersion: options.appVersion,
     platform: options.platform,
     os: options.os,
+    attachmentName: options.attachmentName,
   });
-  return `mailto:${normalizedEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  const mailtoUrl = `mailto:${normalizedEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return { to: normalizedEmail, subject, body, mailtoUrl };
+}
+
+export function buildAgentFeedbackMailto(options: AgentFeedbackMailtoOptions): string {
+  return buildAgentFeedbackEmail(options).mailtoUrl;
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.23 增加图片 / Add image attachment
+// ---------------------------------------------------------------------------
+
+export interface AgentFeedbackImage {
+  readonly name: string;
+  readonly mimeType: string;
+  /** Raw Base64 payload without a `data:` prefix. */
+  readonly base64: string;
+}
+
+/** Upper bound for attached images (Android Binder / Capacitor bridge payload safety). */
+export const AGENT_FEEDBACK_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function readBlobAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read image'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Reads a picked image `File` into `{ name, mimeType, base64 }` (via `arrayBuffer` or `FileReader`). */
+export async function readAgentFeedbackImage(file: File): Promise<AgentFeedbackImage> {
+  const mimeType = file.type || 'image/*';
+  if (!mimeType.startsWith('image/')) {
+    throw new Error('Unsupported attachment type');
+  }
+  if (file.size > AGENT_FEEDBACK_MAX_IMAGE_BYTES) {
+    throw new Error('Attachment too large');
+  }
+  let base64: string;
+  if (typeof file.arrayBuffer === 'function') {
+    base64 = bytesToBase64(new Uint8Array(await file.arrayBuffer()));
+  } else {
+    const dataUrl = await readBlobAsDataUrl(file);
+    const comma = dataUrl.indexOf(',');
+    base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  }
+  return { name: file.name || 'feedback_image', mimeType, base64 };
 }

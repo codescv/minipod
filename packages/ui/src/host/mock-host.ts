@@ -20,6 +20,7 @@ import {
   type EpisodeKey,
   type EpisodeRow,
   type Feed,
+  type FeedbackEmailRequest,
   type FeedKey,
   type FeedPreview,
   type HostCapabilities,
@@ -166,6 +167,8 @@ export class MockPlatformHost implements PlatformHost {
 
   /** Recorded external URLs & saved files for assertions in UI tests. */
   readonly openedExternalUrls: string[] = [];
+  /** Recorded Agent Feedback emails sent with native attachments (v0.1.23). */
+  readonly sentFeedbackEmails: FeedbackEmailRequest[] = [];
   readonly savedFiles: { readonly name: string; readonly text: string; readonly mime: string }[] = [];
   readonly progressSaves: ProgressSave[] = [];
 
@@ -186,7 +189,7 @@ export class MockPlatformHost implements PlatformHost {
     this.info = {
       platform,
       os: platform === 'android' ? 'Android 15' : 'Linux x86_64',
-      appVersion: options?.appVersion ?? '0.1.22',
+      appVersion: options?.appVersion ?? '0.1.23',
       capabilities,
       deviceId: 'd_0123456789abcdef0123456789abcdef',
       deviceName,
@@ -1407,6 +1410,10 @@ export class MockPlatformHost implements PlatformHost {
 
     openExternal: async (url) => {
       this.openedExternalUrls.push(url);
+    },
+
+    sendFeedbackEmail: async (request) => {
+      this.sentFeedbackEmails.push(request);
     },
   };
 

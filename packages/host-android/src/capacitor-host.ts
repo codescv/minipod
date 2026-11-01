@@ -54,6 +54,7 @@ import {
   type EpisodeKey,
   type EpisodeRow,
   type Feed,
+  type FeedbackEmailRequest,
   type FeedKey,
   type FeedPreview,
   type HostCapabilities,
@@ -96,7 +97,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.22';
+export const CAPACITOR_HOST_VERSION = '0.1.23';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -1970,6 +1971,21 @@ export async function createCapacitorPlatformHost(
 
       async openExternal(url: string): Promise<void> {
         await plugin.openExternal({ url });
+      },
+
+      async sendFeedbackEmail(request: FeedbackEmailRequest): Promise<void> {
+        if (!request.attachment || !plugin.sendFeedbackEmail) {
+          await plugin.openExternal({ url: request.mailtoUrl });
+          return;
+        }
+        await plugin.sendFeedbackEmail({
+          to: request.to,
+          subject: request.subject,
+          body: request.body,
+          attachmentBase64: request.attachment.base64,
+          attachmentName: request.attachment.name,
+          attachmentMimeType: request.attachment.mimeType,
+        });
       },
     },
 

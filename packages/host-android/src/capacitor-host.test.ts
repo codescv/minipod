@@ -963,4 +963,52 @@ describe('CapacitorPlatformHost', () => {
       await bundle.host.dispose();
     });
   });
+
+  it('routes v0.1.23 Agent Feedback emails with image attachments to native sendFeedbackEmail and plain ones to mailto', async () => {
+    const harness = createTestPluginHarness();
+    const bridgeSend = vi.fn(async () => undefined);
+    const wrappedBridge = wrapNativeBridge({
+      sendFeedbackEmail: bridgeSend,
+    } as unknown as MiniPodNativeBridge);
+    await wrappedBridge.sendFeedbackEmail!({ to: 'agent@example.com', subject: 's', body: 'b' });
+    expect(bridgeSend).toHaveBeenCalledWith({ to: 'agent@example.com', subject: 's', body: 'b' });
+
+    const sendFeedbackEmail = vi.fn(async () => undefined);
+    const plugin: MiniPodPlugin = { ...harness.plugin, sendFeedbackEmail };
+    const { host } = await createCapacitorPlatformHost({
+      plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-feedback-email-test',
+      preferences: createMemoryPreferences(),
+    });
+
+    const mailtoUrl = 'mailto:agent@example.com?subject=minipod%3A%20%5Bv0.1.23%5D%20Bug&body=Hi';
+    await host.files.sendFeedbackEmail!({
+      to: 'agent@example.com',
+      subject: 'minipod: [v0.1.23] Bug',
+      body: 'Hi\n\n---\nAttachment: shot.png',
+      mailtoUrl,
+      attachment: { name: 'shot.png', mimeType: 'image/png', base64: 'iVBORw0KGgo=' },
+    });
+    expect(sendFeedbackEmail).toHaveBeenCalledWith({
+      to: 'agent@example.com',
+      subject: 'minipod: [v0.1.23] Bug',
+      body: 'Hi\n\n---\nAttachment: shot.png',
+      attachmentBase64: 'iVBORw0KGgo=',
+      attachmentName: 'shot.png',
+      attachmentMimeType: 'image/png',
+    });
+    expect(plugin.openExternal).not.toHaveBeenCalled();
+
+    await host.files.sendFeedbackEmail!({
+      to: 'agent@example.com',
+      subject: 'minipod: [v0.1.23] Bug',
+      body: 'Hi',
+      mailtoUrl,
+    });
+    expect(sendFeedbackEmail).toHaveBeenCalledTimes(1);
+    expect(plugin.openExternal).toHaveBeenCalledWith({ url: mailtoUrl });
+
+    await host.dispose();
+  });
 });

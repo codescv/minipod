@@ -2,13 +2,16 @@
  * Minimalist Settings screen (`DESIGN.md` §4.7):
  * Strictly 8 rows — Cloud sync (4), Subscriptions (3), About (1).
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppSettings, SyncProviderConfig, SyncStatus } from '@minipod/core';
 import {
   AGENT_FEEDBACK_EMAIL_PLACEHOLDER,
-  buildAgentFeedbackMailto,
+  AGENT_FEEDBACK_MAX_IMAGE_BYTES,
+  type AgentFeedbackImage,
+  buildAgentFeedbackEmail,
   isValidFeedbackEmail,
   loadAgentFeedbackEmail,
+  readAgentFeedbackImage,
   saveAgentFeedbackEmail,
 } from './agent-feedback';
 import { isGoogleDriveSafUri } from './CloudSyncSetup';
@@ -47,7 +50,11 @@ export function SettingsPage() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedbackEmail, setFeedbackEmail] = useState(() => loadAgentFeedbackEmail());
+  const [feedbackTitle, setFeedbackTitle] = useState('');
   const [feedbackText, setFeedbackText] = useState('');
+  const [feedbackImage, setFeedbackImage] = useState<AgentFeedbackImage | null>(null);
+  const [feedbackSending, setFeedbackSending] = useState(false);
+  const feedbackImageInputRef = useRef<HTMLInputElement | null>(null);
 
   const updateStatus = useUpdateStore((s) => s.status);
   const updateRelease = useUpdateStore((s) => s.release);
@@ -180,7 +187,32 @@ export function SettingsPage() {
     showSnackbar(t('feedback.emailSavedSnack'));
   };
 
+  const handlePickFeedbackImage = async (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > AGENT_FEEDBACK_MAX_IMAGE_BYTES) {
+      showSnackbar(t('feedback.imageTooLargeSnack'));
+      return;
+    }
+    try {
+      setFeedbackImage(await readAgentFeedbackImage(file));
+    } catch {
+      showSnackbar(t('feedback.imageReadErrorSnack'));
+    }
+  };
+
+  const handleRemoveFeedbackImage = () => {
+    setFeedbackImage(null);
+    if (feedbackImageInputRef.current) feedbackImageInputRef.current.value = '';
+  };
+
+  const resetFeedbackDraft = () => {
+    setFeedbackTitle('');
+    setFeedbackText('');
+    handleRemoveFeedbackImage();
+  };
+
   const handleSendFeedbackEmail = async () => {
+    if (feedbackSending) return;
     const trimmedEmail = feedbackEmail.trim();
     if (!isValidFeedbackEmail(trimmedEmail)) {
       showSnackbar(t('feedback.emailInvalidSnack'));
@@ -188,21 +220,40 @@ export function SettingsPage() {
     }
     const savedEmail = saveAgentFeedbackEmail(trimmedEmail);
     setFeedbackEmail(savedEmail);
-    const mailtoUrl = buildAgentFeedbackMailto({
+    const email = buildAgentFeedbackEmail({
       email: savedEmail,
       appVersion: host.info.appVersion,
+      summary: feedbackTitle,
       feedbackText,
       platform: host.info.platform,
       os: host.info.os,
+      attachmentName: feedbackImage?.name,
     });
+    setFeedbackSending(true);
     try {
-      await host.files.openExternal(mailtoUrl);
+      if (feedbackImage && host.files.sendFeedbackEmail) {
+        await host.files.sendFeedbackEmail({
+          to: email.to,
+          subject: email.subject,
+          body: email.body,
+          mailtoUrl: email.mailtoUrl,
+          attachment: {
+            name: feedbackImage.name,
+            mimeType: feedbackImage.mimeType,
+            base64: feedbackImage.base64,
+          },
+        });
+      } else {
+        await host.files.openExternal(email.mailtoUrl);
+      }
     } catch {
       if (typeof window !== 'undefined' && typeof window.location?.assign === 'function') {
-        window.location.assign(mailtoUrl);
+        window.location.assign(email.mailtoUrl);
       }
+    } finally {
+      setFeedbackSending(false);
     }
-    setFeedbackText('');
+    resetFeedbackDraft();
     setFeedbackOpen(false);
   };
 
@@ -508,17 +559,6 @@ export function SettingsPage() {
           <>
             <Button
               variant="text"
-              icon="mail"
-              data-testid="settings-about-feedback-btn"
-              onClick={() => {
-                setAboutOpen(false);
-                handleOpenFeedback();
-              }}
-            >
-              {t('feedback.openButton')}
-            </Button>
-            <Button
-              variant="text"
               icon="openExternal"
               onClick={() => {
                 void host.files.openExternal('https://github.com/codescv/minipod');
@@ -556,6 +596,7 @@ export function SettingsPage() {
             <Button
               variant="filled"
               icon="send"
+              disabled={feedbackSending}
               data-testid="settings-feedback-send-btn"
               onClick={() => {
                 void handleSendFeedbackEmail();
@@ -594,6 +635,23 @@ export function SettingsPage() {
         </div>
 
         <div className="m-field">
+          <label className="m-field__label" htmlFor="minipod-agent-feedback-title">
+            {t('feedback.titleLabel')}
+          </label>
+          <input
+            id="minipod-agent-feedback-title"
+            className="m-field__input"
+            type="text"
+            maxLength={120}
+            placeholder={t('feedback.titlePlaceholder')}
+            aria-label={t('feedback.titleLabel')}
+            data-testid="settings-feedback-title-input"
+            value={feedbackTitle}
+            onChange={(e) => setFeedbackTitle(e.target.value)}
+          />
+        </div>
+
+        <div className="m-field">
           <label className="m-field__label" htmlFor="minipod-agent-feedback-message">
             {t('feedback.messageLabel')}
           </label>
@@ -610,6 +668,54 @@ export function SettingsPage() {
           <span className="m-field__hint" data-testid="settings-feedback-subject-preview">
             {t('feedback.subjectPreview', { version: host.info.appVersion.replace(/^v/i, '') })}
           </span>
+        </div>
+
+        <div className="m-field">
+          <span className="m-field__label">{t('feedback.imageLabel')}</span>
+          <input
+            ref={feedbackImageInputRef}
+            type="file"
+            accept="image/*"
+            hidden
+            style={{ display: 'none' }}
+            aria-label={t('feedback.addImage')}
+            data-testid="settings-feedback-image-input"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              void handlePickFeedbackImage(file);
+            }}
+          />
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Button
+              variant="tonal"
+              icon="add"
+              data-testid="settings-feedback-add-image-btn"
+              onClick={() => feedbackImageInputRef.current?.click()}
+            >
+              {feedbackImage ? t('feedback.changeImage') : t('feedback.addImage')}
+            </Button>
+            {feedbackImage && (
+              <span
+                className="m-pill-badge"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}
+              >
+                <span
+                  data-testid="settings-feedback-image-name"
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  {feedbackImage.name}
+                </span>
+                <IconButton
+                  icon="close"
+                  iconSize={16}
+                  label={t('feedback.removeImage')}
+                  data-testid="settings-feedback-remove-image-btn"
+                  onClick={handleRemoveFeedbackImage}
+                />
+              </span>
+            )}
+          </div>
+          <span className="m-field__hint">{t('feedback.imageHint')}</span>
         </div>
       </Dialog>
     </div>

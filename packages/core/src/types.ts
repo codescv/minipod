@@ -840,6 +840,30 @@ export interface FilesApi {
   /** OPML export: Android `ACTION_CREATE_DOCUMENT`; desktop triggers a download. */
   saveTextFile(name: string, text: string, mime: string): Promise<void>;
   openExternal(url: string): Promise<void>;
+  /**
+   * Agent Feedback email with an optional image attachment (v0.1.23).
+   * Android: `ACTION_SEND` + FileProvider `EXTRA_STREAM`; hosts without native
+   * attachment support omit this and the UI falls back to `openExternal(mailtoUrl)`.
+   */
+  sendFeedbackEmail?(request: FeedbackEmailRequest): Promise<void>;
+}
+
+export interface FeedbackEmailAttachment {
+  /** Original file name (sanitized natively before writing to cache). */
+  readonly name: string;
+  /** MIME type, e.g. `image/png`. */
+  readonly mimeType: string;
+  /** Raw Base64 payload (no `data:` prefix). */
+  readonly base64: string;
+}
+
+export interface FeedbackEmailRequest {
+  readonly to: string;
+  readonly subject: string;
+  readonly body: string;
+  /** Pre-built `mailto:` URI used when no attachment is present / as fallback. */
+  readonly mailtoUrl: string;
+  readonly attachment?: FeedbackEmailAttachment | undefined;
 }
 
 export interface SettingsApi {

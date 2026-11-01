@@ -4,6 +4,7 @@ import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
@@ -13,6 +14,8 @@ import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
@@ -255,6 +258,112 @@ public class MiniPodPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("Failed to open external URL: " + e.getMessage(), "invalid-url", e);
         }
+    }
+
+    /**
+     * v0.1.23 Agent Feedback email. With an image attachment, writes the decoded bytes to
+     * {@code cache/feedback/<safeName>}, shares them through the app FileProvider, and starts
+     * {@code ACTION_SEND} restricted to email apps via a {@code mailto:} selector (chooser fallback).
+     * Without an attachment, launches a plain {@code mailto:} {@code ACTION_SENDTO} as before.
+     */
+    @PluginMethod
+    public void sendFeedbackEmail(PluginCall call) {
+        final String to = call.getString("to", "").trim();
+        final String subject = call.getString("subject", "");
+        final String body = call.getString("body", "");
+        final String attachmentBase64 = call.getString("attachmentBase64");
+        final String attachmentName = call.getString("attachmentName");
+        final String attachmentMimeType = call.getString("attachmentMimeType");
+        final Context context = getContext();
+
+        if (attachmentBase64 == null || attachmentBase64.trim().isEmpty()) {
+            Uri mailto = Uri.parse(
+                "mailto:" + to + "?subject=" + Uri.encode(subject) + "&body=" + Uri.encode(body)
+            );
+            try {
+                Intent sendToIntent = new Intent(Intent.ACTION_SENDTO, mailto);
+                sendToIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(sendToIntent);
+                call.resolve();
+            } catch (ActivityNotFoundException e) {
+                call.reject("No email application available", "unsupported", e);
+            } catch (Exception e) {
+                call.reject("Failed to open email app: " + e.getMessage(), "io", e);
+            }
+            return;
+        }
+
+        ioPool.execute(() -> {
+            final Uri contentUri;
+            final String mimeType = FeedbackAttachmentNames.normalizeMime(attachmentMimeType);
+            try {
+                byte[] bytes = Base64.decode(
+                    FeedbackAttachmentNames.stripDataUrlPrefix(attachmentBase64),
+                    Base64.DEFAULT
+                );
+                File dir = new File(context.getCacheDir(), "feedback");
+                if (!dir.isDirectory() && !dir.mkdirs()) {
+                    throw new IOException("Cannot create feedback cache directory");
+                }
+                File[] stale = dir.listFiles();
+                if (stale != null) {
+                    for (File f : stale) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                }
+                String safeName = FeedbackAttachmentNames.sanitize(attachmentName, attachmentMimeType);
+                File outFile = new File(dir, safeName);
+                try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                    fos.write(bytes);
+                }
+                contentUri = FileProvider.getUriForFile(
+                    context,
+                    context.getPackageName() + ".fileprovider",
+                    outFile
+                );
+            } catch (IllegalArgumentException e) {
+                call.reject("Invalid feedback attachment: " + e.getMessage(), "invalid-attachment", e);
+                return;
+            } catch (Exception e) {
+                call.reject("Failed to prepare feedback attachment: " + e.getMessage(), "io", e);
+                return;
+            }
+
+            new Handler(Looper.getMainLooper()).post(() -> {
+                Intent send = new Intent(Intent.ACTION_SEND);
+                send.setType(mimeType);
+                if (!to.isEmpty()) send.putExtra(Intent.EXTRA_EMAIL, new String[] { to });
+                send.putExtra(Intent.EXTRA_SUBJECT, subject);
+                send.putExtra(Intent.EXTRA_TEXT, body);
+                send.putExtra(Intent.EXTRA_STREAM, contentUri);
+                send.setClipData(ClipData.newRawUri("feedback_image", contentUri));
+                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                send.setSelector(new Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")));
+                send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                try {
+                    context.startActivity(send);
+                    call.resolve();
+                    return;
+                } catch (ActivityNotFoundException ignored) {
+                    // No mailto-capable app matched the selector: fall back to a generic chooser.
+                } catch (Exception e) {
+                    call.reject("Failed to open email app: " + e.getMessage(), "io", e);
+                    return;
+                }
+                try {
+                    send.setSelector(null);
+                    Intent chooser = Intent.createChooser(send, subject.isEmpty() ? "Send feedback" : subject);
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    context.startActivity(chooser);
+                    call.resolve();
+                } catch (ActivityNotFoundException e) {
+                    call.reject("No application can send feedback email", "unsupported", e);
+                } catch (Exception e) {
+                    call.reject("Failed to open email app: " + e.getMessage(), "io", e);
+                }
+            });
+        });
     }
 
     // -------------------------------------------------------------------------
