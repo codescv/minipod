@@ -64,6 +64,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -415,14 +416,16 @@ public class MiniPodPlugin extends Plugin {
         }
 
         List<String> candidates = new ArrayList<>();
-        addResolvedPackages(candidates, pm.queryIntentActivities(mailtoProbe, PackageManager.MATCH_DEFAULT_ONLY));
-        addResolvedPackages(candidates, pm.queryIntentActivities(mailtoProbe, 0));
+        Set<String> mailtoActivityNames = new HashSet<>();
+        addResolvedPackages(candidates, mailtoActivityNames, pm.queryIntentActivities(mailtoProbe, PackageManager.MATCH_DEFAULT_ONLY));
+        addResolvedPackages(candidates, mailtoActivityNames, pm.queryIntentActivities(mailtoProbe, 0));
 
         List<String> packages = FeedbackEmailIntentBuilder.orderEmailPackages(
             defaultPackage,
             defaultActivity,
             candidates,
-            context.getPackageName()
+            context.getPackageName(),
+            true
         );
 
         List<FeedbackEmailIntentBuilder.SendTarget> targets = new ArrayList<>();
@@ -433,22 +436,38 @@ public class MiniPodPlugin extends Plugin {
                 sendProbe.setPackage(pkg);
                 List<ResolveInfo> sendActivities = pm.queryIntentActivities(sendProbe, PackageManager.MATCH_DEFAULT_ONLY);
                 if (sendActivities == null || sendActivities.isEmpty()) continue;
-                String className = null;
-                if (sendActivities.size() == 1 && sendActivities.get(0).activityInfo != null) {
-                    className = sendActivities.get(0).activityInfo.name;
+                List<String> names = new ArrayList<>();
+                for (ResolveInfo info : sendActivities) {
+                    if (info != null && info.activityInfo != null && pkg.equals(info.activityInfo.packageName)) {
+                        names.add(info.activityInfo.name);
+                    }
                 }
-                targets.add(new FeedbackEmailIntentBuilder.SendTarget(pkg, className, type));
+                String className = FeedbackEmailIntentBuilder.pickComposeActivity(pkg, names, mailtoActivityNames);
+                if (className == null) continue;
+                targets.add(new FeedbackEmailIntentBuilder.SendTarget(
+                    pkg,
+                    className,
+                    FeedbackEmailIntentBuilder.deliveryType(type, mimeType)
+                ));
                 break;
             }
         }
         return targets;
     }
 
-    private static void addResolvedPackages(List<String> out, @Nullable List<ResolveInfo> infos) {
+    private static void addResolvedPackages(
+        List<String> out,
+        Set<String> activityNames,
+        @Nullable List<ResolveInfo> infos
+    ) {
         if (infos == null) return;
         for (ResolveInfo info : infos) {
             if (info != null && info.activityInfo != null && info.activityInfo.packageName != null) {
-                if (!out.contains(info.activityInfo.packageName)) out.add(info.activityInfo.packageName);
+                String pkg = info.activityInfo.packageName;
+                // Drop system resolvers / choosers (android, com.oplus.resolver, intentresolver, ...).
+                if (!FeedbackEmailIntentBuilder.isConcreteEmailApp(pkg, info.activityInfo.name, null)) continue;
+                if (info.activityInfo.name != null) activityNames.add(info.activityInfo.name);
+                if (!out.contains(pkg)) out.add(pkg);
             }
         }
     }
@@ -2154,6 +2173,15 @@ public class MiniPodPlugin extends Plugin {
         pendingInstallApkFile = null;
         try {
             startPackageInstallViewIntent(context, pending);
+            // v0.1.26: tell the UI the installer was auto-launched so the banner / Settings row
+            // switch from "Grant & install" to the re-trigger "Install APK" state.
+            MiniPodPlugin plugin = activeInstance;
+            if (plugin != null) {
+                JSObject ev = new JSObject();
+                ev.put("filePath", pending.getAbsolutePath());
+                ev.put("installerLaunched", true);
+                plugin.notifyListeners("apkInstallResumed", ev);
+            }
         } catch (Exception ignored) {
             // User can still tap "Install APK" manually in the UI banner / Settings
         }

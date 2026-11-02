@@ -20,6 +20,20 @@
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="mailto" />
         </intent>
+        <!-- v0.1.26: probe the email app's ACTION_SEND compose activity for image feedback. -->
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="image/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="message/rfc822" />
+        </intent>
+        <package android:name="com.google.android.gm" />
     </queries>
 
     <application

@@ -36,8 +36,15 @@ final class FeedbackEmailIntentBuilder {
     static {
         SYSTEM_RESOLVER_PACKAGES.add("android");
         SYSTEM_RESOLVER_PACKAGES.add("com.android.intentresolver");
+        SYSTEM_RESOLVER_PACKAGES.add("com.google.android.intentresolver");
         SYSTEM_RESOLVER_PACKAGES.add("com.android.internal.app");
+        // v0.1.26: ColorOS / OPPO / OnePlus system resolver that hijacked image feedback into
+        // the generic "分享1张图片" share sheet.
+        SYSTEM_RESOLVER_PACKAGES.add("com.oplus.resolver");
     }
+
+    /** Activity-name markers for resolvers/choosers (ResolverActivity, OplusResolverActivity, ChooserActivityLauncher, ...). */
+    private static final String[] RESOLVER_ACTIVITY_MARKERS = { "resolveractivity", "chooseractivity" };
 
     enum Strategy {
         DIRECT_PACKAGE,
@@ -109,10 +116,15 @@ final class FeedbackEmailIntentBuilder {
         if (packageName == null || packageName.trim().isEmpty()) return false;
         String pkg = packageName.trim();
         if (SYSTEM_RESOLVER_PACKAGES.contains(pkg)) return false;
+        String lowerPkg = pkg.toLowerCase(Locale.ROOT);
+        if (lowerPkg.endsWith(".resolver") || lowerPkg.endsWith(".intentresolver")) return false;
         if (selfPackage != null && selfPackage.equals(pkg)) return false;
         if (activityName != null) {
-            String lower = activityName.toLowerCase(Locale.ROOT);
-            if (lower.endsWith("resolveractivity") || lower.endsWith("chooseractivity")) return false;
+            String lower = activityName.trim().toLowerCase(Locale.ROOT);
+            if (lower.startsWith("com.android.internal.app.")) return false;
+            for (String marker : RESOLVER_ACTIVITY_MARKERS) {
+                if (lower.contains(marker)) return false;
+            }
         }
         return true;
     }
@@ -129,6 +141,22 @@ final class FeedbackEmailIntentBuilder {
         List<String> candidatePackages,
         String selfPackage
     ) {
+        return orderEmailPackages(defaultPackage, defaultActivity, candidatePackages, selfPackage, false);
+    }
+
+    /**
+     * Same as {@link #orderEmailPackages(String, String, List, String)}; when
+     * {@code alwaysProbeGmail} is true, Gmail is probed right after the default handler even if
+     * it is missing from the {@code mailto:} query (the caller drops it when no {@code ACTION_SEND}
+     * activity is visible, i.e. Gmail is not installed).
+     */
+    static List<String> orderEmailPackages(
+        String defaultPackage,
+        String defaultActivity,
+        List<String> candidatePackages,
+        String selfPackage,
+        boolean alwaysProbeGmail
+    ) {
         LinkedHashSet<String> ordered = new LinkedHashSet<>();
         if (isConcreteEmailApp(defaultPackage, defaultActivity, selfPackage)) {
             ordered.add(defaultPackage.trim());
@@ -136,6 +164,9 @@ final class FeedbackEmailIntentBuilder {
         List<String> candidates = candidatePackages == null
             ? Collections.<String>emptyList()
             : candidatePackages;
+        if (alwaysProbeGmail && isConcreteEmailApp(GMAIL_PACKAGE, null, selfPackage)) {
+            ordered.add(GMAIL_PACKAGE);
+        }
         for (String pkg : candidates) {
             if (GMAIL_PACKAGE.equals(pkg) && isConcreteEmailApp(pkg, null, selfPackage)) {
                 ordered.add(pkg);
@@ -160,6 +191,38 @@ final class FeedbackEmailIntentBuilder {
         types.add("*/*");
         types.add("message/rfc822");
         return new ArrayList<>(types);
+    }
+
+    /**
+     * Picks the explicit compose activity among the package's {@code ACTION_SEND} matches:
+     * prefers the activity that also handles {@code mailto:} (e.g. Gmail's
+     * {@code ComposeActivityGmailExternal}), otherwise the first concrete match. Resolver/chooser
+     * activities are skipped. Returns {@code null} when nothing concrete matched.
+     */
+    static String pickComposeActivity(
+        String packageName,
+        List<String> sendActivityNames,
+        Set<String> mailtoActivityNames
+    ) {
+        if (sendActivityNames == null) return null;
+        String first = null;
+        for (String name : sendActivityNames) {
+            if (name == null || name.trim().isEmpty()) continue;
+            if (!isConcreteEmailApp(packageName, name, null)) continue;
+            if (mailtoActivityNames != null && mailtoActivityNames.contains(name)) return name;
+            if (first == null) first = name;
+        }
+        return first;
+    }
+
+    /**
+     * MIME type to deliver with: the real attachment MIME for any filter that accepts it
+     * ({@code image/jpeg}, {@code image/*}, {@code *}{@code /*}); {@code message/rfc822} stays as-is
+     * because the activity only matched that type.
+     */
+    static String deliveryType(String matchedType, String attachmentMime) {
+        if ("message/rfc822".equals(matchedType)) return matchedType;
+        return FeedbackAttachmentNames.normalizeMime(attachmentMime);
     }
 
     /** Direct launch into a resolved email app: typed {@code ACTION_SEND}, package-pinned, no selector. */

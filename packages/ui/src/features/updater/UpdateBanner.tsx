@@ -31,6 +31,7 @@ export function UpdateBanner() {
   const downloadedBytes = useUpdateStore((s) => s.downloadedBytes);
   const totalBytes = useUpdateStore((s) => s.totalBytes);
   const needsPermission = useUpdateStore((s) => s.needsPermission);
+  const installerLaunched = useUpdateStore((s) => s.installerLaunched);
   const appliedMessage = useUpdateStore((s) => s.appliedMessage);
   const downloadUpdate = useUpdateStore((s) => s.downloadUpdate);
   const installDownloadedApk = useUpdateStore((s) => s.installDownloadedApk);
@@ -102,7 +103,9 @@ export function UpdateBanner() {
           <div className="m-update-banner__notes">
             {needsPermission
               ? t('update.needsPermissionStatus', { version: release.version })
-              : t('update.readyStatus', { version: release.version })}
+              : installerLaunched
+                ? t('update.installerLaunchedStatus', { version: release.version })
+                : t('update.readyStatus', { version: release.version })}
           </div>
         ) : status === 'applied' && appliedMessage ? (
           <div className="m-update-banner__notes" data-testid="update-banner-applied-msg">

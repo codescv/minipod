@@ -84,6 +84,29 @@ export interface NativeUpdaterPluginLike {
     eventName: 'apkDownloadProgress',
     cb: (ev: ApkDownloadProgressEvent) => void,
   ): Promise<{ remove(): Promise<void> }>;
+  addListener?(
+    eventName: 'apkInstallResumed',
+    cb: (ev: ApkInstallResumedEvent) => void,
+  ): Promise<{ remove(): Promise<void> }>;
+}
+
+/**
+ * Emitted by `MiniPodPlugin.resumePendingApkInstall` (from `MainActivity.onResume()`) when the
+ * user returns from the "Install unknown apps" settings screen with the permission granted and
+ * the system installer is launched automatically.
+ */
+export interface ApkInstallResumedEvent {
+  readonly filePath?: string;
+  readonly installerLaunched: boolean;
+}
+
+type ListenerHandle = { remove(): Promise<void> };
+let installResumedHandle: ListenerHandle | undefined;
+
+async function clearInstallResumedListener(): Promise<void> {
+  const handle = installResumedHandle;
+  installResumedHandle = undefined;
+  if (handle) await handle.remove().catch(() => undefined);
 }
 
 interface CapacitorGlobalLike {
@@ -141,6 +164,8 @@ export interface UpdateStoreState {
   readonly totalBytes: number;
   readonly downloadedFilePath: string | undefined;
   readonly needsPermission: boolean;
+  /** True once the system package installer was launched (directly or auto-resumed). */
+  readonly installerLaunched: boolean;
   readonly appliedMessage: string | undefined;
   readonly error: string | undefined;
   readonly dismissedTag: string;
@@ -154,13 +179,14 @@ export interface UpdateStoreState {
 
 export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
   status: 'idle',
-  currentVersion: '0.1.25',
+  currentVersion: '0.1.26',
   release: undefined,
   progressPercent: 0,
   downloadedBytes: 0,
   totalBytes: 0,
   downloadedFilePath: undefined,
   needsPermission: false,
+  installerLaunched: false,
   appliedMessage: undefined,
   error: undefined,
   dismissedTag: readDismissedTag(),
@@ -181,7 +207,7 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
       return state.release;
     }
 
-    const currentVersion = host.info.appVersion || '0.1.25';
+    const currentVersion = host.info.appVersion || '0.1.26';
     set({
       status: 'checking',
       currentVersion,
@@ -258,8 +284,10 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
         downloadedBytes: 0,
         totalBytes: release.apkSizeBytes ?? 0,
         needsPermission: false,
+        installerLaunched: false,
         error: undefined,
       });
+      await clearInstallResumedListener();
 
       let listenerHandle: { remove(): Promise<void> } | undefined;
       try {
@@ -273,19 +301,26 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
           });
         }
 
+        // Single tap: the native side streams the APK, verifies it (ZIP magic, packageName,
+        // no versionCode downgrade) and immediately launches the system package installer.
+        // Without "Install unknown apps" it opens ACTION_MANAGE_UNKNOWN_APP_SOURCES and
+        // MainActivity.onResume() auto-resumes the install once permission is granted.
         const res = await nativePlugin.downloadAndInstallApk({
           url: release.apkUrl,
           version: release.version,
         });
 
+        const needsPermission = Boolean(res.needsPermission);
         set({
           status: 'ready-to-install',
           progressPercent: 100,
           downloadedFilePath: res.filePath,
-          needsPermission: Boolean(res.needsPermission),
+          needsPermission,
+          installerLaunched: Boolean(res.installerLaunched) && !needsPermission,
         });
 
-        if (res.needsPermission) {
+        if (needsPermission) {
+          await watchInstallResumed(nativePlugin, set);
           showSnackbar(tNow('update.permissionSnack'));
         } else {
           showSnackbar(tNow('update.installingSnack', { version: release.version }));
@@ -343,8 +378,13 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
     if (downloadedFilePath && nativePlugin?.installApkFile) {
       try {
         const res = await nativePlugin.installApkFile({ filePath: downloadedFilePath });
-        set({ needsPermission: Boolean(res.needsPermission) });
-        if (res.needsPermission) {
+        const needsPermission = Boolean(res.needsPermission);
+        set({
+          needsPermission,
+          installerLaunched: Boolean(res.installerLaunched) && !needsPermission,
+        });
+        if (needsPermission) {
+          await watchInstallResumed(nativePlugin, set);
           showSnackbar(tNow('update.permissionSnack'));
         } else if (release) {
           showSnackbar(tNow('update.installingSnack', { version: release.version }));
@@ -368,17 +408,38 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
   reset() {
     set({
       status: 'idle',
-      currentVersion: '0.1.25',
+      currentVersion: '0.1.26',
       release: undefined,
       progressPercent: 0,
       downloadedBytes: 0,
       totalBytes: 0,
       downloadedFilePath: undefined,
       needsPermission: false,
+      installerLaunched: false,
       appliedMessage: undefined,
       error: undefined,
       dismissedTag: readDismissedTag(),
       lastCheckedAt: undefined,
     });
+    void clearInstallResumedListener();
   },
 }));
+
+/**
+ * Subscribes (once) to `apkInstallResumed` so the UI leaves the "Grant & install" state when
+ * the native side auto-launches the installer after the unknown-sources permission is granted.
+ */
+async function watchInstallResumed(
+  nativePlugin: NativeUpdaterPluginLike,
+  set: (partial: Partial<UpdateStoreState>) => void,
+): Promise<void> {
+  if (!nativePlugin.addListener || installResumedHandle) return;
+  try {
+    installResumedHandle = await nativePlugin.addListener('apkInstallResumed', (ev) => {
+      set({ needsPermission: false, installerLaunched: ev.installerLaunched !== false });
+      void clearInstallResumedListener();
+    });
+  } catch {
+    installResumedHandle = undefined;
+  }
+}

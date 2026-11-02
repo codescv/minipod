@@ -179,6 +179,112 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
     });
   });
 
+  it('Settings update button downloads and directly launches the Android installer in one tap', async () => {
+    mockGithubLatestRelease('v0.1.2');
+    const apkPath = '/data/user/0/dev.minipod.app/cache/updates/minipod-0.1.2.apk';
+    const downloadAndInstallApk = vi.fn(async () => ({
+      filePath: apkPath,
+      installerLaunched: true,
+      needsPermission: false,
+    }));
+    const installApkFile = vi.fn(async () => ({
+      filePath: apkPath,
+      installerLaunched: true,
+      needsPermission: false,
+    }));
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+      Plugins: {
+        MiniPod: {
+          downloadAndInstallApk,
+          installApkFile,
+          addListener: vi.fn(async () => ({ remove: async () => undefined })),
+        },
+      },
+    };
+
+    renderMiniPod({ width: 1024, hostOptions: { platform: 'android', appVersion: '0.1.0' } });
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-rail-settings'));
+    await screen.findByTestId('settings-screen');
+
+    fireEvent.click(screen.getByTestId('settings-update-btn'));
+    await waitFor(() => {
+      expect(screen.getByTestId('settings-update-btn')).toHaveTextContent('Update to v0.1.2');
+    });
+
+    // ONE tap: download + verify + installer launch, no second "Install" confirmation.
+    fireEvent.click(screen.getByTestId('settings-update-btn'));
+    await waitFor(() => {
+      expect(downloadAndInstallApk).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByTestId('settings-update-status')).toHaveTextContent(
+      'Installer opened for v0.1.2',
+    );
+    expect(installApkFile).not.toHaveBeenCalled();
+    expect(useUpdateStore.getState().installerLaunched).toBe(true);
+
+    // Re-trigger button stays available if the user cancelled the system installer dialog.
+    const retrigger = screen.getByTestId('settings-update-btn');
+    expect(retrigger).toHaveTextContent('Install APK');
+    fireEvent.click(retrigger);
+    await waitFor(() => {
+      expect(installApkFile).toHaveBeenCalledWith({ filePath: apkPath });
+    });
+    expect(downloadAndInstallApk).toHaveBeenCalledTimes(1);
+  });
+
+  it('auto-resumes the install after unknown-sources permission via apkInstallResumed', async () => {
+    mockGithubLatestRelease('v0.1.2');
+    const apkPath = '/data/user/0/dev.minipod.app/cache/updates/minipod-0.1.2.apk';
+    const listeners = new Map<string, (ev: unknown) => void>();
+    const downloadAndInstallApk = vi.fn(async () => ({
+      filePath: apkPath,
+      installerLaunched: false,
+      needsPermission: true,
+    }));
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+      Plugins: {
+        MiniPod: {
+          downloadAndInstallApk,
+          installApkFile: vi.fn(),
+          addListener: vi.fn(async (event: string, cb: (ev: unknown) => void) => {
+            listeners.set(event, cb);
+            return { remove: async () => void listeners.delete(event) };
+          }),
+        },
+      },
+    };
+
+    renderMiniPod({
+      width: 390,
+      hostOptions: { platform: 'android', appVersion: '0.1.0' },
+      autoCheckUpdates: true,
+    });
+    await screen.findByTestId('update-banner');
+    fireEvent.click(screen.getByTestId('update-banner-action-btn'));
+
+    const installBtn = await screen.findByTestId('update-banner-install-btn');
+    expect(installBtn).toHaveTextContent('Grant & install');
+    await waitFor(() => {
+      expect(listeners.has('apkInstallResumed')).toBe(true);
+    });
+
+    // MainActivity.onResume() -> MiniPodPlugin.resumePendingApkInstall() launched the installer.
+    act(() => {
+      listeners.get('apkInstallResumed')?.({ filePath: apkPath, installerLaunched: true });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('update-banner-install-btn')).toHaveTextContent('Install APK');
+    });
+    expect(screen.getByTestId('update-banner')).toHaveTextContent('Installer opened for v0.1.2');
+    expect(useUpdateStore.getState().needsPermission).toBe(false);
+    await waitFor(() => {
+      expect(listeners.has('apkInstallResumed')).toBe(false);
+    });
+  });
+
   it('applies PC self-update via host.updater.apply() and preserves the strict 9-row Settings invariant', async () => {
     mockGithubLatestRelease('v0.1.2');
 

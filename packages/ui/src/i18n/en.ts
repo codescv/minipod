@@ -249,6 +249,7 @@ export const en: Messages = {
   'update.availableStatus': 'Update available: v{version}',
   'update.updateTo': 'Update to v{version}',
   'update.readyStatus': 'v{version} downloaded — tap Install APK',
+  'update.installerLaunchedStatus': 'Installer opened for v{version} — tap Install APK if you cancelled it',
   'update.needsPermissionStatus': 'Allow unknown apps permission to install v{version}',
   'update.appliedStatus': '{message}',
   'update.errorStatus': 'Update error: {error}',

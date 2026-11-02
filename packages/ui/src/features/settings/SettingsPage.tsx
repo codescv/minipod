@@ -62,6 +62,7 @@ export function SettingsPage() {
   const updateDownloadedBytes = useUpdateStore((s) => s.downloadedBytes);
   const updateTotalBytes = useUpdateStore((s) => s.totalBytes);
   const updateNeedsPermission = useUpdateStore((s) => s.needsPermission);
+  const updateInstallerLaunched = useUpdateStore((s) => s.installerLaunched);
   const updateAppliedMessage = useUpdateStore((s) => s.appliedMessage);
   const updateError = useUpdateStore((s) => s.error);
   const checkForUpdate = useUpdateStore((s) => s.checkForUpdate);
@@ -439,7 +440,9 @@ export function SettingsPage() {
                         : updateStatus === 'ready-to-install' && updateRelease
                           ? updateNeedsPermission
                             ? t('update.needsPermissionStatus', { version: updateRelease.version })
-                            : t('update.readyStatus', { version: updateRelease.version })
+                            : updateInstallerLaunched
+                              ? t('update.installerLaunchedStatus', { version: updateRelease.version })
+                              : t('update.readyStatus', { version: updateRelease.version })
                           : updateStatus === 'applied' && updateAppliedMessage
                             ? t('update.appliedStatus', { message: updateAppliedMessage })
                             : updateStatus === 'error' && updateError

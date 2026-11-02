@@ -247,6 +247,7 @@ export const zhCN = {
   'update.availableStatus': '发现新版本 v{version}',
   'update.updateTo': '更新至 v{version}',
   'update.readyStatus': 'v{version} 已下载就绪，点击安装',
+  'update.installerLaunchedStatus': '已打开 v{version} 安装界面，如已取消可点击“安装 APK”重新安装',
   'update.needsPermissionStatus': '请开启“允许安装未知应用”后安装 v{version}',
   'update.appliedStatus': '{message}',
   'update.errorStatus': '检查更新失败：{error}',
