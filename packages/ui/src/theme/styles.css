@@ -153,6 +153,46 @@ button:disabled {
   opacity: 0.45;
 }
 
+/*
+ * v0.1.25: Android WebView starts native text selection on a ~500 ms long press, right after our
+ * ~450 ms long-press gestures portal a context menu under the finger (selection handles showed up
+ * on `.m-menu__item` text). App chrome, buttons and menus are never text-selectable.
+ */
+body,
+button,
+[role="button"],
+[role="menuitem"],
+.m-btn,
+.m-icon-btn,
+.m-chip,
+.m-fab,
+.m-menu,
+.m-menu__item,
+.m-nav-bar,
+.m-nav-rail,
+.m-nav-item,
+.m-appbar,
+.m-mini-player,
+.m-desktop-bar,
+.m-expanded-player,
+.m-settings-row,
+.m-subs-expand-btn,
+.m-inline-undo,
+.m-snackbar {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Form fields and episode shownotes stay selectable. */
+input,
+textarea,
+[contenteditable="true"],
+.m-shownotes {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 :focus-visible {
   outline: 2px solid var(--md-sys-color-primary);
   outline-offset: 2px;

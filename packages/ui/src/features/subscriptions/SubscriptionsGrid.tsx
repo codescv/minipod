@@ -34,6 +34,7 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { preloadArtworkUrls } from '../../lib/artwork-cache';
+import { clearTextSelection } from '../../lib/text-selection';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar } from '../../stores/snackbar';
 import {
@@ -121,6 +122,8 @@ function useLongPressHandlers({
       timerRef.current = setTimeout(() => {
         timerRef.current = null;
         longPressedRef.current = true;
+        // v0.1.25: drop any Android WebView long-press selection before the menu portals in.
+        clearTextSelection();
         onContext(x, y);
       }, LONG_PRESS_DELAY_MS);
     },
@@ -147,6 +150,7 @@ function useLongPressHandlers({
           e.preventDefault();
         }
         e.stopPropagation();
+        clearTextSelection();
       }
     },
     onClick: (e: ReactMouseEvent<HTMLElement>) => {
@@ -162,6 +166,7 @@ function useLongPressHandlers({
       e.preventDefault();
       e.stopPropagation();
       clearTimer();
+      clearTextSelection();
       onContext(e.clientX, e.clientY);
     },
     onKeyDown: (e: ReactKeyboardEvent<HTMLElement>) => {

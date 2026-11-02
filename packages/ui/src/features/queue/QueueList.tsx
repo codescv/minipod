@@ -29,6 +29,7 @@ import {
 } from '../../components/m3';
 import { useDownloadedCount } from '../../hooks/useDownloadedCount';
 import { useRowGestures } from '../../hooks/useRowGestures';
+import { clearTextSelection } from '../../lib/text-selection';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
@@ -861,7 +862,10 @@ export function QueueList() {
                       });
                     }
                   }}
-                  onContext={(x, y) => setActiveContextMenu({ idx, x, y })}
+                  onContext={(x, y) => {
+                    clearTextSelection();
+                    setActiveContextMenu({ idx, x, y });
+                  }}
                   onSwipeLeftRemove={() => {
                     void handleSwipeRemoveWithInlineUndo(idx);
                   }}

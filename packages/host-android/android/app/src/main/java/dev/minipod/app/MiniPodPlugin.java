@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -263,7 +264,7 @@ public class MiniPodPlugin extends Plugin {
     /**
      * v0.1.23 Agent Feedback email. With an image attachment, writes the decoded bytes to
      * {@code cache/feedback/<safeName>}, shares them through the app FileProvider, and starts
-     * {@code ACTION_SEND} restricted to email apps via a {@code mailto:} selector (chooser fallback).
+     * {@code ACTION_SEND} directly in the resolved email app (v0.1.25, see {@link #launchFeedbackEmail}).
      * Without an attachment, launches a plain {@code mailto:} {@code ACTION_SENDTO} as before.
      */
     @PluginMethod
@@ -330,40 +331,154 @@ public class MiniPodPlugin extends Plugin {
                 return;
             }
 
-            new Handler(Looper.getMainLooper()).post(() -> {
-                Intent send = new Intent(Intent.ACTION_SEND);
-                send.setType(mimeType);
-                if (!to.isEmpty()) send.putExtra(Intent.EXTRA_EMAIL, new String[] { to });
-                send.putExtra(Intent.EXTRA_SUBJECT, subject);
-                send.putExtra(Intent.EXTRA_TEXT, body);
-                send.putExtra(Intent.EXTRA_STREAM, contentUri);
-                send.setClipData(ClipData.newRawUri("feedback_image", contentUri));
-                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                send.setSelector(new Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")));
-                send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                try {
-                    context.startActivity(send);
-                    call.resolve();
-                    return;
-                } catch (ActivityNotFoundException ignored) {
-                    // No mailto-capable app matched the selector: fall back to a generic chooser.
-                } catch (Exception e) {
-                    call.reject("Failed to open email app: " + e.getMessage(), "io", e);
-                    return;
-                }
-                try {
-                    send.setSelector(null);
-                    Intent chooser = Intent.createChooser(send, subject.isEmpty() ? "Send feedback" : subject);
-                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    context.startActivity(chooser);
-                    call.resolve();
-                } catch (ActivityNotFoundException e) {
-                    call.reject("No application can send feedback email", "unsupported", e);
-                } catch (Exception e) {
-                    call.reject("Failed to open email app: " + e.getMessage(), "io", e);
-                }
-            });
+            new Handler(Looper.getMainLooper()).post(
+                () -> launchFeedbackEmail(call, context, to, subject, body, mimeType, contentUri)
+            );
         });
+    }
+
+    /**
+     * v0.1.25: opens the email client directly instead of the share sheet. Tries, in order:
+     * (1) typed {@code ACTION_SEND} pinned to the email app resolved from a {@code mailto:}
+     * {@code ACTION_SENDTO} probe, (2) untyped {@code ACTION_SEND} + {@code mailto:} selector
+     * (never {@code setType} + selector together, which made every {@code mailto:} filter fail
+     * with {@code MATCH_NO_TYPE}), and only then (3) the generic chooser.
+     */
+    private void launchFeedbackEmail(
+        PluginCall call,
+        Context context,
+        String to,
+        String subject,
+        String body,
+        String mimeType,
+        Uri contentUri
+    ) {
+        List<FeedbackEmailIntentBuilder.SendTarget> targets;
+        try {
+            targets = resolveFeedbackEmailTargets(context, to, mimeType);
+        } catch (Exception e) {
+            targets = new ArrayList<>();
+        }
+        List<FeedbackEmailIntentBuilder.Spec> plan = FeedbackEmailIntentBuilder.plan(targets, to, mimeType);
+        Exception lastError = null;
+        for (FeedbackEmailIntentBuilder.Spec spec : plan) {
+            Intent send = buildFeedbackSendIntent(context, spec, to, subject, body, contentUri);
+            Intent toStart = send;
+            if (spec.strategy == FeedbackEmailIntentBuilder.Strategy.CHOOSER) {
+                toStart = Intent.createChooser(send, subject.isEmpty() ? "Send feedback" : subject);
+                toStart.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            }
+            try {
+                if (spec.packageName != null) {
+                    context.grantUriPermission(spec.packageName, contentUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
+                context.startActivity(toStart);
+                call.resolve();
+                return;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                // Try the next strategy (selector fallback, then chooser).
+                lastError = e;
+            } catch (Exception e) {
+                lastError = e;
+            }
+        }
+        if (lastError instanceof ActivityNotFoundException) {
+            call.reject("No application can send feedback email", "unsupported", lastError);
+        } else {
+            call.reject(
+                "Failed to open email app: " + (lastError == null ? "unknown" : lastError.getMessage()),
+                "io",
+                lastError
+            );
+        }
+    }
+
+    /**
+     * Resolves concrete email apps from a {@code mailto:} {@code ACTION_SENDTO} probe (default
+     * handler first, then Gmail, then other handlers) and, for each, the {@code ACTION_SEND}
+     * activity and MIME type that accept the attachment.
+     */
+    private List<FeedbackEmailIntentBuilder.SendTarget> resolveFeedbackEmailTargets(
+        Context context,
+        String to,
+        String mimeType
+    ) {
+        PackageManager pm = context.getPackageManager();
+        Intent mailtoProbe = new Intent(Intent.ACTION_SENDTO, Uri.parse(FeedbackEmailIntentBuilder.mailtoUri(to)));
+
+        String defaultPackage = null;
+        String defaultActivity = null;
+        ResolveInfo defaultInfo = pm.resolveActivity(mailtoProbe, PackageManager.MATCH_DEFAULT_ONLY);
+        if (defaultInfo != null && defaultInfo.activityInfo != null) {
+            defaultPackage = defaultInfo.activityInfo.packageName;
+            defaultActivity = defaultInfo.activityInfo.name;
+        }
+
+        List<String> candidates = new ArrayList<>();
+        addResolvedPackages(candidates, pm.queryIntentActivities(mailtoProbe, PackageManager.MATCH_DEFAULT_ONLY));
+        addResolvedPackages(candidates, pm.queryIntentActivities(mailtoProbe, 0));
+
+        List<String> packages = FeedbackEmailIntentBuilder.orderEmailPackages(
+            defaultPackage,
+            defaultActivity,
+            candidates,
+            context.getPackageName()
+        );
+
+        List<FeedbackEmailIntentBuilder.SendTarget> targets = new ArrayList<>();
+        for (String pkg : packages) {
+            for (String type : FeedbackEmailIntentBuilder.sendTypeCandidates(mimeType)) {
+                Intent sendProbe = new Intent(Intent.ACTION_SEND);
+                sendProbe.setType(type);
+                sendProbe.setPackage(pkg);
+                List<ResolveInfo> sendActivities = pm.queryIntentActivities(sendProbe, PackageManager.MATCH_DEFAULT_ONLY);
+                if (sendActivities == null || sendActivities.isEmpty()) continue;
+                String className = null;
+                if (sendActivities.size() == 1 && sendActivities.get(0).activityInfo != null) {
+                    className = sendActivities.get(0).activityInfo.name;
+                }
+                targets.add(new FeedbackEmailIntentBuilder.SendTarget(pkg, className, type));
+                break;
+            }
+        }
+        return targets;
+    }
+
+    private static void addResolvedPackages(List<String> out, @Nullable List<ResolveInfo> infos) {
+        if (infos == null) return;
+        for (ResolveInfo info : infos) {
+            if (info != null && info.activityInfo != null && info.activityInfo.packageName != null) {
+                if (!out.contains(info.activityInfo.packageName)) out.add(info.activityInfo.packageName);
+            }
+        }
+    }
+
+    /** Converts a {@link FeedbackEmailIntentBuilder.Spec} into the concrete {@code ACTION_SEND} Intent. */
+    private static Intent buildFeedbackSendIntent(
+        Context context,
+        FeedbackEmailIntentBuilder.Spec spec,
+        String to,
+        String subject,
+        String body,
+        Uri contentUri
+    ) {
+        Intent send = new Intent(Intent.ACTION_SEND);
+        if (spec.type != null) send.setType(spec.type);
+        if (!to.isEmpty()) send.putExtra(Intent.EXTRA_EMAIL, new String[] { to });
+        send.putExtra(Intent.EXTRA_SUBJECT, subject);
+        send.putExtra(Intent.EXTRA_TEXT, body);
+        send.putExtra(Intent.EXTRA_STREAM, contentUri);
+        send.setClipData(ClipData.newUri(context.getContentResolver(), "feedback_image", contentUri));
+        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (spec.className != null) {
+            send.setClassName(spec.packageName, spec.className);
+        } else if (spec.packageName != null) {
+            send.setPackage(spec.packageName);
+        }
+        if (spec.selectorMailto != null) {
+            send.setSelector(new Intent(Intent.ACTION_SENDTO, Uri.parse(spec.selectorMailto)));
+        }
+        return send;
     }
 
     // -------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type TouchEvent as ReactTouchEvent,
 } from 'react';
+import { clearTextSelection } from '../lib/text-selection';
 
 export const ROW_LONG_PRESS_DELAY_MS = 450;
 export const ROW_LONG_PRESS_SLOP_PX = 10;
@@ -162,6 +163,8 @@ export function useRowGestures({
         pointerStartRef.current = null;
         touchStartRef.current = null;
         resetSwipeVisual();
+        // v0.1.25: drop any Android WebView long-press selection before the menu portals in.
+        clearTextSelection();
         callbacksRef.current.onContext(x, y);
       }, ROW_LONG_PRESS_DELAY_MS);
     },
@@ -261,6 +264,7 @@ export function useRowGestures({
           e.preventDefault();
         }
         e.stopPropagation();
+        clearTextSelection();
         return;
       }
 
@@ -317,6 +321,7 @@ export function useRowGestures({
       touchStartRef.current = null;
       pointerStartRef.current = null;
       resetSwipeVisual();
+      clearTextSelection();
       callbacksRef.current.onContext(e.clientX, e.clientY);
     },
 

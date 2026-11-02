@@ -23,6 +23,7 @@ import {
   preloadArtworkUrls,
   rememberResolvedCandidate,
 } from '../../lib/artwork-cache';
+import { clearTextSelection, suppressNativeContextMenu } from '../../lib/text-selection';
 import { useSnackbarStore } from '../../stores/snackbar';
 import { Icon, type IconName } from './Icon';
 
@@ -45,9 +46,22 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   readonly icon?: IconName | undefined;
 }
 
-export function Button({ variant = 'filled', icon, className, children, type = 'button', ...rest }: ButtonProps) {
+export function Button({
+  variant = 'filled',
+  icon,
+  className,
+  children,
+  type = 'button',
+  onContextMenu,
+  ...rest
+}: ButtonProps) {
   return (
-    <button type={type} className={cx('m-btn', `m-btn--${variant}`, className)} {...rest}>
+    <button
+      type={type}
+      className={cx('m-btn', `m-btn--${variant}`, className)}
+      {...rest}
+      onContextMenu={suppressNativeContextMenu(onContextMenu)}
+    >
       {icon && <Icon name={icon} size={18} />}
       {children}
     </button>
@@ -72,6 +86,7 @@ export function IconButton({
   iconClassName,
   className,
   type = 'button',
+  onContextMenu,
   ...rest
 }: IconButtonProps) {
   return (
@@ -86,6 +101,7 @@ export function IconButton({
         className,
       )}
       {...rest}
+      onContextMenu={suppressNativeContextMenu(onContextMenu)}
     >
       <Icon name={icon} size={iconSize ?? (large ? 30 : 22)} className={iconClassName} />
     </button>
@@ -113,6 +129,7 @@ export function FAB({
       data-testid={testId}
       className={cx('m-fab', floating && 'm-fab--floating')}
       onClick={onClick}
+      onContextMenu={suppressNativeContextMenu()}
     >
       <Icon name={icon} size={24} />
     </button>
@@ -138,6 +155,7 @@ export function Chip({
       data-testid={testId}
       className={cx('m-chip', selected && 'is-selected')}
       onClick={onClick}
+      onContextMenu={suppressNativeContextMenu()}
     >
       {selected && <Icon name="check" size={16} />}
       <span>{children}</span>
@@ -355,6 +373,7 @@ export function Menu({
 
   useEffect(() => {
     if (!open) return;
+    clearTextSelection();
     return registerBackInterceptor(() => {
       setOpen(false);
       return true;
@@ -447,7 +466,7 @@ export function Menu({
         overflowY: 'auto',
       }}
       onClick={(e) => e.stopPropagation()}
-      onContextMenu={(e) => e.preventDefault()}
+      onContextMenu={suppressNativeContextMenu()}
     >
       {items.map((item) => (
         <button
@@ -457,6 +476,7 @@ export function Menu({
           disabled={item.disabled}
           data-testid={item.testId}
           className="m-menu__item"
+          onContextMenu={suppressNativeContextMenu()}
           onClick={() => {
             setOpen(false);
             item.onSelect();
@@ -498,6 +518,31 @@ export interface ContextMenuProps {
 
 export function ContextMenu({ open, x, y, onClose, items, testId }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // v0.1.25: the menu portals under the still-pressed finger after a long press; clear any
+  // selection Android WebView already started so no handles appear on the menu items.
+  useLayoutEffect(() => {
+    if (open) clearTextSelection();
+  }, [open, x, y]);
+
+  // The WebView's native long-press (~500 ms) can still fire after the menu opened (~450 ms):
+  // drop any selection that lands inside the menu while it is open.
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') return;
+    const onSelectionChange = () => {
+      try {
+        const sel = window.getSelection?.();
+        const anchor = sel?.anchorNode ?? null;
+        if (sel && !sel.isCollapsed && anchor && menuRef.current?.contains(anchor)) {
+          clearTextSelection();
+        }
+      } catch {
+        // Selection API unavailable.
+      }
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, [open]);
   const [coords, setCoords] = useState<{ readonly left: number; readonly top: number }>({
     left: Math.max(VIEWPORT_MARGIN_PX, x),
     top: Math.max(VIEWPORT_MARGIN_PX, y),
@@ -586,7 +631,7 @@ export function ContextMenu({ open, x, y, onClose, items, testId }: ContextMenuP
         overflowY: 'auto',
       }}
       onClick={(e) => e.stopPropagation()}
-      onContextMenu={(e) => e.preventDefault()}
+      onContextMenu={suppressNativeContextMenu()}
     >
       {items.map((item) => (
         <button
@@ -596,6 +641,7 @@ export function ContextMenu({ open, x, y, onClose, items, testId }: ContextMenuP
           disabled={item.disabled}
           data-testid={item.testId}
           className="m-menu__item"
+          onContextMenu={suppressNativeContextMenu()}
           onClick={() => {
             onClose();
             item.onSelect();
