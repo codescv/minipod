@@ -1,6 +1,6 @@
 {
   "name": "@minipod/ui",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "MiniPod shared Material Design 3 UI (React 19 + Vite). Exposes `mountMiniPodApp(el, host, engine)`; hosts supply a PlatformHost and a PlayerEngine. Includes MockPlatformHost/MockPlayerEngine dev harness and the HtmlAudioEngine used by the PC Web App.",
   "license": "MIT",
   "type": "module",
