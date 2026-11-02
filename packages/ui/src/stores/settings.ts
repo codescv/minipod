@@ -2,10 +2,13 @@
  * AppSettings zustand store synchronized with `host.settings`.
  */
 import { create } from 'zustand';
-import { COUNTRY_CODE_UNSET, type AppSettings, type PlatformHost } from '@minipod/core';
+import {
+  APP_SETTINGS_SCHEMA_VERSION,
+  COUNTRY_CODE_UNSET,
+  type AppSettings, type PlatformHost } from '@minipod/core';
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
-  schemaVersion: 1,
+  schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
   deleteDownloadWhenPlayed: true,
   backgroundRefreshHours: 3,
   sync: {

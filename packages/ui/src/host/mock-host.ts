@@ -1088,7 +1088,7 @@ export class MockPlatformHost implements PlatformHost {
       const { downloadPath: _omit, ...rest } = ep;
       void _omit;
       this.episodesMap.set(episodeKey, { ...rest, downloadState: 'NONE' });
-      this.emit({ type: 'download-updated', episodeKey, state: 'NONE' });
+      this.emit({ type: 'download-updated', episodeKey, state: 'NONE', progress: 0 });
       this.emit({ type: 'episodes-changed', feedKey: ep.feedKey });
     },
 
@@ -1220,7 +1220,13 @@ export class MockPlatformHost implements PlatformHost {
           this.reindexQueuePositions();
           this.emit({ type: 'queue-changed' });
         }
-        if (this.settingsState.deleteDownloadWhenPlayed && ep?.downloadState === 'DONE') {
+        // Parity with the real hosts: any download artifact (DONE, in-flight, failed, stale path)
+        // is purged once played, emitting `download-updated(NONE)` + `episodes-changed`.
+        if (
+          this.settingsState.deleteDownloadWhenPlayed &&
+          ep &&
+          (ep.downloadState !== 'NONE' || Boolean(ep.downloadPath))
+        ) {
           await this.episodes.deleteDownload(save.episodeKey);
         }
       }
@@ -1622,6 +1628,11 @@ export class MockPlayerEngine implements PlayerEngine {
   emitRawState(snapshot: PlayerSnapshot): void {
     this.snapshot = snapshot;
     this.emit({ type: 'state', snapshot: this.snapshot });
+  }
+
+  /** Test helper: emit an arbitrary raw `PlayerEvent` without touching the snapshot. */
+  emitEvent(event: PlayerEvent): void {
+    this.emit(event);
   }
 
   /** Test helper: simulate natural track completion. */

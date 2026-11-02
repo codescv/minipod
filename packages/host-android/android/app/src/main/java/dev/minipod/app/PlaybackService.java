@@ -783,7 +783,11 @@ public class PlaybackService extends MediaSessionService {
         boolean playing = player != null && player.isPlaying();
         boolean buffering = player != null && player.getPlaybackState() == Player.STATE_BUFFERING;
         long posMs;
-        if (player != null && player.getMediaItemCount() > 0) {
+        if (player != null && player.getPlaybackState() == Player.STATE_ENDED) {
+            // Finished episode: report 0 (never the end position) so a trailing `media-state` after
+            // `media-ended` can't look like a mid-track pause that overwrites PLAYED with IN_PROGRESS.
+            posMs = 0L;
+        } else if (player != null && player.getMediaItemCount() > 0) {
             posMs = Math.max(0L, player.getCurrentPosition());
         } else {
             // Empty player (fresh service / restore failed): keep the last known position instead of 0.
@@ -848,6 +852,8 @@ public class PlaybackService extends MediaSessionService {
             } else if (playbackState == Player.STATE_ENDED) {
                 String finishedKey = activeEpisodeKey;
                 long dur = resolveCurrentDurationMs();
+                // Completed: the resume point is the start, not the end position.
+                lastKnownPositionMs = 0L;
                 MAIN_HANDLER.removeCallbacks(tickRunnable);
                 MAIN_HANDLER.removeCallbacks(sleepTimerRunnable);
                 player.setVolume(1.0f);
@@ -1073,7 +1079,9 @@ public class PlaybackService extends MediaSessionService {
     }
 
     private void emitCurrentState() {
-        if (player != null && player.getMediaItemCount() > 0) {
+        if (player != null && player.getPlaybackState() == Player.STATE_ENDED) {
+            lastKnownPositionMs = 0L;
+        } else if (player != null && player.getMediaItemCount() > 0) {
             long pos = Math.max(0L, player.getCurrentPosition());
             if (pos > 0L || player.getPlaybackState() != Player.STATE_IDLE) {
                 lastKnownPositionMs = pos;
@@ -1107,7 +1115,10 @@ public class PlaybackService extends MediaSessionService {
     private void writeCurrentCheckpoint() {
         if (activeEpisodeKey == null || player == null) return;
         long posMs;
-        if (player.getMediaItemCount() > 0) {
+        if (player.getPlaybackState() == Player.STATE_ENDED) {
+            // Never checkpoint the end position of a finished episode as an IN_PROGRESS resume point.
+            posMs = 0L;
+        } else if (player.getMediaItemCount() > 0) {
             posMs = Math.max(0L, player.getCurrentPosition());
             if (posMs == 0L && player.getPlaybackState() == Player.STATE_IDLE && lastKnownPositionMs > 0L) {
                 posMs = lastKnownPositionMs;

@@ -438,7 +438,16 @@ export type PlayerEvent =
   | { readonly type: 'error'; readonly episodeKey?: EpisodeKey; readonly error: MiniPodErrorShape }
   | { readonly type: 'sleepTimer'; readonly state: SleepTimerState }
   /** Native engine advanced on its own (ARCHITECTURE.md §3.3); UI reconciles queue/progress. */
-  | { readonly type: 'nativeAdvanced'; readonly from: EpisodeKey; readonly to: EpisodeKey };
+  | {
+      readonly type: 'nativeAdvanced';
+      readonly from: EpisodeKey;
+      readonly to: EpisodeKey;
+      /**
+       * `true` when the native player reported `from` finished playing (`media-ended` auto-advance),
+       * as opposed to a transition inferred from `media-state` (e.g. notification "next" skip).
+       */
+      readonly completed?: boolean;
+    };
 
 export interface PlayerEngineCapabilities {
   /** Can render video enclosures inline (`attachVideoSurface`). Android v1: `false`. */
@@ -704,8 +713,16 @@ export interface SyncSchedulerHost {
 // §J. Settings (ARCHITECTURE.md §6.1 `settings`, DESIGN.md §4.7)
 // ---------------------------------------------------------------------------
 
+/**
+ * Current `AppSettings.schemaVersion`. `2` (v0.1.27) force-migrates legacy pre-v0.1.14 installs that
+ * persisted `deleteDownloadWhenPlayed: false` (the toggle was removed in v0.1.14, so auto-delete of
+ * played downloads is an always-on product behavior).
+ */
+export const APP_SETTINGS_SCHEMA_VERSION = 2;
+
 export interface AppSettings {
-  readonly schemaVersion: 1;
+  /** `1` = legacy (pre-v0.1.27, may carry a stale `deleteDownloadWhenPlayed: false`); `2` = current. */
+  readonly schemaVersion: 1 | 2;
   readonly deleteDownloadWhenPlayed: boolean;
   readonly backgroundRefreshHours: 0 | 1 | 3 | 6 | 12 | 24;
   readonly sync: SyncSettings;

@@ -12,7 +12,11 @@ import { Button, Icon, IconButton } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
-import { getHostViewCache, type DownloadedEpisodeItem } from '../../stores/view-cache';
+import {
+  applyDownloadStateToViewCache,
+  getHostViewCache,
+  type DownloadedEpisodeItem,
+} from '../../stores/view-cache';
 import { EpisodeRow } from './EpisodeRow';
 
 export function DownloadsPage() {
@@ -90,6 +94,16 @@ export function DownloadsPage() {
   }, [loadDownloads]);
 
   useHostEvents((ev) => {
+    if (ev.type === 'download-updated') {
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+      if (ev.state !== 'DONE') {
+        // Drop a deleted/cancelled download from the list immediately (before revalidation).
+        setItems((prev) => {
+          const next = prev.filter((item) => item.row.episode.episodeKey !== ev.episodeKey);
+          return next.length === prev.length ? prev : next;
+        });
+      }
+    }
     if (
       ev.type === 'download-updated' ||
       ev.type === 'episodes-changed' ||

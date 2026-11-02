@@ -10,6 +10,7 @@
  */
 import type {
   CountryCode,
+  DownloadState,
   EpisodeFilter,
   EpisodeKey,
   EpisodeRow as EpisodeRowModel,
@@ -179,4 +180,80 @@ export function recomputeHostTimelineAndDownloads(
     downloadedCount: downloadedItems.length,
     downloadedItems,
   };
+}
+
+/**
+ * Applies a `download-updated` transition to every SWR cache slice that embeds the episode
+ * (`episodesByFeed` across all cached feeds, `queueRows`, `timelineItems`, `downloadedItems`,
+ * `downloadedCount`).
+ *
+ * Needed because only the mounted screen revalidates: e.g. when an episode finishes (and its
+ * download is auto-deleted) while the user is on the Queue screen, `DownloadsPage` /
+ * `SubscriptionsGrid` are unmounted, and a stale `episodesByFeed` (`DONE`) would otherwise
+ * re-pollute `downloadedItems` (Manage Downloads) on the next `recomputeHostTimelineAndDownloads`.
+ *
+ * Idempotent (safe to call from several listeners for the same event) and keeps array identity
+ * when nothing changed.
+ */
+export function applyDownloadStateToViewCache(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  state: DownloadState,
+  downloadPath?: string,
+): void {
+  const viewCache = getHostViewCache(host);
+
+  const patchEpisode = <E extends EpisodeRowModel['episode']>(ep: E): E => {
+    const nextPath = state === 'DONE' ? (downloadPath ?? ep.downloadPath) : undefined;
+    if (ep.downloadState === state && ep.downloadPath === nextPath) return ep;
+    const { downloadPath: _omit, ...rest } = ep;
+    void _omit;
+    return {
+      ...rest,
+      downloadState: state,
+      ...(nextPath !== undefined ? { downloadPath: nextPath } : {}),
+    } as E;
+  };
+
+  const patchRow = <R extends { readonly episode: EpisodeRowModel['episode'] }>(row: R): R => {
+    if (row.episode.episodeKey !== episodeKey) return row;
+    const episode = patchEpisode(row.episode);
+    return episode === row.episode ? row : { ...row, episode };
+  };
+
+  const patchList = <T>(list: readonly T[], patch: (item: T) => T): readonly T[] => {
+    let changed = false;
+    const next = list.map((item) => {
+      const patched = patch(item);
+      if (patched !== item) changed = true;
+      return patched;
+    });
+    return changed ? next : list;
+  };
+
+  for (const [feedKey, rows] of viewCache.episodesByFeed) {
+    const next = patchList(rows, patchRow);
+    if (next !== rows) viewCache.episodesByFeed.set(feedKey, next);
+  }
+
+  viewCache.queueRows = patchList(viewCache.queueRows, patchRow);
+
+  viewCache.timelineItems = patchList(viewCache.timelineItems, (item) => {
+    const row = patchRow(item.row);
+    return row === item.row ? item : { ...item, row };
+  });
+
+  if (state !== 'DONE') {
+    const before = viewCache.downloadedItems;
+    const after = before.filter((item) => item.row.episode.episodeKey !== episodeKey);
+    if (after.length !== before.length) {
+      viewCache.downloadedItems = after;
+      viewCache.downloadedCount = after.length;
+    }
+  } else {
+    viewCache.downloadedItems = patchList(viewCache.downloadedItems, (item) => {
+      const row = patchRow(item.row);
+      return row === item.row ? item : { ...item, row };
+    });
+  }
 }

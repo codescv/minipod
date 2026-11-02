@@ -240,4 +240,38 @@ describe('IdbSyncStore & AndroidSecretsStore', () => {
 
     db.close();
   });
+  it('migrates a legacy schemaVersion 1 settings row with deleteDownloadWhenPlayed: false to schemaVersion 2 / true on init (b1d6d66b)', async () => {
+    const db = await openMiniPodDb(new IDBFactory(), 'test-legacy-settings');
+    await db.put('settings', {
+      key: 'app',
+      value: {
+        schemaVersion: 1,
+        deleteDownloadWhenPlayed: false,
+        playbackSpeed: 1.5,
+        uiLanguage: 'zh-CN',
+      } as never,
+    });
+    const store = new IdbSyncStore({
+      db,
+      hlc: new HybridLogicalClock(),
+      appVersion: '0.1.27',
+      defaultDeviceName: 'Pixel 8',
+    });
+    await store.init();
+    const row = await db.get('settings', 'app');
+    expect(row?.value).toMatchObject({
+      schemaVersion: 2,
+      deleteDownloadWhenPlayed: true,
+      // user choices are preserved, missing fields backfilled
+      playbackSpeed: 1.5,
+      uiLanguage: 'zh-CN',
+      backgroundRefreshHours: 0,
+    });
+
+    // schemaVersion 2 rows (incl. an explicit opt-out) are left untouched on later inits
+    await db.put('settings', { key: 'app', value: { ...row!.value, deleteDownloadWhenPlayed: false } });
+    await store.init();
+    expect((await db.get('settings', 'app'))?.value.deleteDownloadWhenPlayed).toBe(false);
+    db.close();
+  });
 });

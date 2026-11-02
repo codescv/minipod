@@ -1,6 +1,11 @@
 import { IDBFactory } from 'fake-indexeddb';
 import { describe, expect, it, vi } from 'vitest';
-import { decodeBase64, encodeBase64, episodeKey as deriveEpisodeKey } from '@minipod/core';
+import {
+  decodeBase64,
+  encodeBase64,
+  episodeKey as deriveEpisodeKey,
+  type HostEvent,
+} from '@minipod/core';
 import { createCapacitorPlatformHost, extractActionSendInput } from './capacitor-host';
 import { createMemoryPreferences } from './storage/idb';
 import {
@@ -267,7 +272,11 @@ describe('CapacitorPlatformHost', () => {
     expect(ep1Prog?.state).toBe('PLAYED');
     expect(ep2Prog).toMatchObject({ state: 'IN_PROGRESS', positionMs: 47_000 });
     expect(remainingQueue.map((r) => r.episode.episodeKey)).toEqual([ep2Key]);
-    expect(harness.deletedLocalFiles.length).toBe(1);
+    // Thorough cleanup: stored file (+ `.part`) and the deterministic target `.part`, ep1 only.
+    expect(harness.deletedLocalFiles).toContain(
+      `/data/user/0/dev.minipod.app/files/downloads/${ep1Key}.mp3`,
+    );
+    expect(harness.deletedLocalFiles.every((p) => p.includes(ep1Key))).toBe(true);
     expect(harness.plugin.media.clearJournal).toHaveBeenCalled();
 
     // Now test hidden pause flush inside 15s native wake lock:
@@ -1010,5 +1019,201 @@ describe('CapacitorPlatformHost', () => {
     expect(plugin.openExternal).toHaveBeenCalledWith({ url: mailtoUrl });
 
     await host.dispose();
+  });
+  describe('played episodes auto-delete their downloads (b1d6d66b, v0.1.24 report)', () => {
+    async function setupDownloadedQueue(dbName: string, idbFactory = new IDBFactory()) {
+      const harness = createTestPluginHarness();
+      const preferences = createMemoryPreferences();
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory,
+        dbName,
+        preferences,
+      });
+      const feed = await bundle.host.feeds.subscribe('https://pod.example.com/rss.xml');
+      const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+      const ep2Key = deriveEpisodeKey(feed.feedKey, 'ep-2');
+      await bundle.host.queue.add(ep1Key);
+      await bundle.host.queue.add(ep2Key);
+      await bundle.host.episodes.download(ep1Key);
+      return { harness, preferences, idbFactory, bundle, feedKey: feed.feedKey, ep1Key, ep2Key };
+    }
+
+    function recordEvents(bundle: { host: { subscribe: (cb: (ev: HostEvent) => void) => unknown } }) {
+      const events: HostEvent[] = [];
+      bundle.host.subscribe((ev) => events.push(ev));
+      return events;
+    }
+
+    it('migrates a legacy pre-v0.1.14 `deleteDownloadWhenPlayed: false` (schemaVersion 1) and deletes the download when a queued episode completes', async () => {
+      const ctx = await setupDownloadedQueue('host-legacy-settings-migration-test');
+      const { harness, idbFactory, preferences, ep1Key, ep2Key, feedKey } = ctx;
+
+      // Simulate the IndexedDB row persisted by a pre-v0.1.14 install (toggle since removed).
+      const legacy = (await ctx.bundle.db.get('settings', 'app'))!;
+      await ctx.bundle.db.put('settings', {
+        key: 'app',
+        value: { ...legacy.value, schemaVersion: 1, deleteDownloadWhenPlayed: false } as never,
+      });
+      // Even before a restart, readSettings() ignores the stale legacy `false`.
+      expect((await ctx.bundle.host.settings.get()).deleteDownloadWhenPlayed).toBe(true);
+      await ctx.bundle.host.dispose();
+
+      // In-place upgrade: next launch migrates the persisted row.
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory,
+        dbName: 'host-legacy-settings-migration-test',
+        preferences,
+      });
+      const migrated = await bundle.db.get('settings', 'app');
+      expect(migrated?.value).toMatchObject({ schemaVersion: 2, deleteDownloadWhenPlayed: true });
+      expect(await bundle.host.settings.get()).toMatchObject({
+        schemaVersion: 2,
+        deleteDownloadWhenPlayed: true,
+      });
+
+      const events = recordEvents(bundle);
+      harness.deletedLocalFiles.length = 0;
+      await bundle.host.progress.save({ episodeKey: ep1Key, positionMs: 0, state: 'PLAYED' });
+
+      expect((await bundle.host.progress.get(ep1Key))?.state).toBe('PLAYED');
+      expect((await bundle.host.queue.list()).map((r) => r.episode.episodeKey)).toEqual([ep2Key]);
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('NONE');
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadPath).toBeUndefined();
+      expect(harness.deletedLocalFiles).toContain(
+        `/data/user/0/dev.minipod.app/files/downloads/${ep1Key}.mp3`,
+      );
+      expect(events).toContainEqual({ type: 'download-updated', episodeKey: ep1Key, state: 'NONE', progress: 0 });
+      expect(events).toContainEqual({ type: 'episodes-changed', feedKey });
+      expect(events).toContainEqual({ type: 'progress-changed', episodeKey: ep1Key });
+      expect(events).toContainEqual({ type: 'queue-changed' });
+      // Manage Downloads (`downloaded` filter) no longer lists it.
+      const downloaded = await bundle.host.episodes.list(feedKey, 'downloaded');
+      expect(downloaded.items.some((r) => r.episode.episodeKey === ep1Key)).toBe(false);
+
+      await bundle.host.dispose();
+    });
+
+    it('still honors an explicit `settings.update({ deleteDownloadWhenPlayed: false })` at schemaVersion 2 (also across restarts)', async () => {
+      const ctx = await setupDownloadedQueue('host-explicit-keep-downloads-test');
+      const { harness, idbFactory, preferences, ep1Key } = ctx;
+      const updated = await ctx.bundle.host.settings.update({ deleteDownloadWhenPlayed: false });
+      expect(updated).toMatchObject({ schemaVersion: 2, deleteDownloadWhenPlayed: false });
+      expect((await ctx.bundle.db.get('settings', 'app'))?.value).toMatchObject({
+        schemaVersion: 2,
+        deleteDownloadWhenPlayed: false,
+      });
+      await ctx.bundle.host.dispose();
+
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory,
+        dbName: 'host-explicit-keep-downloads-test',
+        preferences,
+      });
+      expect((await bundle.host.settings.get()).deleteDownloadWhenPlayed).toBe(false);
+      await bundle.host.progress.save({ episodeKey: ep1Key, positionMs: 0, state: 'PLAYED' });
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('DONE');
+      // Queue auto-removal is independent of the download setting.
+      expect((await bundle.host.queue.list()).some((r) => r.episode.episodeKey === ep1Key)).toBe(false);
+      await bundle.host.dispose();
+    });
+
+    it('deletes the download and removes from queue on a PLAYED save even when the episode was already PLAYED', async () => {
+      const { harness, bundle, ep1Key, ep2Key } = await setupDownloadedQueue('host-replayed-played-test');
+      // Played once (download deleted), then re-queued + re-downloaded.
+      await bundle.host.progress.markPlayed(ep1Key, true);
+      expect((await bundle.host.progress.get(ep1Key))?.state).toBe('PLAYED');
+      await bundle.host.queue.add(ep1Key);
+      await bundle.host.episodes.download(ep1Key);
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('DONE');
+      expect((await bundle.host.progress.get(ep1Key))?.state).toBe('PLAYED');
+
+      const events = recordEvents(bundle);
+      harness.deletedLocalFiles.length = 0;
+      await bundle.host.progress.save({ episodeKey: ep1Key, positionMs: 0, state: 'PLAYED' });
+
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('NONE');
+      expect((await bundle.host.queue.list()).map((r) => r.episode.episodeKey)).toEqual([ep2Key]);
+      expect(harness.deletedLocalFiles.length).toBeGreaterThan(0);
+      expect(events).toContainEqual({ type: 'download-updated', episodeKey: ep1Key, state: 'NONE', progress: 0 });
+      expect(events).toContainEqual({ type: 'progress-changed', episodeKey: ep1Key });
+      await bundle.host.dispose();
+    });
+
+    it('cancels and cleans up an in-flight (non-DONE) download when the episode completes', async () => {
+      const { harness, bundle, ep2Key } = await setupDownloadedQueue('host-inflight-played-test');
+      // ep-2 download stuck QUEUED/RUNNING (no downloadPath yet)
+      await bundle.syncStore.setEpisodeDownloadState(ep2Key, 'RUNNING');
+      harness.deletedLocalFiles.length = 0;
+      await bundle.host.progress.save({ episodeKey: ep2Key, positionMs: 0, state: 'PLAYED' });
+      expect(harness.plugin.cancelDownload).toHaveBeenCalledWith({ episodeKey: ep2Key });
+      expect(harness.deletedLocalFiles).toEqual(
+        expect.arrayContaining([`downloads/${ep2Key}.mp3`, `downloads/${ep2Key}.mp3.part`]),
+      );
+      expect((await bundle.host.episodes.get(ep2Key)).episode.downloadState).toBe('NONE');
+      await bundle.host.dispose();
+    });
+
+    it('falls back to the stored episode duration when a near-end save omits durationMs', async () => {
+      const { bundle, ep1Key } = await setupDownloadedQueue('host-duration-fallback-test');
+      const rec = (await bundle.db.get('episodes', ep1Key))!;
+      await bundle.db.put('episodes', { ...rec, durationMs: 600_000 });
+      await bundle.host.progress.save({ episodeKey: ep1Key, positionMs: 599_500, state: 'IN_PROGRESS' });
+      expect((await bundle.host.progress.get(ep1Key))?.state).toBe('PLAYED');
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('NONE');
+      await bundle.host.dispose();
+    });
+
+    it('reconciles the native completion journal on `media-ended` (no auto-advance): PLAYED, dequeued, download deleted, and a trailing paused media-state does not revert it', async () => {
+      const { harness, bundle, ep1Key, ep2Key, feedKey } = await setupDownloadedQueue('host-native-ended-test');
+      await bundle.engine.load({
+        episodeKey: ep1Key,
+        source: await bundle.host.playback.sourceFor(ep1Key),
+        startMs: 0,
+        speed: 1,
+        metadata: { title: 'Episode One', durationMs: 120_000 },
+        mediaType: 'AUDIO',
+      });
+      harness.emitNative('media-state', {
+        episodeKey: ep1Key,
+        playing: true,
+        buffering: false,
+        positionMs: 100_000,
+        durationMs: 120_000,
+        speed: 1,
+      });
+      await bundle.reconcileJournal();
+
+      const events = recordEvents(bundle);
+      const playerEvents: string[] = [];
+      bundle.engine.subscribe((ev) => playerEvents.push(ev.type));
+
+      // ExoPlayer STATE_ENDED: `appendCompletedJournal` then `media-ended`, then trailing state.
+      harness.setJournal({
+        completed: [{ episodeKey: ep1Key, durationMs: 120_000, endedWallMs: Date.now() + 1_000 }],
+      });
+      harness.emitNative('media-ended', { episodeKey: ep1Key });
+      harness.emitNative('media-state', {
+        episodeKey: ep1Key,
+        playing: false,
+        buffering: false,
+        positionMs: 101_000, // stream ended well before the RSS-declared duration
+        durationMs: 120_000,
+        speed: 1,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      await bundle.reconcileJournal();
+
+      expect(playerEvents.slice(0, 2)).toEqual(['state', 'ended']);
+      expect(bundle.engine.getSnapshot()).toMatchObject({ episodeKey: ep1Key, playing: false, positionMs: 0 });
+      expect((await bundle.host.progress.get(ep1Key))?.state).toBe('PLAYED');
+      expect((await bundle.host.queue.list()).map((r) => r.episode.episodeKey)).toEqual([ep2Key]);
+      expect((await bundle.host.episodes.get(ep1Key)).episode.downloadState).toBe('NONE');
+      expect(events).toContainEqual({ type: 'download-updated', episodeKey: ep1Key, state: 'NONE', progress: 0 });
+      expect(events).toContainEqual({ type: 'episodes-changed', feedKey });
+      await bundle.host.dispose();
+    });
   });
 });

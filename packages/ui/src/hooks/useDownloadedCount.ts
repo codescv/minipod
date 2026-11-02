@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
-import { getHostViewCache } from '../stores/view-cache';
+import { applyDownloadStateToViewCache, getHostViewCache } from '../stores/view-cache';
 
 export function useDownloadedCount(): number {
   const host = useHost();
@@ -57,6 +57,12 @@ export function useDownloadedCount(): number {
   }, [refresh]);
 
   useHostEvents((ev) => {
+    if (ev.type === 'download-updated') {
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+      if (ev.state !== 'DONE') {
+        setCount(getHostViewCache(host).downloadedCount);
+      }
+    }
     if (
       ev.type === 'download-updated' ||
       ev.type === 'episodes-changed' ||

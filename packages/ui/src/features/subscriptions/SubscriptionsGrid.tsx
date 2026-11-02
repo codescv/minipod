@@ -38,6 +38,7 @@ import { clearTextSelection } from '../../lib/text-selection';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar } from '../../stores/snackbar';
 import {
+  applyDownloadStateToViewCache,
   DEFAULT_TIMELINE_LIMIT,
   getHostViewCache,
   recomputeHostTimelineAndDownloads,
@@ -428,6 +429,9 @@ export function SubscriptionsGrid() {
   }, [loadFeedsAndTimeline]);
 
   useHostEvents((ev) => {
+    if (ev.type === 'download-updated') {
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+    }
     if (ev.type === 'queue-changed') {
       void host.queue
         .list()

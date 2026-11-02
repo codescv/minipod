@@ -125,6 +125,13 @@ export function PlayerProvider({
   feedImageUrlRef.current = feedImageUrl;
   /** Until this time, a paused `positionMs: 0` is intentional (user seek to 0 / fresh load). */
   const allowZeroUntilRef = useRef(0);
+  /**
+   * Episode that just finished (`ended` / `nativeAdvanced.from`). A later playing->paused `state`
+   * (e.g. the trailing native `media-state` after `media-ended`) for it must never be saved as
+   * IN_PROGRESS, which would undo PLAYED (and its queue removal / download deletion).
+   * Reset when a new episode is loaded or playback resumes.
+   */
+  const completedEpisodeKeyRef = useRef<string | null>(null);
 
   /**
    * True when a paused `positionMs: 0` for the current episode is a transient native idle/reset
@@ -182,7 +189,15 @@ export function PlayerProvider({
       // Save current episode progress before switching
       const prevEp = episodeRef.current;
       const prevSnap = snapshotRef.current;
-      if (prevEp && prevEp.episodeKey !== target.episodeKey && prevSnap.positionMs > 0) {
+      const prevCompleted =
+        prevEp !== null && completedEpisodeKeyRef.current === prevEp.episodeKey;
+      completedEpisodeKeyRef.current = null;
+      if (
+        prevEp &&
+        !prevCompleted &&
+        prevEp.episodeKey !== target.episodeKey &&
+        prevSnap.positionMs > 0
+      ) {
         saveProgressSafe({
           episodeKey: prevEp.episodeKey,
           positionMs: prevSnap.positionMs,
@@ -374,8 +389,20 @@ export function PlayerProvider({
         snapshotRef.current = nextSnap;
         setSnapshot(nextSnap);
 
-        // Save immediately on transition from playing -> paused
-        if (prev.playing && !ev.snapshot.playing && ev.snapshot.episodeKey) {
+        if (ev.snapshot.playing) {
+          completedEpisodeKeyRef.current = null;
+        }
+
+        // Save immediately on transition from playing -> paused. Never for a just-finished episode,
+        // and never for a `0` position (the engine's stopped-at-end snapshot published right before
+        // `ended`, or a transient native reset): an IN_PROGRESS@0 save would race/undo PLAYED.
+        if (
+          prev.playing &&
+          !ev.snapshot.playing &&
+          ev.snapshot.episodeKey &&
+          ev.snapshot.positionMs > 0 &&
+          completedEpisodeKeyRef.current !== ev.snapshot.episodeKey
+        ) {
           const dur = ev.snapshot.durationMs ?? episodeRef.current?.durationMs;
           const completed = isEpisodeNearEnd(ev.snapshot.positionMs, dur);
           const isHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
@@ -398,7 +425,10 @@ export function PlayerProvider({
           ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
         }));
         const now = Date.now();
-        if (now - lastSavedAtRef.current >= LOCAL_PROGRESS_INTERVAL_MS) {
+        if (
+          now - lastSavedAtRef.current >= LOCAL_PROGRESS_INTERVAL_MS &&
+          !(completedEpisodeKeyRef.current === ev.episodeKey && !engine.getSnapshot().playing)
+        ) {
           saveProgressSafe({
             episodeKey: ev.episodeKey,
             positionMs: ev.positionMs,
@@ -409,6 +439,7 @@ export function PlayerProvider({
       } else if (ev.type === 'sleepTimer') {
         setSleepTimerState(ev.state);
       } else if (ev.type === 'ended') {
+        completedEpisodeKeyRef.current = ev.episodeKey;
         const dur = snapshotRef.current.durationMs ?? episodeRef.current?.durationMs;
         const sleepWasEndOfEp = sleepTimerRef.current.timer.mode === 'endOfEpisode';
         const htmlConsumedSleep =
@@ -453,6 +484,16 @@ export function PlayerProvider({
           })
           .catch(() => undefined);
       } else if (ev.type === 'nativeAdvanced') {
+        if (ev.completed) {
+          completedEpisodeKeyRef.current = ev.from;
+          // Direct completion guarantee for the finished episode (PLAYED + queue removal + download
+          // deletion) even if the host's native-journal reconciliation races or is delayed.
+          // (A transition merely inferred from `media-state`, e.g. a notification "next" skip, is
+          // not a completion and must not mark the skipped episode played.)
+          void host.progress
+            .save({ episodeKey: ev.from, positionMs: 0, state: 'PLAYED' })
+            .catch(() => undefined);
+        }
         void (async () => {
           try {
             const [row, qList] = await Promise.all([
@@ -533,7 +574,11 @@ export function PlayerProvider({
     if (typeof window === 'undefined') return;
     const onPageHide = () => {
       const snap = engine.getSnapshot();
-      if (snap.episodeKey && snap.positionMs > 0) {
+      if (
+        snap.episodeKey &&
+        snap.positionMs > 0 &&
+        !(completedEpisodeKeyRef.current === snap.episodeKey && !snap.playing)
+      ) {
         saveProgressSafe({
           episodeKey: snap.episodeKey,
           positionMs: snap.positionMs,

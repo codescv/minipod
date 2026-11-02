@@ -8,6 +8,7 @@
  * with zero non-IDB awaits while the transaction is open.
  */
 import {
+  APP_SETTINGS_SCHEMA_VERSION,
   compareQueueOrder,
   episodeKey as deriveEpisodeKey,
   feedKey as deriveFeedKey,
@@ -220,6 +221,21 @@ export class IdbSyncStore implements SyncStore {
       await settingsStore.put({
         key: 'app',
         value: createDefaultAndroidAppSettings(stateRow.deviceName),
+      });
+    } else if (
+      (Number(existingSettings.value?.schemaVersion) || 1) < APP_SETTINGS_SCHEMA_VERSION
+    ) {
+      // Pre-v0.1.14 installs persisted `deleteDownloadWhenPlayed: false` and the toggle was removed
+      // in v0.1.14, leaving users stuck with downloads never being auto-deleted once played.
+      // Auto-deleting played downloads is an always-on product behavior: force-migrate to `true`.
+      await settingsStore.put({
+        ...existingSettings,
+        value: {
+          ...createDefaultAndroidAppSettings(stateRow.deviceName),
+          ...existingSettings.value,
+          schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
+          deleteDownloadWhenPlayed: true,
+        },
       });
     }
 

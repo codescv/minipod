@@ -105,6 +105,13 @@ export class NativeAudioEngine implements PlayerEngine {
     readonly expiresAt: number;
   } | null = null;
   private disposed = false;
+  /**
+   * Episode that just finished natively (`media-ended` without auto-advance). Trailing paused
+   * `media-state`s for it are pinned to `positionMs: 0` so they never look like a mid-track pause
+   * (which would overwrite PLAYED with IN_PROGRESS). Cleared on load/play/seek/stop or when the
+   * native player reports playing / a different episode.
+   */
+  private completedEpisodeKey: EpisodeKey | null = null;
 
   constructor(options: NativeAudioEngineOptions) {
     this.plugin = options.plugin;
@@ -278,7 +285,20 @@ export class NativeAudioEngine implements PlayerEngine {
   private handleNativeState(payload: NativeMediaStatePayload): void {
     if (this.disposed) return;
     this.onNativeActivity?.();
-    this.applySnapshotFromPayload(payload, true);
+    let effective = payload;
+    const completed = this.completedEpisodeKey;
+    if (completed !== null) {
+      if (
+        payload.playing ||
+        (payload.episodeKey !== undefined && payload.episodeKey !== completed)
+      ) {
+        this.completedEpisodeKey = null;
+      } else if (payload.positionMs !== 0) {
+        // Trailing paused state of the finished episode: keep it at 0 (no spurious pause/position).
+        effective = { ...payload, positionMs: 0 };
+      }
+    }
+    this.applySnapshotFromPayload(effective, true);
   }
 
   private handleNativeEnded(payload: NativeMediaEndedPayload): void {
@@ -293,14 +313,23 @@ export class NativeAudioEngine implements PlayerEngine {
         type: 'nativeAdvanced',
         from: payload.episodeKey,
         to: payload.autoAdvancedTo,
+        completed: true,
       });
     } else {
+      this.completedEpisodeKey = payload.episodeKey;
+      if (this.lastLoadedItem?.episodeKey === payload.episodeKey) {
+        this.lastLoadedItem = { ...this.lastLoadedItem, startMs: 0 };
+      }
       if (this.snapshot.episodeKey === payload.episodeKey) {
         this.snapshot = {
           ...this.snapshot,
           playing: false,
           buffering: false,
+          positionMs: 0,
         };
+        // Publish the stopped snapshot BEFORE `ended` so listeners (usePlayer) already see
+        // `playing: false` and never treat the trailing native `media-state` as a pause.
+        this.emit({ type: 'state', snapshot: this.snapshot });
       }
       this.emit({ type: 'ended', episodeKey: payload.episodeKey });
     }
@@ -337,6 +366,7 @@ export class NativeAudioEngine implements PlayerEngine {
     const speed = clampSpeed(item.speed);
     const startMs = Math.max(0, Math.trunc(item.startMs));
     this.pendingSeek = null;
+    this.completedEpisodeKey = null;
     this.requestedEpisodeKey = item.episodeKey;
     this.lastLoadedItem = { ...item, startMs, speed };
     this.snapshot = {
@@ -363,6 +393,7 @@ export class NativeAudioEngine implements PlayerEngine {
   }
 
   async play(): Promise<void> {
+    this.completedEpisodeKey = null;
     const item = this.lastLoadedItem;
     if (item !== null && !this.snapshot.episodeKey) {
       await this.reloadAndPlay(item);
@@ -455,6 +486,7 @@ export class NativeAudioEngine implements PlayerEngine {
 
   stop(): void {
     this.pendingSeek = null;
+    this.completedEpisodeKey = null;
     this.requestedEpisodeKey = undefined;
     this.lastLoadedItem = null;
     this.snapshot = {
@@ -474,6 +506,7 @@ export class NativeAudioEngine implements PlayerEngine {
         ? Math.min(Math.floor(ms), this.snapshot.durationMs)
         : Math.floor(ms),
     );
+    this.completedEpisodeKey = null;
     this.pendingSeek = {
       episodeKey: this.snapshot.episodeKey,
       targetMs: clamped,

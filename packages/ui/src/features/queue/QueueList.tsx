@@ -36,7 +36,7 @@ import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
-import { getHostViewCache } from '../../stores/view-cache';
+import { applyDownloadStateToViewCache, getHostViewCache } from '../../stores/view-cache';
 
 interface PendingQueueInlineUndo {
   readonly epKey: EpisodeKey;
@@ -143,6 +143,8 @@ export function QueueList() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
+      // Keep the unmounted screens' SWR slices (Manage Downloads, timeline, per-feed rows) in sync.
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
       setDownloadProgressByKey((prev) => {
         if (ev.state === 'RUNNING' || ev.state === 'QUEUED') {
           const next = new Map(prev);

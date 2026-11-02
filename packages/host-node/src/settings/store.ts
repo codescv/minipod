@@ -7,6 +7,7 @@
  *   never in SQLite or `minipod-sync-v1.json`.
  */
 import {
+  APP_SETTINGS_SCHEMA_VERSION,
   COUNTRY_CODE_UNSET,
   type AppSettings,
   type CountryCode,
@@ -41,7 +42,7 @@ export interface SecretsFile {
 
 export function defaultAppSettings(deviceName: string, defaultCountry: CountryCode = COUNTRY_CODE_UNSET): AppSettings {
   return {
-    schemaVersion: 1,
+    schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
     deleteDownloadWhenPlayed: true,
     backgroundRefreshHours: 0,
     sync: {
@@ -81,10 +82,15 @@ function sanitizeSettings(raw: Partial<AppSettings> | undefined, fallbackDeviceN
         : fallbackDeviceName,
   };
 
+  // Legacy (`schemaVersion < 2`) rows may carry a stale `deleteDownloadWhenPlayed: false` from before
+  // the toggle was removed (v0.1.14): auto-deleting played downloads is now always-on, so force `true`.
+  const legacySchema = (Number(raw.schemaVersion) || 1) < APP_SETTINGS_SCHEMA_VERSION;
   return {
-    schemaVersion: 1,
+    schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
     deleteDownloadWhenPlayed:
-      raw.deleteDownloadWhenPlayed === undefined ? true : Boolean(raw.deleteDownloadWhenPlayed),
+      legacySchema || raw.deleteDownloadWhenPlayed === undefined
+        ? true
+        : Boolean(raw.deleteDownloadWhenPlayed),
     backgroundRefreshHours: refreshHours,
     sync,
     playbackSpeed: speed,
@@ -141,6 +147,8 @@ export class SettingsStore {
       {
         ...current,
         ...patch,
+        // Every write is at the current schema: an explicit `deleteDownloadWhenPlayed` patch is honored.
+        schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
         sync: mergedSync,
       },
       this.fallbackDeviceName,

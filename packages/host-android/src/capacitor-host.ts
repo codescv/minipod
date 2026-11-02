@@ -5,6 +5,7 @@
  */
 import type { PluginListenerHandle } from '@capacitor/core';
 import {
+  APP_SETTINGS_SCHEMA_VERSION,
   BasicAuth,
   buildQueueStub,
   buildUserAgent,
@@ -217,6 +218,15 @@ export async function createCapacitorPlatformHost(
     if (!rec?.value) {
       return createDefaultAndroidAppSettings(bootSyncState.deviceName);
     }
+    // Legacy (`schemaVersion < 2`, pre-v0.1.14) rows may carry a stale `deleteDownloadWhenPlayed: false`
+    // that the user can no longer toggle off (the switch was removed): always-on auto-delete wins.
+    if ((Number(rec.value.schemaVersion) || 1) < APP_SETTINGS_SCHEMA_VERSION) {
+      return {
+        ...rec.value,
+        schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
+        deleteDownloadWhenPlayed: true,
+      };
+    }
     return {
       ...rec.value,
       deleteDownloadWhenPlayed:
@@ -231,6 +241,8 @@ export async function createCapacitorPlatformHost(
     const merged: AppSettings = {
       ...cur,
       ...patch,
+      // Every write is at the current schema so an explicit `deleteDownloadWhenPlayed` is honored.
+      schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
       sync: patch.sync ? { ...cur.sync, ...patch.sync } : cur.sync,
     };
     await db.put('settings', { key: 'app', value: merged });
@@ -242,6 +254,53 @@ export async function createCapacitorPlatformHost(
 
   // Serialized journal reconciliation mutex (`ARCHITECTURE.md §3.3`)
   let journalChain: Promise<void> = Promise.resolve();
+
+  // Episodes whose in-flight download was stopped (`deleteDownload` / played auto-delete while
+  // RUNNING/QUEUED). Declared before the first `reconcileJournal()` (boot) can reach it.
+  const cancelledDownloads = new Set<EpisodeKey>();
+
+  /**
+   * Thoroughly removes an episode's download: cancels any in-flight/queued transfer, deletes the
+   * stored file (+ `.part`) and the deterministic `downloads/<episodeKey>.<ext>` target (+ `.part`),
+   * resets the IDB record to `NONE`, and emits `download-updated` + `episodes-changed`.
+   * Shared by `episodes.deleteDownload` and played auto-delete (`handleEpisodeCompletedSideEffects`).
+   */
+  const purgeEpisodeDownload = async (ep: {
+    readonly episodeKey: EpisodeKey;
+    readonly feedKey: FeedKey;
+    readonly downloadState: string;
+    readonly downloadPath?: string | null | undefined;
+    readonly enclosureUrl?: string | null | undefined;
+    readonly enclosureMime?: string | null | undefined;
+  }): Promise<void> => {
+    const episodeKey = ep.episodeKey;
+    // Mark first so a racing `httpToFile` resolution/rejection settles to `NONE` (never `FAILED`).
+    cancelledDownloads.add(episodeKey);
+    await Promise.resolve()
+      .then(() => plugin.cancelDownload({ episodeKey }))
+      .catch(() => undefined);
+    if (ep.downloadPath) {
+      await plugin.deleteLocalFile({ path: ep.downloadPath }).catch(() => undefined);
+      await plugin.deleteLocalFile({ path: `${ep.downloadPath}.part` }).catch(() => undefined);
+    }
+    if (
+      ep.enclosureUrl &&
+      !ep.feedKey.startsWith('l_') &&
+      !ep.enclosureUrl.startsWith('content://')
+    ) {
+      // In-flight downloads have no `downloadPath` yet: remove the deterministic target + `.part`.
+      const { cleanUrl } = extractUrlCredentials(ep.enclosureUrl);
+      const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime ?? undefined);
+      const deterministic = `downloads/${episodeKey}.${ext}`;
+      if (deterministic !== ep.downloadPath) {
+        await plugin.deleteLocalFile({ path: deterministic }).catch(() => undefined);
+      }
+      await plugin.deleteLocalFile({ path: `${deterministic}.part` }).catch(() => undefined);
+    }
+    await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
+    emit({ type: 'download-updated', episodeKey, state: 'NONE', progress: 0 });
+    emit({ type: 'episodes-changed', feedKey: ep.feedKey });
+  };
 
   const handleEpisodeCompletedSideEffects = async (
     episodeKey: EpisodeKey,
@@ -265,12 +324,9 @@ export async function createCapacitorPlatformHost(
     const curSettings = await readSettings();
     if (curSettings.deleteDownloadWhenPlayed && !feedKey.startsWith('l_')) {
       const epRec = await syncStore.getEpisodeRecord(episodeKey);
-      if (epRec && epRec.downloadState === 'DONE') {
-        if (epRec.downloadPath) {
-          await plugin.deleteLocalFile({ path: epRec.downloadPath }).catch(() => undefined);
-        }
-        await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
-        emit({ type: 'download-updated', episodeKey, state: 'NONE' });
+      // Any download artifact counts (DONE, QUEUED/RUNNING in-flight, FAILED leftovers, stale path).
+      if (epRec && (epRec.downloadState !== 'NONE' || Boolean(epRec.downloadPath))) {
+        await purgeEpisodeDownload(epRec);
       }
     }
   };
@@ -571,6 +627,9 @@ export async function createCapacitorPlatformHost(
         positionMs: 0,
         episodeKey: ev.episodeKey,
       });
+      // `PlaybackService` appended a native completion on STATE_ENDED: reconcile it now (marks
+      // PLAYED, removes from queue, deletes the download) instead of waiting for the next launch.
+      void reconcileJournal().then(() => pushNativeQueueFn?.());
     }
   });
 
@@ -965,8 +1024,6 @@ export async function createCapacitorPlatformHost(
 
   // Download progress listener (coalesced <= 2/s per episode)
   const lastDownloadEmitAt = new Map<EpisodeKey, number>();
-  // Episodes whose in-flight download was stopped by the user (`deleteDownload` while RUNNING/QUEUED)
-  const cancelledDownloads = new Set<EpisodeKey>();
   const dlListenerHandle: PluginListenerHandle = await plugin.addListener(
     'download-progress',
     (ev) => {
@@ -1464,27 +1521,7 @@ export async function createCapacitorPlatformHost(
       async deleteDownload(episodeKey: EpisodeKey): Promise<void> {
         const ep = await syncStore.getEpisodeRecord(episodeKey);
         if (!ep) return;
-        // Mark first so a racing `httpToFile` resolution/rejection settles to `NONE` (never `FAILED`).
-        cancelledDownloads.add(episodeKey);
-        await plugin.cancelDownload({ episodeKey }).catch(() => undefined);
-        if (ep.downloadPath) {
-          await plugin.deleteLocalFile({ path: ep.downloadPath }).catch(() => undefined);
-        }
-        if (
-          ep.enclosureUrl &&
-          !ep.feedKey.startsWith('l_') &&
-          !ep.enclosureUrl.startsWith('content://')
-        ) {
-          // In-flight downloads have no `downloadPath` yet: remove the deterministic target + `.part`.
-          const { cleanUrl } = extractUrlCredentials(ep.enclosureUrl);
-          const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
-          const deterministic = `downloads/${episodeKey}.${ext}`;
-          await plugin.deleteLocalFile({ path: deterministic }).catch(() => undefined);
-          await plugin.deleteLocalFile({ path: `${deterministic}.part` }).catch(() => undefined);
-        }
-        await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
-        emit({ type: 'download-updated', episodeKey, state: 'NONE' });
-        emit({ type: 'episodes-changed', feedKey: ep.feedKey });
+        await purgeEpisodeDownload(ep);
         await syncNativeQueue();
       },
 
@@ -1695,22 +1732,35 @@ export async function createCapacitorPlatformHost(
           );
         }
 
-        const stamped = stampProgressSave(save, {
-          feedKey,
-          hlc,
-          deviceId: st.deviceId,
-          previous: prevProg,
-          ended: save.state === 'PLAYED',
-        });
+        // Fall back to the feed-declared / previously recorded duration (parity with host-node) so
+        // near-end saves without `durationMs` still complete the episode.
+        const effectiveDurationMs = save.durationMs ?? epRec?.durationMs ?? prevProg?.durationMs;
+        const stamped = stampProgressSave(
+          {
+            ...save,
+            ...(effectiveDurationMs !== undefined ? { durationMs: effectiveDurationMs } : {}),
+          },
+          {
+            feedKey,
+            hlc,
+            deviceId: st.deviceId,
+            previous: prevProg,
+            ended: save.state === 'PLAYED',
+          },
+        );
 
         await syncStore.upsertProgress(stamped, {
           syncDirty: true,
           identity: epRec?.identity,
         });
 
-        if (stamped.state === 'PLAYED' && prevProg?.state !== 'PLAYED') {
+        // Run completion side effects on EVERY PLAYED save (parity with host-node): an episode that
+        // was already PLAYED (journal reconcile won the race, or it was re-queued/re-downloaded)
+        // must still leave the queue and have its download deleted.
+        if (stamped.state === 'PLAYED') {
           await handleEpisodeCompletedSideEffects(save.episodeKey, feedKey, true);
           await syncNativeQueue();
+          emit({ type: 'progress-changed', episodeKey: save.episodeKey });
         }
 
         if (!feedKey.startsWith('l_')) {

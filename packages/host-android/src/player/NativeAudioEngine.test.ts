@@ -208,4 +208,76 @@ describe('NativeAudioEngine', () => {
 
     engine.dispose();
   });
+  it('publishes a stopped state (pos 0) BEFORE `ended` and pins trailing paused media-state of the finished episode to 0 (b1d6d66b)', async () => {
+    const { plugin, emitNative } = createMockMediaHarness();
+    const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+    await new Promise((r) => setTimeout(r, 0));
+    const events: PlayerEvent[] = [];
+    engine.subscribe((ev) => events.push(ev));
+
+    await engine.load({
+      episodeKey: 'e_done',
+      source: { kind: 'url', url: 'https://example.com/done.mp3' },
+      startMs: 0,
+      speed: 1.0,
+      metadata: { title: 'Done', durationMs: 1_800_000 },
+      mediaType: 'AUDIO',
+    });
+    await engine.play();
+    emitNative('media-state', {
+      episodeKey: 'e_done',
+      playing: true,
+      buffering: false,
+      positionMs: 1_700_000,
+      durationMs: 1_800_000,
+      speed: 1.0,
+    });
+    events.length = 0;
+
+    emitNative('media-ended', { episodeKey: 'e_done' });
+    expect(events.map((e) => e.type)).toEqual(['state', 'ended']);
+    expect(events[0]).toMatchObject({
+      type: 'state',
+      snapshot: { episodeKey: 'e_done', playing: false, buffering: false, positionMs: 0 },
+    });
+
+    // Trailing `emitCurrentState()` from PlaybackService (old builds report the end position,
+    // ~100 s before the RSS-declared duration): no pause-looking state/position events.
+    events.length = 0;
+    emitNative('media-state', {
+      episodeKey: 'e_done',
+      playing: false,
+      buffering: false,
+      positionMs: 1_700_500,
+      durationMs: 1_800_000,
+      speed: 1.0,
+    });
+    expect(events).toEqual([]);
+    expect(engine.getSnapshot()).toMatchObject({ episodeKey: 'e_done', playing: false, positionMs: 0 });
+
+    // A deliberate seek on the finished episode is honored again.
+    engine.seekTo(60_000);
+    emitNative('media-state', {
+      episodeKey: 'e_done',
+      playing: false,
+      buffering: false,
+      positionMs: 60_000,
+      durationMs: 1_800_000,
+      speed: 1.0,
+    });
+    expect(engine.getSnapshot().positionMs).toBe(60_000);
+
+    engine.dispose();
+  });
+
+  it('flags media-ended auto-advance as a completed nativeAdvanced', async () => {
+    const { plugin, emitNative } = createMockMediaHarness();
+    const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+    await new Promise((r) => setTimeout(r, 0));
+    const events: PlayerEvent[] = [];
+    engine.subscribe((ev) => events.push(ev));
+    emitNative('media-ended', { episodeKey: 'e_a', autoAdvancedTo: 'e_b' });
+    expect(events).toContainEqual({ type: 'nativeAdvanced', from: 'e_a', to: 'e_b', completed: true });
+    engine.dispose();
+  });
 });
