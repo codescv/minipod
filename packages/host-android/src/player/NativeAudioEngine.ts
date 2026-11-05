@@ -165,8 +165,11 @@ export class NativeAudioEngine implements PlayerEngine {
 
   private applySnapshotFromPayload(payload: NativeMediaStatePayload, emitEvents: boolean): void {
     const prev = this.snapshot;
-    const rawPosMs = Math.max(0, Math.trunc(payload.positionMs));
+    const rawPosMs = Math.max(0, Math.trunc(Number.isFinite(payload.positionMs) ? payload.positionMs : 0));
+    const seeked = payload.seeked === true && payload.episodeKey !== undefined;
     let resolvedPosMs = rawPosMs;
+    // Note: a native `seeked` echo of an *older* in-app seek (rapid ±skip taps) must not override
+    // the newer pending target either, so `seeked` payloads go through the same guard.
     if (this.pendingSeek !== null) {
       if (
         Date.now() >= this.pendingSeek.expiresAt ||
@@ -219,7 +222,7 @@ export class NativeAudioEngine implements PlayerEngine {
     }
 
     this.snapshot = next;
-    this.rememberPosition(next);
+    this.rememberPosition(next, seeked);
 
     if (!emitEvents) return;
 
@@ -232,6 +235,7 @@ export class NativeAudioEngine implements PlayerEngine {
     }
 
     const stateChanged =
+      seeked ||
       prev.episodeKey !== next.episodeKey ||
       prev.playing !== next.playing ||
       prev.buffering !== next.buffering ||
@@ -240,7 +244,7 @@ export class NativeAudioEngine implements PlayerEngine {
       (!next.playing && prev.positionMs !== next.positionMs);
 
     if (stateChanged) {
-      this.emit({ type: 'state', snapshot: next });
+      this.emit(seeked ? { type: 'state', snapshot: next, seeked: true } : { type: 'state', snapshot: next });
     }
 
     if (next.episodeKey && (next.playing || prev.positionMs !== next.positionMs)) {
@@ -258,11 +262,15 @@ export class NativeAudioEngine implements PlayerEngine {
     }
   }
 
-  /** Keeps `lastLoadedItem.startMs` at the latest known position of that episode. */
-  private rememberPosition(snap: PlayerSnapshot): void {
+  /**
+   * Keeps `lastLoadedItem.startMs` at the latest known position of that episode. A `0` is only
+   * adopted for an explicit seek (e.g. lock-screen Rewind -10 s from 0:06), never for a transient
+   * idle/reset state.
+   */
+  private rememberPosition(snap: PlayerSnapshot, seeked = false): void {
     const item = this.lastLoadedItem;
     if (item === null || snap.episodeKey !== item.episodeKey) return;
-    if (snap.positionMs > 0 && snap.positionMs !== item.startMs) {
+    if ((snap.positionMs > 0 || seeked) && snap.positionMs !== item.startMs) {
       this.lastLoadedItem = { ...item, startMs: snap.positionMs };
     }
   }
@@ -290,7 +298,9 @@ export class NativeAudioEngine implements PlayerEngine {
     if (completed !== null) {
       if (
         payload.playing ||
-        (payload.episodeKey !== undefined && payload.episodeKey !== completed)
+        (payload.episodeKey !== undefined && payload.episodeKey !== completed) ||
+        // Explicit seek on the finished episode (e.g. lock-screen Rewind -10 s re-opens its tail).
+        (payload.seeked === true && payload.episodeKey === completed)
       ) {
         this.completedEpisodeKey = null;
       } else if (payload.positionMs !== 0) {

@@ -376,6 +376,12 @@ export function PlayerProvider({
         const prev = snapshotRef.current;
         let nextSnap = ev.snapshot;
         const curEp = episodeRef.current;
+        if (ev.seeked) {
+          // Explicit seek (lock-screen Rewind -10 s / Fast-forward +30 s, OS media-session seek,
+          // Bluetooth keys): a paused `positionMs: 0` is a legitimate rewind to 0:00, not a
+          // transient native idle/reset. Also covers the `position` event that follows.
+          allowZeroUntilRef.current = Date.now() + 2000;
+        }
         if (curEp && isTransientZero(nextSnap)) {
           // Never clobber the paused position with a transient native idle `0` state.
           const durationMs = nextSnap.durationMs ?? prev.durationMs ?? curEp.durationMs;
@@ -391,6 +397,24 @@ export function PlayerProvider({
 
         if (ev.snapshot.playing) {
           completedEpisodeKeyRef.current = null;
+        }
+
+        // Persist a seek made outside the in-app controls (lock screen / notification / OS media
+        // session / Bluetooth) right away so IndexedDB matches the native checkpoint, incl. a paused
+        // rewind to 0:00. Never for a just-finished episode (would undo PLAYED) and never near the
+        // end (the native `ended` flow marks it PLAYED).
+        if (ev.seeked && nextSnap.episodeKey && completedEpisodeKeyRef.current !== nextSnap.episodeKey) {
+          const dur = nextSnap.durationMs ?? episodeRef.current?.durationMs;
+          if (!isEpisodeNearEnd(nextSnap.positionMs, dur)) {
+            const isHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+            saveProgressSafe({
+              episodeKey: nextSnap.episodeKey,
+              positionMs: nextSnap.positionMs,
+              durationMs: dur,
+              state: 'IN_PROGRESS',
+              flush: isHidden,
+            });
+          }
         }
 
         // Save immediately on transition from playing -> paused. Never for a just-finished episode,

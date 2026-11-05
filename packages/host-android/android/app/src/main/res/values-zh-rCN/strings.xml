@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Podcasts</string>
+    <string name="title_activity_main">Podcasts</string>
+    <!-- 锁屏 / 通知栏 / 系统媒体控件 (PlaybackService) -->
+    <string name="lock_screen_rewind_10">快退 10 秒</string>
+    <string name="lock_screen_fast_forward_30">快进 30 秒</string>
+    <string name="playback_channel_name">播客播放</string>
+</resources>

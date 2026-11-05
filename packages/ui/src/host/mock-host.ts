@@ -1562,7 +1562,7 @@ export class MockPlayerEngine implements PlayerEngine {
     const clamped = Math.max(0, Math.min(upper, Math.floor(ms)));
     this.snapshot = { ...this.snapshot, positionMs: clamped };
     this.sleepController.onPosition(clamped);
-    this.emit({ type: 'state', snapshot: this.snapshot });
+    this.emit({ type: 'state', snapshot: this.snapshot, seeked: true });
   }
 
   skip(deltaMs: number): void {
@@ -1624,10 +1624,16 @@ export class MockPlayerEngine implements PlayerEngine {
   /**
    * Test helper: replace the raw engine snapshot and emit a `state` event, e.g. to simulate a
    * native `PlaybackService` that was stopped/reset while paused in the background (idle, 0 ms).
+   * Pass `{ seeked: true }` to simulate a seek made outside the app (lock screen / notification
+   * Rewind -10 s / Fast-forward +30 s, OS media session, Bluetooth keys).
    */
-  emitRawState(snapshot: PlayerSnapshot): void {
+  emitRawState(snapshot: PlayerSnapshot, options?: { readonly seeked?: boolean }): void {
     this.snapshot = snapshot;
-    this.emit({ type: 'state', snapshot: this.snapshot });
+    this.emit(
+      options?.seeked
+        ? { type: 'state', snapshot: this.snapshot, seeked: true }
+        : { type: 'state', snapshot: this.snapshot },
+    );
   }
 
   /** Test helper: emit an arbitrary raw `PlayerEvent` without touching the snapshot. */

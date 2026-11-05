@@ -280,4 +280,117 @@ describe('NativeAudioEngine', () => {
     expect(events).toContainEqual({ type: 'nativeAdvanced', from: 'e_a', to: 'e_b', completed: true });
     engine.dispose();
   });
+
+  describe('lock-screen Rewind -10 s / Fast-forward +30 s (media-state `seeked`)', () => {
+    async function pausedAt6s() {
+      const harness = createMockMediaHarness();
+      const engine = new NativeAudioEngine({ plugin: harness.plugin, isVisible: () => true });
+      await new Promise((r) => setTimeout(r, 0));
+      await engine.load({
+        episodeKey: 'e_lock',
+        source: { kind: 'file', path: '/downloads/e_lock.mp3' },
+        startMs: 6_000,
+        speed: 1.0,
+        metadata: { title: 'Lock', durationMs: 600_000 },
+        mediaType: 'AUDIO',
+      });
+      const events: PlayerEvent[] = [];
+      engine.subscribe((ev) => events.push(ev));
+      return { ...harness, engine, events };
+    }
+
+    it('emits a `seeked` state for a paused lock-screen rewind to 0:00 and adopts 0 as resume point', async () => {
+      const { engine, events, emitNative, media } = await pausedAt6s();
+
+      emitNative('media-state', {
+        episodeKey: 'e_lock',
+        playing: false,
+        buffering: false,
+        positionMs: 0,
+        durationMs: 600_000,
+        speed: 1.0,
+        seeked: true,
+      });
+
+      expect(events[0]).toEqual({
+        type: 'state',
+        seeked: true,
+        snapshot: expect.objectContaining({ episodeKey: 'e_lock', playing: false, positionMs: 0 }),
+      });
+      expect(events).toContainEqual(expect.objectContaining({ type: 'position', episodeKey: 'e_lock', positionMs: 0 }));
+      expect(engine.getSnapshot().positionMs).toBe(0);
+
+      // Android later stops the paused service; Play reloads from the rewound 0:00, not 0:06.
+      emitNative('media-state', { playing: false, buffering: false, positionMs: 0, speed: 1.0 });
+      vi.mocked(media.load).mockClear();
+      vi.mocked(media.play).mockResolvedValueOnce(undefined);
+      vi.mocked(media.getState).mockResolvedValueOnce({ playing: false, buffering: false, positionMs: 0, speed: 1 });
+      await engine.play();
+      expect(media.load).toHaveBeenCalledWith(expect.objectContaining({ episodeKey: 'e_lock', startMs: 0 }));
+      engine.dispose();
+    });
+
+    it('keeps the transient idle-0 protection for payloads without `seeked`', async () => {
+      const { engine, events, emitNative } = await pausedAt6s();
+
+      emitNative('media-state', { playing: false, buffering: false, positionMs: 0, speed: 1.0 });
+
+      expect(engine.getSnapshot()).toMatchObject({ episodeKey: 'e_lock', positionMs: 6_000 });
+      expect(events.some((e) => e.type === 'state' && e.seeked === true)).toBe(false);
+      engine.dispose();
+    });
+
+    it('emits a `seeked` state for a lock-screen +30 s while playing (position-only change)', async () => {
+      const { engine, events, emitNative } = await pausedAt6s();
+      await engine.play();
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: true, buffering: false, positionMs: 7_000, durationMs: 600_000, speed: 1.0,
+      });
+      events.length = 0;
+
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: true, buffering: false, positionMs: 37_000, durationMs: 600_000, speed: 1.0, seeked: true,
+      });
+
+      expect(events.map((e) => e.type)).toEqual(['state', 'position']);
+      expect(events[0]).toMatchObject({ type: 'state', seeked: true, snapshot: { positionMs: 37_000, playing: true } });
+      // A regular tick with the same values does not re-emit `state`.
+      events.length = 0;
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: true, buffering: false, positionMs: 38_000, durationMs: 600_000, speed: 1.0,
+      });
+      expect(events.map((e) => e.type)).toEqual(['position']);
+      expect(engine.getSnapshot().positionMs).toBe(38_000);
+      engine.dispose();
+    });
+
+    it('a stale native `seeked` echo of an older in-app skip does not override the newer pending target', async () => {
+      const { engine, emitNative } = await pausedAt6s();
+      engine.skip(30_000); // 0:36
+      engine.skip(30_000); // 1:06 (pending)
+
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: false, buffering: false, positionMs: 36_000, durationMs: 600_000, speed: 1.0, seeked: true,
+      });
+      expect(engine.getSnapshot().positionMs).toBe(66_000);
+
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: false, buffering: false, positionMs: 66_000, durationMs: 600_000, speed: 1.0, seeked: true,
+      });
+      expect(engine.getSnapshot().positionMs).toBe(66_000);
+      engine.dispose();
+    });
+
+    it('an explicit lock-screen rewind re-opens a finished episode instead of pinning it to 0', async () => {
+      const { engine, emitNative } = await pausedAt6s();
+      emitNative('media-ended', { episodeKey: 'e_lock' });
+      expect(engine.getSnapshot().positionMs).toBe(0);
+
+      emitNative('media-state', {
+        episodeKey: 'e_lock', playing: false, buffering: false, positionMs: 590_000, durationMs: 600_000, speed: 1.0, seeked: true,
+      });
+      expect(engine.getSnapshot().positionMs).toBe(590_000);
+      engine.dispose();
+    });
+  });
 });

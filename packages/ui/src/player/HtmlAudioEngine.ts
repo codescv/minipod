@@ -203,7 +203,8 @@ export class HtmlAudioEngine implements PlayerEngine {
 
   seekTo(ms: number): void {
     const dur = this.resolveDurationMs();
-    const clamped = dur !== undefined ? Math.min(dur, Math.max(0, ms)) : Math.max(0, ms);
+    const target = Number.isFinite(ms) ? ms : this.positionMs;
+    const clamped = dur !== undefined ? Math.min(dur, Math.max(0, target)) : Math.max(0, target);
     this.positionMs = Math.floor(clamped);
     if (this.activeEl) {
       try {
@@ -213,7 +214,9 @@ export class HtmlAudioEngine implements PlayerEngine {
       }
     }
     this.updateMediaSessionPosition();
-    this.emitState();
+    // `seeked: true` lets `usePlayer` accept a paused seek to 0:00 (e.g. OS lock-screen
+    // `seekbackward` from 0:06) instead of treating it as a transient reset.
+    this.emit({ type: 'state', snapshot: this.getSnapshot(), seeked: true });
     if (this.episodeKey) {
       this.emit({
         type: 'position',
@@ -502,16 +505,15 @@ export class HtmlAudioEngine implements PlayerEngine {
       this.pause();
     });
     safeHandler('seekbackward', (details) => {
-      const offsetMs = details.seekOffset ? details.seekOffset * 1000 : SKIP_BACK_MS;
-      this.skip(-offsetMs);
+      this.skip(-normalizeSeekOffsetMs(details.seekOffset, SKIP_BACK_MS));
     });
     safeHandler('seekforward', (details) => {
-      const offsetMs = details.seekOffset ? details.seekOffset * 1000 : SKIP_FORWARD_MS;
-      this.skip(offsetMs);
+      this.skip(normalizeSeekOffsetMs(details.seekOffset, SKIP_FORWARD_MS));
     });
     safeHandler('seekto', (details) => {
-      if (details.seekTime !== undefined) {
-        this.seekTo(details.seekTime * 1000);
+      const t = details.seekTime;
+      if (typeof t === 'number' && Number.isFinite(t) && t >= 0) {
+        this.seekTo(t * 1000);
       }
     });
     safeHandler('nexttrack', () => {
@@ -589,4 +591,20 @@ export class HtmlAudioEngine implements PlayerEngine {
 
 export function createHtmlAudioEngine(options?: HtmlAudioEngineOptions): HtmlAudioEngine {
   return new HtmlAudioEngine(options);
+}
+
+/** Upper bound for an OS-provided `seekOffset` (seconds-based) so a bogus value can't jump hours. */
+const MAX_SEEK_OFFSET_MS = 10 * 60_000;
+
+/**
+ * `navigator.mediaSession` `seekbackward` / `seekforward` offset in ms: the browser/OS-provided
+ * `details.seekOffset` (seconds) when it is a finite positive number (capped at 10 min),
+ * otherwise MiniPod's default (`SKIP_BACK_MS` 10 s / `SKIP_FORWARD_MS` 30 s). Never negative, so a
+ * malformed offset can't flip the seek direction.
+ */
+export function normalizeSeekOffsetMs(seekOffsetSec: number | undefined | null, fallbackMs: number): number {
+  if (typeof seekOffsetSec === 'number' && Number.isFinite(seekOffsetSec) && seekOffsetSec > 0) {
+    return Math.min(MAX_SEEK_OFFSET_MS, Math.round(seekOffsetSec * 1000));
+  }
+  return fallbackMs;
 }

@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Podcasts</string>
+    <string name="title_activity_main">Podcasts</string>
+    <!-- ロック画面 / 通知 / システムのメディアコントロール (PlaybackService) -->
+    <string name="lock_screen_rewind_10">10秒戻す</string>
+    <string name="lock_screen_fast_forward_30">30秒送る</string>
+    <string name="playback_channel_name">ポッドキャストの再生</string>
+</resources>

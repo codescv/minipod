@@ -2,6 +2,10 @@
 <resources>
     <string name="app_name">Podcasts</string>
     <string name="title_activity_main">Podcasts</string>
-    <string name="package_name">dev.minipod.app</string>
-    <string name="custom_url_scheme">dev.minipod.app</string>
+    <string name="package_name" translatable="false">dev.minipod.app</string>
+    <string name="custom_url_scheme" translatable="false">dev.minipod.app</string>
+    <!-- Lock screen / notification / System UI media controls (PlaybackService) -->
+    <string name="lock_screen_rewind_10">Rewind 10 seconds</string>
+    <string name="lock_screen_fast_forward_30">Fast-forward 30 seconds</string>
+    <string name="playback_channel_name">Podcasts Playback</string>
 </resources>

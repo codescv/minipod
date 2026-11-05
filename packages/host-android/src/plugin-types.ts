@@ -118,6 +118,12 @@ export interface NativeMediaStatePayload {
   readonly positionMs: number;
   readonly durationMs?: number;
   readonly speed: number;
+  /**
+   * Set by `PlaybackService.onPositionDiscontinuity` (DISCONTINUITY_REASON_SEEK /
+   * SEEK_ADJUSTMENT): the position changed because of a seek, e.g. the lock-screen Rewind -10 s /
+   * Fast-forward +30 s buttons, the System UI seekbar or Bluetooth keys.
+   */
+  readonly seeked?: boolean;
 }
 
 export interface NativeMediaEndedPayload {

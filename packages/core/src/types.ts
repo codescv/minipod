@@ -431,7 +431,17 @@ export interface PlayerSnapshot {
 }
 
 export type PlayerEvent =
-  | { readonly type: 'state'; readonly snapshot: PlayerSnapshot }
+  | {
+      readonly type: 'state';
+      readonly snapshot: PlayerSnapshot;
+      /**
+       * `true` when this state results from an explicit seek (in-app, lock screen / notification
+       * ±skip, OS media-session `seekbackward` / `seekforward` / `seekto`, Bluetooth keys). A
+       * paused `positionMs: 0` carrying it is a legitimate rewind-to-0:00, never a transient
+       * native idle/reset.
+       */
+      readonly seeked?: boolean;
+    }
   /** ≈ every 1 s while playing. */
   | { readonly type: 'position'; readonly episodeKey: EpisodeKey; readonly positionMs: number; readonly durationMs?: number }
   | { readonly type: 'ended'; readonly episodeKey: EpisodeKey }

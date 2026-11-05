@@ -13,14 +13,17 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.view.KeyEvent;
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
 import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.IntentCompat;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
@@ -37,12 +40,17 @@ import androidx.media3.datasource.ResolvingDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.extractor.DefaultExtractorsFactory;
-import androidx.media3.session.DefaultMediaNotificationProvider;
+import androidx.media3.session.CommandButton;
 import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
 import androidx.media3.session.MediaStyleNotificationHelper;
+import androidx.media3.session.SessionCommand;
+import androidx.media3.session.SessionResult;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -64,6 +72,9 @@ import org.json.JSONObject;
  *   2. Native sleep timer (`off`, `minutes`, `endOfEpisode`, `endOfChapter`) with 60 s linear volume fade.
  *   3. Persistent 5 s checkpoint + append-only `completed[]` journal in `minipod_playback.xml`.
  *   4. Bounded 15 s `PARTIAL_WAKE_LOCK` (`MiniPod:SyncFlush`) on pause/stop/ended, released early on `ackFlush()`.
+ *   5. Lock-screen / notification / System UI controls: Rewind -10 s | Play/Pause | Fast-forward
+ *      +30 s (`LockScreenControls`, `LockScreenSessionPlayer`, `LockScreenNotificationProvider`),
+ *      with every session seek checkpointed and emitted (`media-state` + `seeked: true`).
  */
 @OptIn(markerClass = UnstableApi.class)
 public class PlaybackService extends MediaSessionService {
@@ -80,8 +91,8 @@ public class PlaybackService extends MediaSessionService {
     private static final long SLEEP_TICK_MS = 500L;
     private static final long SLEEP_FADE_WINDOW_MS = 60_000L;
     private static final long FLUSH_WAKE_LOCK_TIMEOUT_MS = 15_000L;
-    private static final long SEEK_BACK_MS = 10_000L;
-    private static final long SEEK_FORWARD_MS = 30_000L;
+    private static final long SEEK_BACK_MS = LockScreenControls.SEEK_BACK_MS;
+    private static final long SEEK_FORWARD_MS = LockScreenControls.SEEK_FORWARD_MS;
 
     private static final Object JOURNAL_LOCK = new Object();
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
@@ -152,6 +163,9 @@ public class PlaybackService extends MediaSessionService {
     private final Map<String, Long> durationHintByEpisodeKey = new ConcurrentHashMap<>();
 
     private ExoPlayer player;
+    /** Session-facing wrapper of {@link #player} (lock screen / System UI / Bluetooth seeks). */
+    private LockScreenSessionPlayer sessionPlayer;
+    private ImmutableList<CommandButton> lockScreenLayout = ImmutableList.of();
     private MediaSession mediaSession;
     private PowerManager.WakeLock flushWakeLock;
     private boolean foregroundStarted = false;
@@ -396,12 +410,11 @@ public class PlaybackService extends MediaSessionService {
 
         ensureNotificationChannel();
 
-        DefaultMediaNotificationProvider notificationProvider =
-            new DefaultMediaNotificationProvider.Builder(this)
-                .setChannelId(NOTIFICATION_CHANNEL_ID)
-                .setNotificationId(NOTIFICATION_ID)
-                .build();
-        setMediaNotificationProvider(notificationProvider);
+        // Rewind -10 s | Play/Pause | Fast-forward +30 s in the `MediaStyle` notification
+        // (expanded + collapsed compact view) — see `LockScreenNotificationProvider`.
+        setMediaNotificationProvider(
+            new LockScreenNotificationProvider(this, NOTIFICATION_ID, NOTIFICATION_CHANNEL_ID)
+        );
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
@@ -449,9 +462,18 @@ public class PlaybackService extends MediaSessionService {
 
         player.addListener(playerListener);
 
+        // The session (lock screen, notification, System UI, Bluetooth, Wear/Auto) drives a
+        // `ForwardingPlayer` so its seeks also work on a paused / idle / restored-unprepared track.
+        // The in-app bridge and `playerListener` keep using `player` directly.
+        sessionPlayer = new LockScreenSessionPlayer(player, sessionPlayerHost);
+        lockScreenLayout = LockScreenControls.buildCustomLayout(this);
+
         PendingIntent sessionActivityPendingIntent = createSessionActivityPendingIntent();
-        mediaSession = new MediaSession.Builder(this, player)
+        mediaSession = new MediaSession.Builder(this, sessionPlayer)
             .setSessionActivity(sessionActivityPendingIntent)
+            .setCallback(sessionCallback)
+            .setCustomLayout(lockScreenLayout)
+            .setSessionExtras(LockScreenControls.buildSessionExtras())
             .build();
         addSession(mediaSession);
 
@@ -529,6 +551,7 @@ public class PlaybackService extends MediaSessionService {
             player.release();
             player = null;
         }
+        sessionPlayer = null;
         if (instance == this) {
             instance = null;
         }
@@ -551,7 +574,7 @@ public class PlaybackService extends MediaSessionService {
             if (nm != null) {
                 NotificationChannel channel = new NotificationChannel(
                     NOTIFICATION_CHANNEL_ID,
-                    "Podcasts Playback",
+                    getString(R.string.playback_channel_name),
                     NotificationManager.IMPORTANCE_LOW
                 );
                 channel.setShowBadge(false);
@@ -561,6 +584,15 @@ public class PlaybackService extends MediaSessionService {
         }
     }
 
+    /**
+     * Minimal placeholder for the mandatory `startForeground` until Media3 posts its own
+     * notification with the same id. It intentionally adds <b>no</b> actions, so it can never
+     * flash track-skip (prev/next) buttons: on Android 13+ System UI renders the transport row from
+     * the session's `PlaybackState`, which carries Rewind -10 s | Play/Pause | Fast-forward +30 s
+     * as soon as Media3's notification controller connects (`addSession` in `onCreate` connects it
+     * right away; `sessionCallback.onConnect` grants it the custom commands minus track-skip), and
+     * on older versions `LockScreenNotificationProvider` replaces it with the same three buttons.
+     */
     private Notification buildBootstrapForegroundNotification() {
         ensureNotificationChannel();
         CharSequence appLabel = getString(R.string.app_name);
@@ -807,10 +839,128 @@ public class PlaybackService extends MediaSessionService {
     }
 
     // -------------------------------------------------------------------------
+    // Lock-screen / System UI / Bluetooth session controls
+    // -------------------------------------------------------------------------
+
+    private final LockScreenSessionPlayer.Host sessionPlayerHost = new LockScreenSessionPlayer.Host() {
+        @Override
+        public boolean ensureTrackLoaded() {
+            if (player == null) return false;
+            if (player.getMediaItemCount() == 0 || activeEpisodeKey == null) {
+                restoreLastTrackIfNeeded(true);
+            }
+            return player.getMediaItemCount() > 0;
+        }
+
+        @Override
+        public long lastKnownPositionMs() {
+            return lastKnownPositionMs;
+        }
+
+        @Override
+        public long durationHintMs() {
+            return resolveCurrentDurationMs();
+        }
+    };
+
+    private final MediaSession.Callback sessionCallback = new MediaSession.Callback() {
+        @Override
+        public MediaSession.ConnectionResult onConnect(
+            MediaSession session,
+            MediaSession.ControllerInfo controller
+        ) {
+            MediaSession.ConnectionResult.AcceptedResultBuilder result =
+                new MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                    .setAvailableSessionCommands(
+                        LockScreenControls.withSeekSessionCommands(
+                            MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS));
+            if (session.isMediaNotificationController(controller)) {
+                // Media3 1.5.1 applies these to the platform session (`PlaybackState` actions read
+                // by Android 13+ System UI): without SKIP_TO_PREVIOUS / SKIP_TO_NEXT, System UI puts
+                // custom action #1 (-10 s) left and #2 (+30 s) right of Play/Pause.
+                result
+                    .setAvailablePlayerCommands(
+                        LockScreenControls.withoutTrackSkipCommands(
+                            MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS))
+                    .setCustomLayout(lockScreenLayout);
+            }
+            return result.build();
+        }
+
+        @Override
+        public ListenableFuture<SessionResult> onCustomCommand(
+            MediaSession session,
+            MediaSession.ControllerInfo controller,
+            SessionCommand customCommand,
+            Bundle args
+        ) {
+            long deltaMs = LockScreenControls.deltaForAction(customCommand.customAction);
+            if (deltaMs != 0L && sessionPlayer != null) {
+                sessionPlayer.seekBy(deltaMs);
+                return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_SUCCESS));
+            }
+            return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_ERROR_NOT_SUPPORTED));
+        }
+
+        @Override
+        public boolean onMediaButtonEvent(
+            MediaSession session,
+            MediaSession.ControllerInfo controller,
+            Intent intent
+        ) {
+            KeyEvent keyEvent = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_KEY_EVENT, KeyEvent.class);
+            if (keyEvent == null) return false;
+            long deltaMs = LockScreenControls.deltaForMediaKey(keyEvent.getKeyCode());
+            if (deltaMs == 0L) return false;
+            // Long-press auto-repeat would fire a seek storm: seek once per press.
+            if (keyEvent.getRepeatCount() == 0 && sessionPlayer != null) {
+                sessionPlayer.seekBy(deltaMs);
+            }
+            return true;
+        }
+    };
+
+    /**
+     * Lock-screen / notification / Bluetooth seeks (and seekbar scrubs) reach ExoPlayer through the
+     * session without passing `seekToMs()`: checkpoint + emit them immediately so the in-app
+     * player, `minipod_playback.xml` (`KEY_CURRENT` + `KEY_LAST_TRACK`) and IndexedDB stay in sync.
+     */
+    private void onSeekDiscontinuity(Player.PositionInfo oldPosition, Player.PositionInfo newPosition) {
+        if (player == null || activeEpisodeKey == null) return;
+        // Cross-item seeks are owned by `onMediaItemTransition` (delivered after this callback,
+        // while `activeEpisodeKey` still names the previous item).
+        if (oldPosition.mediaItemIndex != newPosition.mediaItemIndex) return;
+        if (player.getPlaybackState() == Player.STATE_ENDED) return;
+
+        lastKnownPositionMs = Math.max(0L, newPosition.positionMs);
+        writeCurrentCheckpoint();
+        if (player.isPlaying()) {
+            scheduleTicks();
+        } else {
+            // Paused: keep the CPU up briefly so a hidden WebView can flush the new position.
+            acquireFlushWakeLock();
+        }
+        JSObject state = buildStateObject();
+        state.put("seeked", true);
+        emitStateObject(state);
+    }
+
+    // -------------------------------------------------------------------------
     // Internal helpers & `Player.Listener`
     // -------------------------------------------------------------------------
 
     private final Player.Listener playerListener = new Player.Listener() {
+        @Override
+        public void onPositionDiscontinuity(
+            Player.PositionInfo oldPosition,
+            Player.PositionInfo newPosition,
+            int reason
+        ) {
+            if (LockScreenControls.isSeekDiscontinuity(reason)) {
+                onSeekDiscontinuity(oldPosition, newPosition);
+            }
+        }
+
         @Override
         public void onTimelineChanged(Timeline timeline, int reason) {
             if (player == null) return;
