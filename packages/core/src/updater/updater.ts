@@ -8,7 +8,7 @@
 import type { ReleaseInfo } from '../types';
 
 export const GITHUB_REPO = 'codescv/minipod';
-export const CURRENT_APP_VERSION = '0.1.27';
+export const CURRENT_APP_VERSION = '0.1.28';
 export const GITHUB_RELEASE_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 export const GITHUB_RELEASES_LIST_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=5`;
 export const GITHUB_RELEASES_ATOM_URL = `https://github.com/${GITHUB_REPO}/releases.atom`;
