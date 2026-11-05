@@ -1601,7 +1601,7 @@ public class MiniPodPlugin extends Plugin {
             call.resolve(idle);
             return;
         }
-        PlaybackService.execute(getContext(), false, s -> call.resolve(s.buildStateObject()));
+        PlaybackService.execute(getContext(), false, s -> call.resolve(s.buildStateObjectForQuery()));
     }
 
     @PluginMethod

@@ -178,6 +178,13 @@ public class PlaybackService extends MediaSessionService {
     private long lastKnownDurationMs = 0L;
     private long lastKnownPositionMs = 0L;
     private long lastJournalWriteElapsedMs = 0L;
+    /**
+     * True while the active position comes from an explicit seek (lock screen / notification /
+     * System UI / Bluetooth / in-app) with no playback progress since. Checkpoints then carry
+     * `seeked: true`, so a deliberate rewind to 0:00 is distinguishable from a transient idle 0
+     * (journal reconciliation and `mediaGetState`).
+     */
+    private boolean positionFromSeek = false;
 
     // Sleep timer state (main thread only)
     private String sleepMode = "off"; // "off" | "minutes" | "endOfEpisode" | "endOfChapter"
@@ -191,6 +198,8 @@ public class PlaybackService extends MediaSessionService {
         public void run() {
             if (player == null) return;
             if (player.isPlaying()) {
+                // Playback advanced since any explicit seek.
+                positionFromSeek = false;
                 emitCurrentState();
                 long nowElapsed = SystemClock.elapsedRealtime();
                 if (nowElapsed - lastJournalWriteElapsedMs >= JOURNAL_CHECKPOINT_MS) {
@@ -334,9 +343,8 @@ public class PlaybackService extends MediaSessionService {
             long posMs = spec.startMs;
             long durMs = spec.durationMs;
             JSONObject cur = parseJson(prefs.getString(KEY_CURRENT, null));
-            if (cur != null
-                && spec.episodeKey.equals(cur.optString("episodeKey"))
-                && cur.optLong("wallMs", 0L) >= lastWallMs) {
+            boolean curSameEpisode = cur != null && spec.episodeKey.equals(cur.optString("episodeKey"));
+            if (curSameEpisode && cur.optLong("wallMs", 0L) >= lastWallMs) {
                 posMs = Math.max(0L, cur.optLong("positionMs", posMs));
                 long d = cur.optLong("durationMs", 0L);
                 if (d > 0L) durMs = d;
@@ -350,6 +358,11 @@ public class PlaybackService extends MediaSessionService {
                 out.put("durationMs", durMs);
             }
             out.put("speed", (double) spec.speed);
+            if (posMs == 0L && curSameEpisode && cur.optBoolean("seeked", false)) {
+                // Deliberate paused rewind to 0:00 (e.g. lock-screen -10 s) before Android stopped
+                // the service: the UI must show 0:00, not keep the older position.
+                out.put("seeked", true);
+            }
             return out;
         }
     }
@@ -644,6 +657,7 @@ public class PlaybackService extends MediaSessionService {
         activeEpisodeKey = spec.episodeKey;
         activeTrackSpec = spec;
         primaryTrackSpec = spec;
+        positionFromSeek = false;
         lastKnownPositionMs = spec.startMs;
         lastKnownDurationMs = spec.durationMs > 0 ? spec.durationMs : 0L;
         if (spec.durationMs > 0) {
@@ -803,6 +817,7 @@ public class PlaybackService extends MediaSessionService {
         queuedSpecs.clear();
         lastKnownDurationMs = 0L;
         lastKnownPositionMs = 0L;
+        positionFromSeek = false;
         clearLastTrack(null);
         emitCurrentState();
     }
@@ -838,6 +853,24 @@ public class PlaybackService extends MediaSessionService {
         return obj;
     }
 
+    /**
+     * {@link #buildStateObject()} for `mediaGetState` queries (e.g. `syncStateFromNative()` on app
+     * foreground): also flags a paused position that is the result of an explicit seek to 0:00
+     * (`seeked: true`), so a lock-screen rewind made while the WebView was frozen is not mistaken
+     * for a transient idle 0 by the UI.
+     */
+    public JSObject buildStateObjectForQuery() {
+        JSObject obj = buildStateObject();
+        if (positionFromSeek
+            && activeEpisodeKey != null
+            && player != null
+            && player.getPlaybackState() != Player.STATE_ENDED
+            && obj.optLong("positionMs", -1L) == 0L) {
+            obj.put("seeked", true);
+        }
+        return obj;
+    }
+
     // -------------------------------------------------------------------------
     // Lock-screen / System UI / Bluetooth session controls
     // -------------------------------------------------------------------------
@@ -850,6 +883,16 @@ public class PlaybackService extends MediaSessionService {
                 restoreLastTrackIfNeeded(true);
             }
             return player.getMediaItemCount() > 0;
+        }
+
+        @Override
+        public boolean canRestoreTrack() {
+            if (activeTrackSpec != null) return true;
+            synchronized (JOURNAL_LOCK) {
+                return getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .contains(KEY_LAST_TRACK);
+            }
         }
 
         @Override
@@ -933,6 +976,7 @@ public class PlaybackService extends MediaSessionService {
         if (player.getPlaybackState() == Player.STATE_ENDED) return;
 
         lastKnownPositionMs = Math.max(0L, newPosition.positionMs);
+        positionFromSeek = true;
         writeCurrentCheckpoint();
         if (player.isPlaying()) {
             scheduleTicks();
@@ -1033,6 +1077,10 @@ public class PlaybackService extends MediaSessionService {
             if (mediaItem == null) return;
             String nextKey = mediaItem.mediaId;
             String prevKey = activeEpisodeKey;
+            if (nextKey != null && !nextKey.equals(prevKey)) {
+                // A different episode: an explicit seek on the previous one no longer applies.
+                positionFromSeek = false;
+            }
 
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && prevKey != null && !prevKey.equals(nextKey)) {
                 long prevDur = durationHintByEpisodeKey.getOrDefault(prevKey, lastKnownDurationMs);
@@ -1146,6 +1194,10 @@ public class PlaybackService extends MediaSessionService {
         }
 
         MediaMetadata.Builder meta = new MediaMetadata.Builder().setTitle(spec.title);
+        if (spec.durationMs > 0L) {
+            // Lets System UI show the lock-screen seekbar range before ExoPlayer is prepared.
+            meta.setDurationMs(spec.durationMs);
+        }
         if (spec.artist != null && !spec.artist.isEmpty()) {
             meta.setArtist(spec.artist);
         }
@@ -1266,8 +1318,11 @@ public class PlaybackService extends MediaSessionService {
         if (activeEpisodeKey == null || player == null) return;
         long posMs;
         if (player.getPlaybackState() == Player.STATE_ENDED) {
-            // Never checkpoint the end position of a finished episode as an IN_PROGRESS resume point.
-            posMs = 0L;
+            // A finished episode is journaled in `KEY_COMPLETED` (and `KEY_CURRENT` /
+            // `KEY_LAST_TRACK` for it were removed): never (re)write a `positionMs: 0` checkpoint
+            // for it from `onTaskRemoved` / `onDestroy` / pause paths.
+            lastKnownPositionMs = 0L;
+            return;
         } else if (player.getMediaItemCount() > 0) {
             posMs = Math.max(0L, player.getCurrentPosition());
             if (posMs == 0L && player.getPlaybackState() == Player.STATE_IDLE && lastKnownPositionMs > 0L) {
@@ -1290,13 +1345,17 @@ public class PlaybackService extends MediaSessionService {
                     cur.put("durationMs", durMs);
                 }
                 cur.put("wallMs", wallMs);
+                if (positionFromSeek) {
+                    // Deliberate seek (e.g. lock-screen -10 s to 0:00): lets the WebView journal
+                    // reconciliation accept `positionMs: 0` instead of ignoring it as an idle reset.
+                    cur.put("seeked", true);
+                }
 
                 SharedPreferences prefs = getApplicationContext()
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
                 SharedPreferences.Editor editor = prefs.edit().putString(KEY_CURRENT, cur.toString());
                 if (activeTrackSpec != null
-                    && activeEpisodeKey.equals(activeTrackSpec.episodeKey)
-                    && player.getPlaybackState() != Player.STATE_ENDED) {
+                    && activeEpisodeKey.equals(activeTrackSpec.episodeKey)) {
                     float speed = player.getPlaybackParameters().speed;
                     editor.putString(
                         KEY_LAST_TRACK,

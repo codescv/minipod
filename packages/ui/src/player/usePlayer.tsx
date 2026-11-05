@@ -632,7 +632,7 @@ export function PlayerProvider({
           if (
             !prog ||
             prog.state !== 'IN_PROGRESS' ||
-            prog.positionMs <= 0 ||
+            prog.positionMs < 0 ||
             episodeRef.current?.episodeKey !== event.episodeKey ||
             engine.getSnapshot().playing ||
             prog.positionMs === snapshotRef.current.positionMs
@@ -640,6 +640,11 @@ export function PlayerProvider({
             return;
           }
           const posMs = prog.positionMs;
+          if (posMs === 0) {
+            // IN_PROGRESS at 0:00 is a deliberate rewind (e.g. lock-screen -10 s reconciled from
+            // the native journal): make it stick instead of reading as a transient idle 0.
+            allowZeroUntilRef.current = Date.now() + 2000;
+          }
           const engSnap = engine.getSnapshot();
           if (
             engSnap.episodeKey === event.episodeKey &&

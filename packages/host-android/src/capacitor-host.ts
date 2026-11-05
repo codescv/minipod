@@ -401,8 +401,20 @@ export async function createCapacitorPlatformHost(
           !prevProg ||
           current.wallMs > prevProg.updatedAt ||
           (prevProg.state !== 'PLAYED' && current.positionMs !== prevProg.positionMs);
+        // A `positionMs: 0` checkpoint is normally a transient idle/reset and ignored. It is only
+        // adopted when native flagged it as an explicit seek (lock-screen Rewind -10 s / scrub to
+        // 0:00 while the WebView was frozen or killed), it is newer than the stored IN_PROGRESS
+        // position, and it can never undo PLAYED.
+        const explicitRewindToZero =
+          current.positionMs === 0 &&
+          current.seeked === true &&
+          prevProg !== undefined &&
+          prevProg !== null &&
+          prevProg.state === 'IN_PROGRESS' &&
+          prevProg.positionMs > 0 &&
+          current.wallMs > prevProg.updatedAt;
 
-        if (isNewerThanStored && current.positionMs > 0) {
+        if (isNewerThanStored && (current.positionMs > 0 || explicitRewindToZero)) {
           const stamped = stampProgressSave(
             {
               episodeKey: current.episodeKey,

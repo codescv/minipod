@@ -148,6 +148,11 @@ export interface NativeJournalCheckpoint {
   readonly positionMs: number;
   readonly durationMs?: number;
   readonly wallMs: EpochMs;
+  /**
+   * The checkpointed position is the result of an explicit seek with no playback since (e.g. a
+   * paused lock-screen Rewind -10 s to 0:00). Only then may reconciliation adopt `positionMs: 0`.
+   */
+  readonly seeked?: boolean;
 }
 
 export interface NativeJournalCompletedEntry {

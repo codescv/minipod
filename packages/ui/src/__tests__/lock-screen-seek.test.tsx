@@ -127,6 +127,38 @@ describe('lock-screen Rewind -10 s / Fast-forward +30 s sync', () => {
     });
   });
 
+  it('reflects a reconciled IN_PROGRESS 0:00 checkpoint (rewind while the WebView was frozen) on foreground', async () => {
+    const mobile = renderMiniPod({ width: 390 });
+    const { epKey, durationMs } = await playAndPauseAt(mobile, 8_000);
+    expect(miniPlayerClock()).toMatch(/^0?0:08/);
+
+    // Foreground `syncStateFromNative()` without the flag: still treated as a transient idle 0.
+    act(() => {
+      mobile.engine.emitRawState({
+        episodeKey: epKey,
+        playing: false,
+        buffering: false,
+        positionMs: 0,
+        speed: 1,
+        ...(durationMs !== undefined ? { durationMs } : {}),
+      });
+    });
+    expect(miniPlayerClock()).toMatch(/^0?0:08/);
+
+    // Host reconciles the native `seeked: true` 0 checkpoint -> IN_PROGRESS@0 + progress-changed.
+    await act(async () => {
+      await mobile.host.progress.save({ episodeKey: epKey, positionMs: 0, state: 'IN_PROGRESS' });
+      mobile.host.emit({ type: 'progress-changed', episodeKey: epKey });
+    });
+    await waitFor(() => expect(miniPlayerClock()).toMatch(/^0?0:00/));
+
+    // And it sticks (the trailing transient 0 / position events do not snap back to 0:08).
+    act(() => {
+      mobile.engine.emitPosition(0);
+    });
+    expect(miniPlayerClock()).toMatch(/^0?0:00/);
+  });
+
   it('does not save IN_PROGRESS for a seek that lands in the completion tail (native `ended` marks PLAYED)', async () => {
     const mobile = renderMiniPod({ width: 390 });
     const { epKey, durationMs } = await playAndPauseAt(mobile, 6_000);

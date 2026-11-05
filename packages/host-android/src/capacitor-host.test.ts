@@ -1216,4 +1216,73 @@ describe('CapacitorPlatformHost', () => {
       await bundle.host.dispose();
     });
   });
+
+  describe('lock-screen Rewind -10 s to 0:00 while the WebView was frozen/killed (3c52a30e)', () => {
+    async function setup(dbName: string) {
+      const harness = createTestPluginHarness();
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory: new IDBFactory(),
+        dbName,
+        preferences: createMemoryPreferences(),
+      });
+      const feed = await bundle.host.feeds.subscribe('https://pod.example.com/rss.xml');
+      const epKey = deriveEpisodeKey(feed.feedKey, 'ep-1');
+      await bundle.host.progress.save({ episodeKey: epKey, positionMs: 8_000, state: 'IN_PROGRESS' });
+      const events: HostEvent[] = [];
+      bundle.host.subscribe((ev) => events.push(ev));
+      return { harness, bundle, epKey, events };
+    }
+
+    it('adopts a native `seeked` 0 checkpoint newer than the stored IN_PROGRESS position', async () => {
+      const { harness, bundle, epKey, events } = await setup('host-lockscreen-rewind-zero');
+      harness.setJournal({
+        completed: [],
+        current: { episodeKey: epKey, positionMs: 0, durationMs: 120_000, wallMs: Date.now() + 1_000, seeked: true },
+      });
+      await bundle.reconcileJournal();
+
+      expect(await bundle.host.progress.get(epKey)).toMatchObject({ positionMs: 0, state: 'IN_PROGRESS' });
+      expect(events).toContainEqual({ type: 'progress-changed', episodeKey: epKey });
+      expect(harness.plugin.media.clearJournal).toHaveBeenCalled();
+      await bundle.host.dispose();
+    });
+
+    it('still ignores an un-flagged 0 checkpoint (transient idle / service reset)', async () => {
+      const { harness, bundle, epKey } = await setup('host-lockscreen-idle-zero');
+      harness.setJournal({
+        completed: [],
+        current: { episodeKey: epKey, positionMs: 0, durationMs: 120_000, wallMs: Date.now() + 1_000 },
+      });
+      await bundle.reconcileJournal();
+
+      expect(await bundle.host.progress.get(epKey)).toMatchObject({ positionMs: 8_000, state: 'IN_PROGRESS' });
+      await bundle.host.dispose();
+    });
+
+    it('ignores a stale `seeked` 0 checkpoint older than the stored progress', async () => {
+      const { harness, bundle, epKey } = await setup('host-lockscreen-stale-zero');
+      harness.setJournal({
+        completed: [],
+        current: { episodeKey: epKey, positionMs: 0, wallMs: 1, seeked: true },
+      });
+      await bundle.reconcileJournal();
+
+      expect(await bundle.host.progress.get(epKey)).toMatchObject({ positionMs: 8_000, state: 'IN_PROGRESS' });
+      await bundle.host.dispose();
+    });
+
+    it('never lets a `seeked` 0 checkpoint undo PLAYED', async () => {
+      const { harness, bundle, epKey } = await setup('host-lockscreen-played-zero');
+      await bundle.host.progress.save({ episodeKey: epKey, positionMs: 0, state: 'PLAYED' });
+      harness.setJournal({
+        completed: [],
+        current: { episodeKey: epKey, positionMs: 0, wallMs: Date.now() + 5_000, seeked: true },
+      });
+      await bundle.reconcileJournal();
+
+      expect((await bundle.host.progress.get(epKey))?.state).toBe('PLAYED');
+      await bundle.host.dispose();
+    });
+  });
 });

@@ -381,6 +381,25 @@ describe('NativeAudioEngine', () => {
       engine.dispose();
     });
 
+    it('foreground syncStateFromNative() honors a `seeked` 0:00 reported by mediaGetState', async () => {
+      const { engine, events, media } = await pausedAt6s();
+      vi.mocked(media.getState).mockResolvedValueOnce({
+        episodeKey: 'e_lock',
+        playing: false,
+        buffering: false,
+        positionMs: 0,
+        durationMs: 600_000,
+        speed: 1,
+        seeked: true,
+      });
+
+      const snap = await engine.syncStateFromNative();
+
+      expect(snap).toMatchObject({ episodeKey: 'e_lock', positionMs: 0 });
+      expect(events).toContainEqual(expect.objectContaining({ type: 'state', seeked: true }));
+      engine.dispose();
+    });
+
     it('an explicit lock-screen rewind re-opens a finished episode instead of pinning it to 0', async () => {
       const { engine, emitNative } = await pausedAt6s();
       emitNative('media-ended', { episodeKey: 'e_lock' });
