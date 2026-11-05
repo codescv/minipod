@@ -48,7 +48,7 @@ export function saveAgentFeedbackEmail(
 
 export function normalizeFeedbackVersion(appVersion: string): string {
   const cleaned = appVersion.trim().replace(/^v/i, '');
-  return `v${cleaned || '0.1.28'}`;
+  return `v${cleaned || '0.1.29'}`;
 }
 
 export function extractFeedbackSummary(feedbackText: string, maxLength = 72): string {
