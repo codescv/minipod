@@ -935,6 +935,85 @@ textarea,
   display: block;
 }
 
+/* v0.1.29: visible `{percent}%` next to the ring while downloading (Android has no hover title). */
+.m-queue-cache-status.is-downloading {
+  width: auto;
+  min-width: 14px;
+  gap: 4px;
+  padding: 2px 6px 2px 7px;
+  margin: -2px 0;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: color-mix(in srgb, var(--md-sys-color-primary) 10%, transparent);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.m-queue-cache-status.is-downloading[role='button']:focus-visible,
+.m-resume-download-chip:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 1px;
+}
+
+.m-download-percent {
+  display: inline-block;
+  min-width: 4ch; /* `100%` fits: `0%` -> `42%` -> `100%` never shifts the row */
+  text-align: right;
+  font: var(--md-sys-typescale-label-small);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* `继续下载` pill for FAILED downloads: compact tonal, error-accented, finger-sized hit target. */
+.m-resume-download-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  min-height: 24px;
+  padding: 2px 10px 2px 8px;
+  margin: -4px 0;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+  font: var(--md-sys-typescale-label-medium);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  position: relative;
+}
+
+/* Expand the touch target to ~40px tall without growing the row. */
+.m-resume-download-chip::before {
+  content: '';
+  position: absolute;
+  inset: -8px -4px;
+}
+
+.m-resume-download-chip:hover {
+  filter: brightness(0.97);
+}
+
+.m-resume-download-chip:active {
+  filter: brightness(0.92);
+}
+
+.m-detail-download-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--md-sys-typescale-label-large);
+  font-variant-numeric: tabular-nums;
+  color: var(--md-sys-color-primary);
+}
+
+.m-detail-download-status.is-failed {
+  color: var(--md-sys-color-error);
+}
+
 .m-queue-row__handle {
   display: grid;
   place-items: center;

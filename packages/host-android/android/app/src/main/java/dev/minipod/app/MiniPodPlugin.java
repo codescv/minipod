@@ -834,75 +834,28 @@ public class MiniPodPlugin extends Plugin {
             String authPass = authObj != null ? authObj.optString("password", "") : "";
 
             try {
-                Response resp = openDownloadStream(rawUrl, headers, authUser, authPass, resumeFrom, episodeKey);
-                try {
-                    int code = resp.code();
-                    if (code < 200 || code >= 300) {
-                        call.reject("Download failed with HTTP " + code, "network");
-                        return;
-                    }
-                    ResponseBody body = resp.body();
-                    if (body == null) {
-                        call.reject("Download response has empty body", "network");
-                        return;
-                    }
+                DownloadTransfer.Result result = DownloadTransfer.run(
+                    rs -> openDownloadStream(rawUrl, headers, authUser, authPass, rs, episodeKey),
+                    partFile,
+                    finalFile,
+                    resumeFrom,
+                    () -> cancelledDownloadKeys.contains(episodeKey),
+                    (bytesDownloaded, totalBytes) -> {
+                        JSObject prog = new JSObject();
+                        prog.put("episodeKey", episodeKey);
+                        prog.put("bytesDownloaded", bytesDownloaded);
+                        if (totalBytes > 0) prog.put("totalBytes", totalBytes);
+                        notifyListeners("download-progress", prog);
+                    },
+                    DOWNLOAD_PROGRESS_THROTTLE_MS,
+                    System::currentTimeMillis
+                );
 
-                    boolean appending = code == 206 && resumeFrom > 0L;
-                    long contentLen = body.contentLength();
-                    long totalBytes = contentLen > 0
-                        ? (appending ? resumeFrom + contentLen : contentLen)
-                        : -1L;
-
-                    long written = appending ? resumeFrom : 0L;
-                    long lastEmitMs = 0L;
-
-                    try (InputStream in = body.byteStream();
-                         RandomAccessFile raf = new RandomAccessFile(partFile, "rw")) {
-                        if (appending) {
-                            raf.seek(resumeFrom);
-                        } else {
-                            raf.setLength(0L);
-                        }
-                        byte[] buf = new byte[16_384];
-                        int n;
-                        while ((n = in.read(buf)) != -1) {
-                            if (cancelledDownloadKeys.contains(episodeKey)) {
-                                throw new IOException("Canceled");
-                            }
-                            raf.write(buf, 0, n);
-                            written += n;
-                            long now = System.currentTimeMillis();
-                            if (now - lastEmitMs >= DOWNLOAD_PROGRESS_THROTTLE_MS) {
-                                lastEmitMs = now;
-                                JSObject prog = new JSObject();
-                                prog.put("episodeKey", episodeKey);
-                                prog.put("bytesDownloaded", written);
-                                if (totalBytes > 0) prog.put("totalBytes", totalBytes);
-                                notifyListeners("download-progress", prog);
-                            }
-                        }
-                        raf.getFD().sync();
-                    }
-
-                    if (cancelledDownloadKeys.contains(episodeKey)) {
-                        throw new IOException("Canceled");
-                    }
-                    if (finalFile.exists() && !finalFile.delete()) {
-                        throw new IOException("Unable to replace existing file " + finalFile);
-                    }
-                    if (!partFile.renameTo(finalFile)) {
-                        throw new IOException("Unable to rename .part file to " + finalFile);
-                    }
-
-                    JSObject res = new JSObject();
-                    res.put("path", finalFile.getAbsolutePath());
-                    res.put("size", finalFile.length());
-                    String ct = resp.header("Content-Type");
-                    if (ct != null) res.put("mime", ct);
-                    call.resolve(res);
-                } finally {
-                    resp.close();
-                }
+                JSObject res = new JSObject();
+                res.put("path", finalFile.getAbsolutePath());
+                res.put("size", result.size);
+                if (result.contentType != null) res.put("mime", result.contentType);
+                call.resolve(res);
             } catch (Exception e) {
                 if (cancelledDownloadKeys.contains(episodeKey)) {
                     //noinspection ResultOfMethodCallIgnored

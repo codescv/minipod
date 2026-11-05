@@ -212,6 +212,9 @@ export async function createCapacitorPlatformHost(
   });
 
   const bootSyncState = await syncStore.init();
+  // No download task survives a WebView/process restart: stale `QUEUED`/`RUNNING` -> `FAILED`
+  // (keeping the native `.part`) so the user sees `继续下载` and resumes via HTTP `Range`.
+  await syncStore.failStaleInFlightDownloads().catch(() => []);
 
   const readSettings = async (): Promise<AppSettings> => {
     const rec = await db.get('settings', 'app');
@@ -1036,18 +1039,27 @@ export async function createCapacitorPlatformHost(
 
   // Download progress listener (coalesced <= 2/s per episode)
   const lastDownloadEmitAt = new Map<EpisodeKey, number>();
+  // RSS `<enclosure length>` of in-flight downloads: percentage fallback when the server omits
+  // `Content-Length` (native `totalBytes` absent / <= 0).
+  const inFlightEnclosureSize = new Map<EpisodeKey, number>();
   const dlListenerHandle: PluginListenerHandle = await plugin.addListener(
     'download-progress',
     (ev) => {
       if (cancelledDownloads.has(ev.episodeKey)) return;
       const now = Date.now();
-      const prev = lastDownloadEmitAt.get(ev.episodeKey) ?? 0;
-      if (now - prev < DOWNLOAD_EVENT_MIN_INTERVAL_MS) return;
+      const prev = lastDownloadEmitAt.get(ev.episodeKey);
+      // The first snapshot (incl. the native immediate `resumeFrom > 0` one) always passes.
+      if (prev !== undefined && now - prev < DOWNLOAD_EVENT_MIN_INTERVAL_MS) return;
       lastDownloadEmitAt.set(ev.episodeKey, now);
+      const nativeTotal = ev.totalBytes && ev.totalBytes > 0 ? ev.totalBytes : undefined;
+      const declaredTotal = inFlightEnclosureSize.get(ev.episodeKey);
       const progress =
-        ev.totalBytes && ev.totalBytes > 0
-          ? Math.min(1, Math.max(0, ev.bytesDownloaded / ev.totalBytes))
-          : undefined;
+        nativeTotal !== undefined
+          ? Math.min(1, Math.max(0, ev.bytesDownloaded / nativeTotal))
+          : declaredTotal !== undefined
+            ? // RSS sizes are often approximate: cap at 99% until the transfer really completes.
+              Math.min(0.99, Math.max(0, ev.bytesDownloaded / declaredTotal))
+            : undefined;
       emit({
         type: 'download-updated',
         episodeKey: ev.episodeKey,
@@ -1485,6 +1497,12 @@ export async function createCapacitorPlatformHost(
         const destPath = `downloads/${episodeKey}.${ext}`;
 
         cancelledDownloads.delete(episodeKey);
+        lastDownloadEmitAt.delete(episodeKey);
+        if (ep.enclosureSize !== undefined && ep.enclosureSize > 0) {
+          inFlightEnclosureSize.set(episodeKey, ep.enclosureSize);
+        } else {
+          inFlightEnclosureSize.delete(episodeKey);
+        }
         await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
         emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
 
@@ -1527,6 +1545,7 @@ export async function createCapacitorPlatformHost(
           throw wrapped;
         } finally {
           lastDownloadEmitAt.delete(episodeKey);
+          inFlightEnclosureSize.delete(episodeKey);
         }
       },
 

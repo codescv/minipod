@@ -60,6 +60,8 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     const cachingBadge = screen.getByTestId(`queue-cache-status-${secondKey}`);
     expect(cachingBadge).toHaveAttribute('data-cache-state', 'downloading');
     expect(cachingBadge).toHaveAttribute('data-cache-progress', '45');
+    // v0.1.29 `下载中用百分比来表示进度`: the percentage is visible text, not only a hover title
+    expect(cachingBadge).toHaveTextContent('45%');
     expect(cachingBadge.querySelectorAll('circle')).toHaveLength(2);
 
     act(() => {

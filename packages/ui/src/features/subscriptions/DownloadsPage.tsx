@@ -95,7 +95,7 @@ export function DownloadsPage() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
       if (ev.state !== 'DONE') {
         // Drop a deleted/cancelled download from the list immediately (before revalidation).
         setItems((prev) => {

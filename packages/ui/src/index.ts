@@ -49,6 +49,7 @@ export {
   createMockPlatformHost,
   MockPlayerEngine,
   createMockPlayerEngine,
+  type MockDownloadControl,
   type MockHostOptions,
 } from './host/mock-host';
 export {

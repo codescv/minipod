@@ -49,6 +49,25 @@ function chooseExtension(enclosureUrl: string, mime: string | undefined): string
   return 'mp3';
 }
 
+/** Size of a leftover `.part` file (0 when absent/unreadable). */
+function partialFileSize(partPath: string): number {
+  if (!existsSync(partPath)) return 0;
+  try {
+    return statSync(partPath).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** Parses the complete length from `Content-Range: bytes <start>-<end>/<total>`. */
+function parseContentRangeTotal(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const m = /\/\s*(\d+)\s*$/.exec(header);
+  if (!m) return undefined;
+  const total = Number.parseInt(m[1]!, 10);
+  return Number.isFinite(total) && total > 0 ? total : undefined;
+}
+
 export interface EpisodeDownloaderDeps {
   readonly db: Database;
   readonly downloadsDir: string;
@@ -82,6 +101,23 @@ export class EpisodeDownloader {
       active.controller.abort();
     }
     this.activeDownloads.clear();
+  }
+
+  /**
+   * Startup reconciliation: a `QUEUED` / `RUNNING` row with no in-memory task was interrupted
+   * (process killed / crashed mid-download). Flip it to `FAILED` (keeping its `.part` bytes) so
+   * the UI offers `继续下载` / `Resume download` instead of a stuck progress ring.
+   * Returns the affected episode keys.
+   */
+  failStaleInFlightDownloads(): EpisodeKey[] {
+    const rows = this.deps.db
+      .prepare("SELECT episode_key FROM episodes WHERE download_state IN ('QUEUED', 'RUNNING')")
+      .all() as Array<{ episode_key: EpisodeKey }>;
+    const stale = rows.map((r) => r.episode_key).filter((k) => !this.activeDownloads.has(k));
+    for (const key of stale) {
+      this.episodesRepo.setDownloadState(key, 'FAILED', null);
+    }
+    return stale;
   }
 
   deleteFilesByPaths(paths: readonly string[]): void {
@@ -123,7 +159,15 @@ export class EpisodeDownloader {
     const partPath = `${destPath}.part`;
 
     this.episodesRepo.setDownloadState(episodeKey, 'QUEUED', null);
-    this.deps.emit({ type: 'download-updated', episodeKey, state: 'QUEUED', progress: 0 });
+    // A leftover `.part` (failed / interrupted download) resumes via HTTP `Range`: omit
+    // `progress: 0` so the UI keeps its last known percentage instead of flashing back to 0%.
+    const hasPartial = partialFileSize(partPath) > 0;
+    this.deps.emit({
+      type: 'download-updated',
+      episodeKey,
+      state: 'QUEUED',
+      ...(hasPartial ? {} : { progress: 0 }),
+    });
 
     const controller = new AbortController();
     const promise = this.runDownload({
@@ -152,22 +196,15 @@ export class EpisodeDownloader {
     readonly signal: AbortSignal;
   }): Promise<void> {
     try {
+      let resumeBytes = partialFileSize(params.partPath);
       this.episodesRepo.setDownloadState(params.episodeKey, 'RUNNING', null);
       this.deps.emit({
         type: 'download-updated',
         episodeKey: params.episodeKey,
         state: 'RUNNING',
-        progress: 0,
+        // Resuming: the real resumed fraction is emitted as soon as the server answers `206`.
+        ...(resumeBytes > 0 ? {} : { progress: 0 }),
       });
-
-      let resumeBytes = 0;
-      if (existsSync(params.partPath)) {
-        try {
-          resumeBytes = statSync(params.partPath).size;
-        } catch {
-          resumeBytes = 0;
-        }
-      }
 
       const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(params.enclosureUrl);
       const creds = inlineCreds ?? this.deps.getCredentials(params.feedKey);
@@ -197,13 +234,28 @@ export class EpisodeDownloader {
 
       const contentLenHeader = resp.headers.get('content-length');
       const contentLen = contentLenHeader ? Number.parseInt(contentLenHeader, 10) : Number.NaN;
-      const totalExpected = Number.isFinite(contentLen) && contentLen > 0
-        ? resumeBytes + contentLen
-        : params.declaredSize;
+      const rangeTotal = appending ? parseContentRangeTotal(resp.headers.get('content-range')) : undefined;
+      const totalExpected =
+        rangeTotal ??
+        (Number.isFinite(contentLen) && contentLen > 0 ? resumeBytes + contentLen : params.declaredSize);
 
       const ws = createWriteStream(params.partPath, { flags: appending ? 'a' : 'w' });
       let written = resumeBytes;
       let lastEmitAt = 0;
+
+      // Immediate snapshot of the resumed fraction (e.g. `42%`) instead of restarting at `0%`.
+      const progressOf = (bytes: number): number | undefined =>
+        totalExpected && totalExpected > 0 ? Math.min(0.99, bytes / totalExpected) : undefined;
+      if (appending) {
+        lastEmitAt = Date.now();
+        const resumedProgress = progressOf(written);
+        this.deps.emit({
+          type: 'download-updated',
+          episodeKey: params.episodeKey,
+          state: 'RUNNING',
+          ...(resumedProgress !== undefined ? { progress: resumedProgress } : {}),
+        });
+      }
 
       try {
         if (resp.body) {
@@ -221,10 +273,7 @@ export class EpisodeDownloader {
             const now = Date.now();
             if (now - lastEmitAt >= EVENT_COALESCE_MS) {
               lastEmitAt = now;
-              const progress =
-                totalExpected && totalExpected > 0
-                  ? Math.min(0.99, written / totalExpected)
-                  : undefined;
+              const progress = progressOf(written);
               this.deps.emit({
                 type: 'download-updated',
                 episodeKey: params.episodeKey,

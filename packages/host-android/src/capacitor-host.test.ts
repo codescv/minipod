@@ -778,6 +778,111 @@ describe('CapacitorPlatformHost', () => {
     await host.dispose();
   });
 
+  it('failed download: FAILED survives feed refresh + restart (stale QUEUED -> FAILED), % falls back to RSS enclosure length, and 继续下载 resumes to DONE', async () => {
+    const harness = createTestPluginHarness();
+    const idbFactory = new IDBFactory();
+    const preferences = createMemoryPreferences();
+    const dbName = 'host-download-resume-test';
+    // Realistic RSS `<enclosure length>` (tiny values are discarded as suspicious by the parser).
+    const rssWithSizes = SAMPLE_RSS.replaceAll('length="1000"', 'length="10000000"');
+    harness.plugin.http = vi.fn(async (req) => ({
+      status: 200,
+      headers: { 'content-type': 'application/rss+xml' },
+      finalUrl: req.url,
+      chain: [],
+      bodyBase64: encodeBase64(new TextEncoder().encode(rssWithSizes)),
+    }));
+
+    // 1st attempt: server omits Content-Length (no native `totalBytes`), then the network drops.
+    harness.plugin.httpToFile = vi.fn(async (req) => {
+      harness.emitNative('download-progress', { episodeKey: req.episodeKey, bytesDownloaded: 4_200_000 });
+      throw Object.assign(new Error('unexpected end of stream'), { code: 'network' });
+    });
+
+    const first = await createCapacitorPlatformHost({ plugin: harness.plugin, idbFactory, dbName, preferences });
+    const events: { episodeKey: string; state: string; progress?: number }[] = [];
+    const unsub = first.host.subscribe((ev) => {
+      if (ev.type === 'download-updated') {
+        events.push({
+          episodeKey: ev.episodeKey,
+          state: ev.state,
+          ...(ev.progress !== undefined ? { progress: ev.progress } : {}),
+        });
+      }
+    });
+    const feed = await first.host.feeds.subscribe('https://pod.example.com/rss.xml');
+    const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+    const ep2Key = deriveEpisodeKey(feed.feedKey, 'ep-2');
+
+    await expect(first.host.episodes.download(ep1Key)).rejects.toMatchObject({ code: 'network' });
+    // `<enclosure length="10000000">` -> 4.2 MB / 10 MB = 42%
+    expect(events).toEqual([
+      { episodeKey: ep1Key, state: 'QUEUED' },
+      { episodeKey: ep1Key, state: 'RUNNING', progress: 0.42 },
+      { episodeKey: ep1Key, state: 'FAILED' },
+    ]);
+    expect((await first.db.get('episodes', ep1Key))?.downloadState).toBe('FAILED');
+    // A network failure never deletes the native `.part` (only an explicit stop does).
+    expect(harness.plugin.cancelDownload).not.toHaveBeenCalled();
+    expect(harness.deletedLocalFiles).toEqual([]);
+
+    // Feed refresh (`upsertParsedFeed`) keeps FAILED so the 继续下载 button survives.
+    await first.host.feeds.refresh(feed.feedKey);
+    expect((await first.host.episodes.get(ep1Key)).episode.downloadState).toBe('FAILED');
+
+    // ep-2's download was in flight when the process died (record stuck QUEUED).
+    await first.syncStore.setEpisodeDownloadState(ep2Key, 'QUEUED');
+    unsub();
+    await first.host.dispose();
+
+    // Restart: stale QUEUED -> FAILED; FAILED stays FAILED.
+    const pendingHttp: { resolve?: () => void } = {};
+    harness.plugin.httpToFile = vi.fn(
+      (req) =>
+        new Promise<{ path: string; size: number }>((resolve) => {
+          pendingHttp.resolve = () =>
+            resolve({ path: `/data/user/0/dev.minipod.app/files/${req.destPath}`, size: 1000 });
+          // Native resumes from the kept `.part` and emits an immediate snapshot.
+          harness.emitNative('download-progress', {
+            episodeKey: req.episodeKey,
+            bytesDownloaded: 420,
+            totalBytes: 1000,
+          });
+          // A chunk inside the 500ms coalescing window is dropped...
+          harness.emitNative('download-progress', {
+            episodeKey: req.episodeKey,
+            bytesDownloaded: 500,
+            totalBytes: 1000,
+          });
+        }),
+    );
+    const second = await createCapacitorPlatformHost({ plugin: harness.plugin, idbFactory, dbName, preferences });
+    expect((await second.host.episodes.get(ep1Key)).episode.downloadState).toBe('FAILED');
+    expect((await second.host.episodes.get(ep2Key)).episode.downloadState).toBe('FAILED');
+
+    const events2: { state: string; progress?: number }[] = [];
+    const unsub2 = second.host.subscribe((ev) => {
+      if (ev.type === 'download-updated' && ev.episodeKey === ep1Key) {
+        events2.push({ state: ev.state, ...(ev.progress !== undefined ? { progress: ev.progress } : {}) });
+      }
+    });
+    const resumePromise = second.host.episodes.download(ep1Key);
+    await vi.waitFor(() => {
+      expect(pendingHttp.resolve).toBeDefined();
+    });
+    // ...but the first (resumed) snapshot is emitted right away: 42%, never 0%.
+    expect(events2).toEqual([{ state: 'QUEUED' }, { state: 'RUNNING', progress: 0.42 }]);
+    pendingHttp.resolve?.();
+    await resumePromise;
+    expect(events2.at(-1)).toEqual({ state: 'DONE', progress: 1 });
+    const done = await second.host.episodes.get(ep1Key);
+    expect(done.episode.downloadState).toBe('DONE');
+    expect(done.episode.downloadPath).toBe(`/data/user/0/dev.minipod.app/files/downloads/${ep1Key}.mp3`);
+
+    unsub2();
+    await second.host.dispose();
+  });
+
   describe('Airplane Mode: downloaded audio -> background -> pause -> foreground -> Play (v0.1.21 bug)', () => {
     async function setupOfflinePlayback(dbName: string) {
       const harness = createTestPluginHarness();

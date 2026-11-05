@@ -11,7 +11,7 @@
  *   and real-time neighbor slot shifting (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, Fragment } from 'react';
-import type { EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
+import type { DownloadState, EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import {
   ArtworkImage,
@@ -36,7 +36,18 @@ import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
-import { applyDownloadStateToViewCache, getHostViewCache } from '../../stores/view-cache';
+import {
+  applyDownloadStateToViewCache,
+  downloadRatioToPercent,
+  getHostViewCache,
+} from '../../stores/view-cache';
+import {
+  DetailDownloadStatus,
+  DownloadPercentText,
+  DownloadProgressRing,
+  ResumeDownloadChip,
+  inlineRowActionProps,
+} from '../../components/DownloadControls';
 
 interface PendingQueueInlineUndo {
   readonly epKey: EpisodeKey;
@@ -82,7 +93,7 @@ export function QueueList() {
   const [loading, setLoading] = useState(() => !getHostViewCache(host).queueLoaded);
   const [downloadProgressByKey, setDownloadProgressByKey] = useState<
     ReadonlyMap<EpisodeKey, number>
-  >(() => new Map());
+  >(() => new Map(getHostViewCache(host).downloadProgressByKey));
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
   const [dragDeltaY, setDragDeltaY] = useState(0);
@@ -100,6 +111,14 @@ export function QueueList() {
   const listRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<ActiveHandleDrag | null>(null);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * `download-updated` events seen while a `loadQueue()` is in flight win over its (older)
+   * snapshot, so a slow revalidation never reverts a just-started download (`QUEUED` -> `NONE`).
+   */
+  const downloadEventSeqRef = useRef(0);
+  const lastDownloadEventRef = useRef(
+    new Map<EpisodeKey, { readonly seq: number; readonly state: DownloadState }>(),
+  );
 
   const clearUndoTimer = useCallback(() => {
     if (undoTimerRef.current !== null) {
@@ -111,8 +130,19 @@ export function QueueList() {
   useEffect(() => clearUndoTimer, [clearUndoTimer]);
 
   const loadQueue = useCallback(async () => {
+    const startSeq = downloadEventSeqRef.current;
     try {
-      const [q, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
+      const [fetched, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
+      const newerEvents = [...lastDownloadEventRef.current].filter(([, e]) => e.seq > startSeq);
+      const q =
+        newerEvents.length === 0
+          ? fetched
+          : fetched.map((r) => {
+              const live = lastDownloadEventRef.current.get(r.episode.episodeKey);
+              return live && live.seq > startSeq && live.state !== r.episode.downloadState
+                ? { ...r, episode: { ...r.episode, downloadState: live.state } }
+                : r;
+            });
       const map = new Map<FeedKey, Feed>();
       for (const f of fList) {
         map.set(f.feedKey, f);
@@ -143,19 +173,16 @@ export function QueueList() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      // Keep the unmounted screens' SWR slices (Manage Downloads, timeline, per-feed rows) in sync.
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
-      setDownloadProgressByKey((prev) => {
-        if (ev.state === 'RUNNING' || ev.state === 'QUEUED') {
-          const next = new Map(prev);
-          next.set(ev.episodeKey, ev.progress ?? (prev.get(ev.episodeKey) ?? 0));
-          return next;
-        }
-        if (!prev.has(ev.episodeKey)) return prev;
-        const next = new Map(prev);
-        next.delete(ev.episodeKey);
-        return next;
+      downloadEventSeqRef.current += 1;
+      lastDownloadEventRef.current.set(ev.episodeKey, {
+        seq: downloadEventSeqRef.current,
+        state: ev.state,
       });
+      // Keep the unmounted screens' SWR slices (Manage Downloads, timeline, per-feed rows) in sync.
+      // Also records the progress sample in the shared `downloadProgressByKey` (kept on FAILED,
+      // cleared on DONE/NONE) so a remount mid-download never flashes back to `0%`.
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+      setDownloadProgressByKey(new Map(getHostViewCache(host).downloadProgressByKey));
       setRows((prev) => {
         if (!prev.some((r) => r.episode.episodeKey === ev.episodeKey)) return prev;
         const next = prev.map((r) =>
@@ -492,6 +519,8 @@ export function QueueList() {
   /** Optimistically flips the given episodes to `downloadState: 'NONE'` and clears their progress. */
   const markDownloadsStopped = useCallback(
     (keySet: ReadonlySet<EpisodeKey>) => {
+      const cachedProgress = getHostViewCache(host).downloadProgressByKey;
+      for (const key of keySet) cachedProgress.delete(key);
       setDownloadProgressByKey((prev) => {
         let changed = false;
         const next = new Map(prev);
@@ -524,6 +553,24 @@ export function QueueList() {
       }
     },
     [host.episodes, loadQueue, markDownloadsStopped],
+  );
+
+  /**
+   * `继续下载` / `Download episode`: (re)starts the download (hosts resume a failed `.part` via HTTP
+   * `Range`). `download()` rejects when the transfer fails again: surface `下载失败` instead of
+   * leaking an unhandled rejection; the row falls back to `FAILED` with its `继续下载` pill.
+   */
+  const handleResumeDownload = useCallback(
+    async (epKey: EpisodeKey) => {
+      try {
+        await host.episodes.download(epKey);
+      } catch {
+        showSnackbar(t('queue.downloadFailed'));
+      } finally {
+        await loadQueue().catch(() => undefined);
+      }
+    },
+    [host.episodes, loadQueue, t],
   );
 
   const handleStopAllDownloads = useCallback(async () => {
@@ -588,7 +635,10 @@ export function QueueList() {
                   disabled: !canDownload,
                   testId: `queue-download-${epKey}`,
                   onSelect: () => {
-                    void host.episodes.deleteDownload(epKey).then(() => loadQueue());
+                    void host.episodes
+                      .deleteDownload(epKey)
+                      .catch(() => undefined)
+                      .then(() => loadQueue());
                   },
                 }
               : dlState === 'RUNNING' || dlState === 'QUEUED'
@@ -604,7 +654,8 @@ export function QueueList() {
                   }
                 : {
                     key: 'download',
-                    label: t('detail.download'),
+                    label:
+                      dlState === 'FAILED' ? t('detail.resumeDownload') : t('detail.download'),
                     icon: 'download',
                     disabled:
                       !canDownload ||
@@ -615,7 +666,7 @@ export function QueueList() {
                       ),
                     testId: `queue-download-${epKey}`,
                     onSelect: () => {
-                      void host.episodes.download(epKey).then(() => loadQueue());
+                      void handleResumeDownload(epKey);
                     },
                   };
           return [
@@ -700,7 +751,20 @@ export function QueueList() {
           : '';
     const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
     const shownotesHtml = sanitizeShownotesHtml(episode.description);
+    const canDownloadEpisode =
+      canDownload &&
+      !episode.feedKey.startsWith('l_') &&
+      Boolean(episode.enclosureUrl ?? detailsRow.entry.stub?.enclosureUrl);
+    const isDownloading =
+      canDownloadEpisode &&
+      (episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED');
+    const isDownloadFailed = canDownloadEpisode && episode.downloadState === 'FAILED';
+    const downloadRatio = downloadProgressByKey.get(epKey) ?? 0;
     return {
+      isDownloading,
+      isDownloadFailed,
+      downloadRatio,
+      downloadPercent: downloadRatioToPercent(downloadRatio),
       episode,
       epKey,
       inQueue,
@@ -796,14 +860,13 @@ export function QueueList() {
                   ? formatHumanDuration(dur)
                   : '';
             const rawProgress = downloadProgressByKey.get(epKey);
-            const progressPercent =
-              rawProgress !== undefined
-                ? Math.round(Math.max(0, Math.min(1, rawProgress)) * 100)
-                : undefined;
-            const cachingLabel =
-              progressPercent !== undefined && progressPercent > 0
-                ? t('queue.cachingProgress', { percent: progressPercent })
-                : t('queue.caching');
+            const cachingLabel = t('queue.cachingProgress', {
+              percent: downloadRatioToPercent(rawProgress),
+            });
+            const canResumeDownload =
+              canDownload &&
+              !r.episode.feedKey.startsWith('l_') &&
+              Boolean(r.episode.enclosureUrl ?? r.entry.stub?.enclosureUrl);
 
             return (
               <Fragment key={epKey}>
@@ -844,6 +907,13 @@ export function QueueList() {
                   stopDownloadLabel={t('detail.stopDownload')}
                   onStopDownload={() => {
                     void handleStopDownload(epKey);
+                  }}
+                  canResumeDownload={canResumeDownload}
+                  resumeDownloadLabel={t('queue.resumeDownload')}
+                  resumeDownloadAriaLabel={t('detail.resumeDownload')}
+                  downloadFailedLabel={t('queue.downloadFailed')}
+                  onResumeDownload={() => {
+                    void handleResumeDownload(epKey);
                   }}
                   isCurrent={isCurrent}
                   isPlaying={isPlaying}
@@ -994,6 +1064,21 @@ export function QueueList() {
                     {detailsSheet.remStr && <span>{detailsSheet.remStr}</span>}
                   </div>
                 )}
+                <DetailDownloadStatus
+                  state={
+                    detailsSheet.isDownloading
+                      ? 'downloading'
+                      : detailsSheet.isDownloadFailed
+                        ? 'failed'
+                        : null
+                  }
+                  ratio={detailsSheet.downloadRatio}
+                  downloadingLabel={t('detail.downloadingProgress', {
+                    percent: detailsSheet.downloadPercent,
+                  })}
+                  failedLabel={t('queue.downloadFailed')}
+                  testId={`ep-detail-download-status-${detailsSheet.epKey}`}
+                />
               </div>
             </div>
 
@@ -1018,6 +1103,30 @@ export function QueueList() {
               >
                 {detailsSheet.inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')}
               </Button>
+              {detailsSheet.isDownloadFailed && (
+                <Button
+                  variant="tonal"
+                  icon="download"
+                  data-testid={`ep-detail-resume-download-${detailsSheet.epKey}`}
+                  onClick={() => {
+                    void handleResumeDownload(detailsSheet.epKey);
+                  }}
+                >
+                  {t('detail.resumeDownload')}
+                </Button>
+              )}
+              {detailsSheet.isDownloading && (
+                <Button
+                  variant="tonal"
+                  icon="stop"
+                  data-testid={`ep-detail-stop-download-${detailsSheet.epKey}`}
+                  onClick={() => {
+                    void handleStopDownload(detailsSheet.epKey);
+                  }}
+                >
+                  {t('detail.stopDownload')}
+                </Button>
+              )}
               {detailsSheet.feed && (
                 <Button
                   variant="outlined"
@@ -1101,6 +1210,11 @@ function QueueRowItem({
   cachingLabel,
   stopDownloadLabel,
   onStopDownload,
+  canResumeDownload,
+  resumeDownloadLabel,
+  resumeDownloadAriaLabel,
+  downloadFailedLabel,
+  onResumeDownload,
   isCurrent,
   isPlaying,
   draggingIdx,
@@ -1132,6 +1246,11 @@ function QueueRowItem({
   readonly cachingLabel: string;
   readonly stopDownloadLabel: string;
   readonly onStopDownload: () => void;
+  readonly canResumeDownload: boolean;
+  readonly resumeDownloadLabel: string;
+  readonly resumeDownloadAriaLabel: string;
+  readonly downloadFailedLabel: string;
+  readonly onResumeDownload: () => void;
   readonly isCurrent: boolean;
   readonly isPlaying: boolean;
   readonly draggingIdx: number | null;
@@ -1168,8 +1287,9 @@ function QueueRowItem({
   const dlState = row.episode.downloadState;
   const isCacheDone = dlState === 'DONE';
   const isCacheDownloading = dlState === 'RUNNING' || dlState === 'QUEUED';
+  const isCacheFailed = dlState === 'FAILED' && canResumeDownload;
   const progressRatio = Math.max(0, Math.min(1, downloadProgress ?? 0));
-  const progressPercent = Math.round(progressRatio * 100);
+  const progressPercent = downloadRatioToPercent(progressRatio);
 
   let shiftY = 0;
   if (
@@ -1395,7 +1515,7 @@ function QueueRowItem({
 
         <div className="m-episode-row__body">
           <div className="m-episode-row__title">{row.episode.title}</div>
-          {(dateStr || remStr || isCacheDone || isCacheDownloading) && (
+          {(dateStr || remStr || isCacheDone || isCacheDownloading || isCacheFailed) && (
             <div className="m-episode-row__meta">
               {dateStr && <span>{dateStr}</span>}
               {dateStr && remStr && <span>·</span>}
@@ -1423,58 +1543,23 @@ function QueueRowItem({
                   data-cache-state="downloading"
                   data-cache-progress={progressPercent}
                   style={{ cursor: 'pointer' }}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                  }}
-                  onTouchStart={(e) => {
-                    e.stopPropagation();
-                  }}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onStopDownload();
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onStopDownload();
-                    }
-                  }}
+                  {...inlineRowActionProps(onStopDownload)}
                 >
-                  <svg
-                    width={14}
-                    height={14}
-                    viewBox="0 0 14 14"
-                    fill="none"
-                    aria-hidden="true"
-                    focusable="false"
-                  >
-                    <circle
-                      cx="7"
-                      cy="7"
-                      r="5.25"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeDasharray="2.1 2.1"
-                      opacity="0.45"
-                    />
-                    <circle
-                      cx="7"
-                      cy="7"
-                      r="5.25"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                      strokeDasharray={32.99}
-                      strokeDashoffset={Number(
-                        (32.99 * (1 - Math.max(0.12, progressRatio))).toFixed(2),
-                      )}
-                      transform="rotate(-90 7 7)"
-                    />
-                    <rect x="5" y="5" width="4" height="4" rx="0.7" fill="currentColor" />
-                  </svg>
+                  <DownloadPercentText
+                    percent={progressPercent}
+                    testId={`queue-cache-percent-${epKey}`}
+                  />
+                  <DownloadProgressRing ratio={progressRatio} withStop />
                 </span>
+              )}
+              {isCacheFailed && (
+                <ResumeDownloadChip
+                  label={resumeDownloadLabel}
+                  ariaLabel={resumeDownloadAriaLabel}
+                  title={`${downloadFailedLabel} · ${resumeDownloadAriaLabel}`}
+                  testId={`queue-resume-download-${epKey}`}
+                  onResume={onResumeDownload}
+                />
               )}
             </div>
           )}

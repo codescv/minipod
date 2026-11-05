@@ -54,6 +54,12 @@ export interface HostViewCache {
   timelineLimit: number;
   queueRows: readonly QueueRow[];
   queueLoaded: boolean;
+  /**
+   * Last known download ratio (`0..1`) per episode, so remounting a screen (`Queue` ↔
+   * `Subscriptions` ↔ `Settings`) mid-download never flashes the percentage back to `0%`.
+   * Kept on `FAILED` (partial `.part` resumes from there), cleared on `DONE` / `NONE`.
+   */
+  readonly downloadProgressByKey: Map<EpisodeKey, number>;
   syncStatus: SyncStatus | null;
   topChartsCountries: readonly { readonly code: CountryCode; readonly name: string }[];
   readonly topChartsByCountry: Map<CountryCode, readonly SearchResult[]>;
@@ -80,6 +86,7 @@ function createEmptyHostViewCache(): HostViewCache {
     timelineLimit: DEFAULT_TIMELINE_LIMIT,
     queueRows: [],
     queueLoaded: false,
+    downloadProgressByKey: new Map(),
     syncStatus: null,
     topChartsCountries: [],
     topChartsByCountry: new Map(),
@@ -182,10 +189,43 @@ export function recomputeHostTimelineAndDownloads(
   };
 }
 
+/** Clamps a download ratio to `0..1` and converts it to an integer percentage (`0..100`). */
+export function downloadRatioToPercent(ratio: number | undefined): number {
+  if (ratio === undefined || !Number.isFinite(ratio)) return 0;
+  return Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+}
+
+/**
+ * Records a `download-updated` progress sample in `downloadProgressByKey` (idempotent):
+ * - `QUEUED` / `RUNNING`: stores `progress` when given, otherwise keeps the last known ratio
+ *   (seeding `0` for a brand-new download)
+ * - `FAILED`: keeps the last known ratio (the resumed download continues from there)
+ * - `DONE` / `NONE`: clears it
+ */
+export function applyDownloadProgressToViewCache(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  state: DownloadState,
+  progress?: number,
+): void {
+  const map = getHostViewCache(host).downloadProgressByKey;
+  if (state === 'RUNNING' || state === 'QUEUED') {
+    if (progress !== undefined && Number.isFinite(progress)) {
+      map.set(episodeKey, Math.max(0, Math.min(1, progress)));
+    } else if (!map.has(episodeKey)) {
+      map.set(episodeKey, 0);
+    }
+    return;
+  }
+  if (state === 'DONE' || state === 'NONE') {
+    map.delete(episodeKey);
+  }
+}
+
 /**
  * Applies a `download-updated` transition to every SWR cache slice that embeds the episode
  * (`episodesByFeed` across all cached feeds, `queueRows`, `timelineItems`, `downloadedItems`,
- * `downloadedCount`).
+ * `downloadedCount`, `downloadProgressByKey`).
  *
  * Needed because only the mounted screen revalidates: e.g. when an episode finishes (and its
  * download is auto-deleted) while the user is on the Queue screen, `DownloadsPage` /
@@ -200,8 +240,10 @@ export function applyDownloadStateToViewCache(
   episodeKey: EpisodeKey,
   state: DownloadState,
   downloadPath?: string,
+  progress?: number,
 ): void {
   const viewCache = getHostViewCache(host);
+  applyDownloadProgressToViewCache(host, episodeKey, state, progress);
 
   const patchEpisode = <E extends EpisodeRowModel['episode']>(ep: E): E => {
     const nextPath = state === 'DONE' ? (downloadPath ?? ep.downloadPath) : undefined;

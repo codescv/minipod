@@ -430,7 +430,7 @@ export function SubscriptionsGrid() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
     }
     if (ev.type === 'queue-changed') {
       void host.queue

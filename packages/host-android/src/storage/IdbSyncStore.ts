@@ -1540,6 +1540,31 @@ export class IdbSyncStore implements SyncStore {
     await tx.done;
   }
 
+  /**
+   * Boot reconciliation: `QUEUED` / `RUNNING` records can only be stale at startup (the WebView /
+   * process died mid-download, leaving the `.part` behind). Flip them to `FAILED` so the UI shows
+   * `继续下载` (resumable via HTTP `Range`) instead of a stuck progress ring. Feed refreshes and
+   * sync merges preserve `FAILED` as-is. Returns the affected episode keys.
+   */
+  async failStaleInFlightDownloads(): Promise<EpisodeKey[]> {
+    const tx = this.db.transaction(['episodes'], 'readwrite');
+    const store = tx.objectStore('episodes');
+    const affected: EpisodeKey[] = [];
+    let cursor = await store.openCursor();
+    while (cursor) {
+      const ep = cursor.value;
+      if (ep.downloadState === 'QUEUED' || ep.downloadState === 'RUNNING') {
+        const next: IdbEpisodeRecord = { ...ep, downloadState: 'FAILED' };
+        delete (next as { downloadPath?: string }).downloadPath;
+        await cursor.update(next);
+        affected.push(ep.episodeKey);
+      }
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+    return affected;
+  }
+
   async listAllQueueEntries(): Promise<QueueEntry[]> {
     const rows = await this.db.getAll('queue');
     return rows.map(idbRecordToQueueEntry);

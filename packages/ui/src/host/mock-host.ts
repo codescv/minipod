@@ -145,6 +145,20 @@ const CATALOG_SEARCH_RESULTS: readonly SearchResult[] = [
   },
 ];
 
+/** Controls for a download held in flight via `MockPlatformHost.holdNextDownload`. */
+export interface MockDownloadControl {
+  /** Emits `download-updated(RUNNING, progress)` (and persists `RUNNING`). */
+  readonly progress: (ratio: number) => void;
+  /** Completes the held download (`DONE`). */
+  readonly finish: () => void;
+  /** Fails the held download (`FAILED`; `episodes.download` rejects with a `network` error). */
+  readonly fail: () => void;
+}
+
+interface PendingMockDownload {
+  readonly wait: Promise<'done' | 'failed'>;
+}
+
 export class MockPlatformHost implements PlatformHost {
   readonly info: HostInfo;
   readonly updater?: UpdaterApi;
@@ -158,6 +172,7 @@ export class MockPlatformHost implements PlatformHost {
   private readonly credentialsMap = new Map<FeedKey, HttpBasicCredentials>();
   private readonly previewsMap = new Map<string, FeedPreview>();
   private readonly olderPagesMap = new Map<string, readonly ParsedEpisode[]>();
+  private readonly heldDownloads = new Map<EpisodeKey, PendingMockDownload>();
   private queueOrder: QueueEntry[] = [];
   private settingsState: AppSettings;
   private syncStatusState: SyncStatus;
@@ -262,6 +277,53 @@ export class MockPlatformHost implements PlatformHost {
 
   getStoredSecret(): SyncProviderSecret | undefined {
     return this.lastSecret;
+  }
+
+  /**
+   * Test & dev helper: force an episode's persisted download state (e.g. a `FAILED` download left
+   * over from a dropped connection) and emit the matching `download-updated` + `episodes-changed`.
+   */
+  setEpisodeDownloadState(episodeKey: EpisodeKey, state: DownloadState, progress?: number): void {
+    const ep = this.episodesMap.get(episodeKey);
+    if (!ep) return;
+    const { downloadPath: _omit, ...rest } = ep;
+    void _omit;
+    this.episodesMap.set(episodeKey, {
+      ...rest,
+      downloadState: state,
+      ...(state === 'DONE' ? { downloadPath: `/mock/downloads/${episodeKey}.mp3` } : {}),
+    });
+    this.emit({
+      type: 'download-updated',
+      episodeKey,
+      state,
+      ...(progress !== undefined ? { progress } : {}),
+    });
+    this.emit({ type: 'episodes-changed', feedKey: ep.feedKey });
+  }
+
+  /**
+   * Test helper: the next `episodes.download(episodeKey)` call stays in flight (`QUEUED` ->
+   * `RUNNING`) until the returned control reports progress, finishes (`DONE`) or fails
+   * (`FAILED`, rejecting like the real hosts with a `network` error).
+   */
+  holdNextDownload(episodeKey: EpisodeKey): MockDownloadControl {
+    let settle: ((outcome: 'done' | 'failed') => void) | null = null;
+    const pending: PendingMockDownload = {
+      wait: new Promise<'done' | 'failed'>((resolve) => {
+        settle = resolve;
+      }),
+    };
+    this.heldDownloads.set(episodeKey, pending);
+    return {
+      progress: (ratio: number) => {
+        const ep = this.episodesMap.get(episodeKey);
+        if (ep) this.episodesMap.set(episodeKey, { ...ep, downloadState: 'RUNNING' });
+        this.emit({ type: 'download-updated', episodeKey, state: 'RUNNING', progress: ratio });
+      },
+      finish: () => settle?.('done'),
+      fail: () => settle?.('failed'),
+    };
   }
 
   private seedSampleData(): void {
@@ -1072,8 +1134,23 @@ export class MockPlatformHost implements PlatformHost {
     download: async (episodeKey) => {
       const ep = this.episodesMap.get(episodeKey);
       if (!ep) throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
+      const held = this.heldDownloads.get(episodeKey);
+      if (held) {
+        this.heldDownloads.delete(episodeKey);
+        this.episodesMap.set(episodeKey, { ...ep, downloadState: 'QUEUED' });
+        this.emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
+        const outcome = await held.wait;
+        if (outcome === 'failed') {
+          const cur = this.episodesMap.get(episodeKey) ?? ep;
+          this.episodesMap.set(episodeKey, { ...cur, downloadState: 'FAILED' });
+          const err = new MiniPodError('network', 'unexpected end of stream');
+          this.emit({ type: 'download-updated', episodeKey, state: 'FAILED', error: err.toShape() });
+          this.emit({ type: 'episodes-changed', feedKey: ep.feedKey });
+          throw err;
+        }
+      }
       const updated: Episode = {
-        ...ep,
+        ...(this.episodesMap.get(episodeKey) ?? ep),
         downloadState: 'DONE',
         downloadPath: `/mock/downloads/${episodeKey}.mp3`,
       };

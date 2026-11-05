@@ -207,7 +207,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     if (ev.type === 'download-updated') {
       // Patch every cached slice first so `recomputeHostTimelineAndDownloads` (which walks all
       // cached feeds) never re-adds a deleted download from another feed's stale rows.
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state);
+      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
     }
     if (
       ev.type === 'feeds-changed' ||

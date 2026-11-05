@@ -1,6 +1,7 @@
 /**
  * Minimalist gesture-driven episode row (`v0.1.8`):
  * - Strictly 4 visual elements: `44×44` cover icon, 2-line clamped title, publish date, and remaining time
+ *   (plus, only while relevant, a `{percent}%` download badge or a `继续下载` pill for FAILED downloads)
  * - Zero inline action buttons
  * - Tap / click directly plays (or toggles pause if current)
  * - Long-press (~450ms) / right-click / keyboard (`ContextMenu` / `Shift+F10`) opens viewport-clamped `<ContextMenu>`
@@ -21,12 +22,20 @@ import {
   type IconName,
   type MenuEntry,
 } from '../../components/m3';
+import {
+  DetailDownloadStatus,
+  DownloadPercentText,
+  DownloadProgressRing,
+  ResumeDownloadChip,
+} from '../../components/DownloadControls';
+import { useEpisodeDownloadStatus } from '../../hooks/useEpisodeDownloadStatus';
 import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
+import { downloadRatioToPercent } from '../../stores/view-cache';
 
 type InlineUndoState =
   | { readonly kind: 'play-next' }
@@ -59,7 +68,7 @@ export function EpisodeRow({
   row,
   feedTitle,
   feedImageUrl,
-  allowDownloads: _allowDownloads,
+  allowDownloads,
   removeWhenQueued,
   onOpenPodcast,
   onStartInlineRemove,
@@ -72,7 +81,6 @@ export function EpisodeRow({
   onDeleteDownload,
   onChanged,
 }: EpisodeRowProps) {
-  void _allowDownloads;
   const host = useHost();
   const locale = useLocale();
   const t = useT();
@@ -102,6 +110,42 @@ export function EpisodeRow({
     (isCurrent ? player.snapshot.durationMs : undefined) ?? progress?.durationMs ?? episode.durationMs;
 
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
+
+  const { state: downloadState, ratio: downloadRatio } = useEpisodeDownloadStatus(
+    episode.episodeKey,
+    episode.downloadState,
+  );
+  const canDownloadEpisode =
+    allowDownloads &&
+    Boolean(host.info.capabilities.downloads) &&
+    !episode.feedKey.startsWith('l_') &&
+    Boolean(episode.enclosureUrl) &&
+    !episode.enclosureUrl?.startsWith('content://');
+  const isDownloading =
+    canDownloadEpisode && (downloadState === 'RUNNING' || downloadState === 'QUEUED');
+  const isDownloadFailed = canDownloadEpisode && downloadState === 'FAILED';
+  const downloadPercent = downloadRatioToPercent(downloadRatio);
+
+  /** `继续下载`: resumes the failed `.part` (HTTP `Range`); a repeated failure shows `下载失败`. */
+  const handleResumeDownload = async () => {
+    try {
+      await host.episodes.download(episode.episodeKey);
+    } catch {
+      showSnackbar(t('queue.downloadFailed'));
+    } finally {
+      onChanged();
+    }
+  };
+
+  const handleStopDownload = async () => {
+    try {
+      await host.episodes.deleteDownload(episode.episodeKey);
+    } catch {
+      // ignore: the next revalidation shows the real state
+    } finally {
+      onChanged();
+    }
+  };
 
   const handlePlayToggle = () => {
     if (isCurrent) {
@@ -355,11 +399,34 @@ export function EpisodeRow({
 
             <div className="m-episode-row__body">
               <div className="m-episode-row__title">{episode.title}</div>
-              {(dateStr || remStr) && (
+              {(dateStr || remStr || isDownloading || isDownloadFailed) && (
                 <div className="m-episode-row__meta">
                   {dateStr && <span>{dateStr}</span>}
                   {dateStr && remStr && <span>·</span>}
                   {remStr && <span>{remStr}</span>}
+                  {isDownloading && (
+                    <span
+                      className="m-queue-cache-status is-downloading"
+                      title={t('queue.cachingProgress', { percent: downloadPercent })}
+                      data-testid={`ep-download-progress-${episode.episodeKey}`}
+                      data-cache-state="downloading"
+                      data-cache-progress={downloadPercent}
+                    >
+                      <DownloadPercentText percent={downloadPercent} />
+                      <DownloadProgressRing ratio={downloadRatio ?? 0} withStop={false} />
+                    </span>
+                  )}
+                  {isDownloadFailed && (
+                    <ResumeDownloadChip
+                      label={t('queue.resumeDownload')}
+                      ariaLabel={t('detail.resumeDownload')}
+                      title={`${t('queue.downloadFailed')} · ${t('detail.resumeDownload')}`}
+                      testId={`ep-resume-download-${episode.episodeKey}`}
+                      onResume={() => {
+                        void handleResumeDownload();
+                      }}
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -471,6 +538,13 @@ export function EpisodeRow({
                   {remStr && <span>{remStr}</span>}
                 </div>
               )}
+              <DetailDownloadStatus
+                state={isDownloading ? 'downloading' : isDownloadFailed ? 'failed' : null}
+                ratio={downloadRatio ?? 0}
+                downloadingLabel={t('detail.downloadingProgress', { percent: downloadPercent })}
+                failedLabel={t('queue.downloadFailed')}
+                testId={`ep-detail-download-status-${episode.episodeKey}`}
+              />
             </div>
           </div>
 
@@ -495,6 +569,30 @@ export function EpisodeRow({
             >
               {inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')}
             </Button>
+            {isDownloadFailed && (
+              <Button
+                variant="tonal"
+                icon="download"
+                data-testid={`ep-detail-resume-download-${episode.episodeKey}`}
+                onClick={() => {
+                  void handleResumeDownload();
+                }}
+              >
+                {t('detail.resumeDownload')}
+              </Button>
+            )}
+            {isDownloading && (
+              <Button
+                variant="tonal"
+                icon="stop"
+                data-testid={`ep-detail-stop-download-${episode.episodeKey}`}
+                onClick={() => {
+                  void handleStopDownload();
+                }}
+              >
+                {t('detail.stopDownload')}
+              </Button>
+            )}
             {onOpenPodcast && (
               <Button
                 variant="outlined"

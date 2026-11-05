@@ -310,6 +310,8 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
     emit,
   });
   downloaderRef = downloader;
+  // Interrupted (process-killed) downloads resume via `继续下载` instead of a stuck ring.
+  downloader.failStaleInFlightDownloads();
 
   let refresherRef: FeedRefresher | null = null;
 
