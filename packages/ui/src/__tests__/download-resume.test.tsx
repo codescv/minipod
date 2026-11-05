@@ -197,19 +197,30 @@ describe('Download percentage + 继续下载 (resume failed downloads)', () => {
     expect(await screen.findByTestId(`queue-resume-download-${thirdKey}`)).toBeInTheDocument();
     expect(await screen.findByTestId('snackbar')).toHaveTextContent('Download failed');
 
-    // Detail sheet -> Resume download -> DONE
+    // Detail sheet -> Resume download -> live % -> DONE, still live after leaving the queue
     fireEvent.contextMenu(screen.getByTestId('queue-row-2'), { clientX: 120, clientY: 220 });
     fireEvent.click(screen.getByTestId(`queue-view-details-${thirdKey}`));
     const resumeBtn = await screen.findByTestId(`ep-detail-resume-download-${thirdKey}`);
     expect(resumeBtn).toHaveTextContent('Resume download');
-    fireEvent.click(resumeBtn);
-    await waitFor(() => {
-      expect(screen.getByTestId(`queue-cache-status-${thirdKey}`)).toHaveAttribute('data-cache-state', 'done');
+    fireEvent.click(screen.getByTestId(`ep-detail-queue-${thirdKey}`));
+    await waitFor(async () => {
+      expect(await host.queue.list()).toHaveLength(2);
     });
     await waitFor(() => {
-      expect(screen.queryByTestId(`ep-detail-resume-download-${thirdKey}`)).not.toBeInTheDocument();
+      expect(screen.getByTestId(`ep-detail-queue-${thirdKey}`)).toHaveTextContent('Add to queue');
     });
-    expect(screen.queryByTestId(`ep-detail-download-status-${thirdKey}`)).not.toBeInTheDocument();
+    const resumed = host.holdNextDownload(thirdKey);
+    fireEvent.click(screen.getByTestId(`ep-detail-resume-download-${thirdKey}`));
+    act(() => resumed.progress(0.64));
+    expect(screen.getByTestId(`ep-detail-download-status-${thirdKey}`)).toHaveTextContent('Downloading 64%');
+    expect(screen.queryByTestId(`ep-detail-resume-download-${thirdKey}`)).not.toBeInTheDocument();
+    expect(screen.getByTestId(`ep-detail-stop-download-${thirdKey}`)).toBeInTheDocument();
+    act(() => resumed.finish());
+    await waitFor(() => {
+      expect(screen.queryByTestId(`ep-detail-download-status-${thirdKey}`)).not.toBeInTheDocument();
+    });
+    expect(screen.queryByTestId(`ep-detail-resume-download-${thirdKey}`)).not.toBeInTheDocument();
+    expect((await host.episodes.get(thirdKey)).episode.downloadState).toBe('DONE');
   });
 
   it('Podcast detail EpisodeRow shows `{percent}%` while downloading and a 继续下载 pill (+ detail sheet button) when FAILED; NONE/DONE rows stay minimal', async () => {
@@ -239,6 +250,21 @@ describe('Download percentage + 继续下载 (resume failed downloads)', () => {
       host.emit({ type: 'download-updated', episodeKey: runningKey, state: 'RUNNING', progress: 0.57 });
     });
     expect(screen.getByTestId(`ep-download-progress-${runningKey}`)).toHaveTextContent('57%');
+    // The `%` pill is a stop control (role=button, stop square) that never plays the row
+    const pill = screen.getByTestId(`ep-download-progress-${runningKey}`);
+    expect(pill).toHaveAttribute('role', 'button');
+    expect(pill).toHaveAttribute('aria-label', '停止下载');
+    expect(pill.querySelectorAll('rect')).toHaveLength(1);
+    expect(rowOf(/40: Live Studio Walkthrough/).querySelectorAll('button')).toHaveLength(0);
+    const deleteSpy = vi.spyOn(host.episodes, 'deleteDownload');
+    fireEvent.pointerDown(pill);
+    fireEvent.click(pill);
+    expect(deleteSpy).toHaveBeenCalledWith(runningKey);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`ep-download-progress-${runningKey}`)).not.toBeInTheDocument();
+    });
+    expect((await host.episodes.get(runningKey)).episode.downloadState).toBe('NONE');
+    expect(engine.getSnapshot().playing).toBe(false);
 
     // FAILED -> 继续下载 pill in the row meta (no nested <button>)
     act(() => host.setEpisodeDownloadState(failedKey, 'FAILED'));

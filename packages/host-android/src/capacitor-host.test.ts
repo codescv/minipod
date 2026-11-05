@@ -883,6 +883,54 @@ describe('CapacitorPlatformHost', () => {
     await second.host.dispose();
   });
 
+  it('deduplicates concurrent download(epKey) calls (double-tapped 继续下载) into a single native transfer, and a stop + resume starts a fresh one', async () => {
+    const harness = createTestPluginHarness();
+    const pending: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
+    harness.plugin.httpToFile = vi.fn(
+      (req) =>
+        new Promise<{ path: string; size: number }>((resolve, reject) => {
+          pending.push({
+            resolve: () => resolve({ path: `/data/user/0/dev.minipod.app/files/${req.destPath}`, size: 1 }),
+            reject,
+          });
+        }),
+    );
+    harness.plugin.cancelDownload = vi.fn(async () => {
+      pending.shift()?.reject(Object.assign(new Error('Download cancelled'), { code: 'cancelled' }));
+    });
+    const { host, db } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-download-dedup-test',
+      preferences: createMemoryPreferences(),
+    });
+    const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+    const ep1Key = deriveEpisodeKey(feed.feedKey, 'ep-1');
+
+    const a = host.episodes.download(ep1Key);
+    const b = host.episodes.download(ep1Key);
+    await vi.waitFor(() => {
+      expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(1);
+    });
+    const c = host.episodes.download(ep1Key);
+    await Promise.resolve();
+    expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(1);
+
+    // Stop, then immediately resume: the cancelled transfer settles first, then a fresh one starts.
+    await host.episodes.deleteDownload(ep1Key);
+    await Promise.all([a, b, c]);
+    expect((await db.get('episodes', ep1Key))?.downloadState).toBe('NONE');
+    const d = host.episodes.download(ep1Key);
+    await vi.waitFor(() => {
+      expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(2);
+    });
+    pending.shift()?.resolve();
+    await d;
+    expect((await db.get('episodes', ep1Key))?.downloadState).toBe('DONE');
+
+    await host.dispose();
+  });
+
   describe('Airplane Mode: downloaded audio -> background -> pause -> foreground -> Play (v0.1.21 bug)', () => {
     async function setupOfflinePlayback(dbName: string) {
       const harness = createTestPluginHarness();

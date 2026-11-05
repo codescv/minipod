@@ -938,13 +938,26 @@ textarea,
 /* v0.1.29: visible `{percent}%` next to the ring while downloading (Android has no hover title). */
 .m-queue-cache-status.is-downloading {
   width: auto;
+  height: auto;
   min-width: 14px;
+  min-height: 20px;
   gap: 4px;
   padding: 2px 6px 2px 7px;
-  margin: -2px 0;
+  margin: -3px 0;
   border-radius: var(--md-sys-shape-corner-full);
   background: color-mix(in srgb, var(--md-sys-color-primary) 10%, transparent);
   -webkit-tap-highlight-color: transparent;
+}
+
+/* Tappable (stop) badge: expand the touch target to ~36px tall without growing the row. */
+.m-queue-cache-status.is-downloading[role='button'] {
+  position: relative;
+}
+
+.m-queue-cache-status.is-downloading[role='button']::before {
+  content: '';
+  position: absolute;
+  inset: -8px -4px;
 }
 
 .m-queue-cache-status.is-downloading[role='button']:focus-visible,

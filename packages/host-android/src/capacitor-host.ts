@@ -1059,7 +1059,10 @@ export async function createCapacitorPlatformHost(
           : declaredTotal !== undefined
             ? // RSS sizes are often approximate: cap at 99% until the transfer really completes.
               Math.min(0.99, Math.max(0, ev.bytesDownloaded / declaredTotal))
-            : undefined;
+            : ev.bytesDownloaded <= 0
+              ? // Unknown size but a (re)start from scratch (e.g. 416 / 200 restart): reset to 0%.
+                0
+              : undefined;
       emit({
         type: 'download-updated',
         episodeKey: ev.episodeKey,
@@ -1068,6 +1071,82 @@ export async function createCapacitorPlatformHost(
       });
     },
   );
+
+  /** In-flight `episodes.download` transfers (deduplicated per episode). */
+  const inFlightDownloads = new Map<EpisodeKey, Promise<void>>();
+  const runEpisodeDownload = async (episodeKey: EpisodeKey): Promise<void> => {
+    const ep = await syncStore.getEpisodeRecord(episodeKey);
+    if (!ep) {
+      throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
+    }
+    if (ep.feedKey.startsWith('l_') || ep.enclosureUrl?.startsWith('content://')) {
+      return;
+    }
+    if (!ep.enclosureUrl) {
+      throw new MiniPodError('invalid-argument', `Episode ${episodeKey} has no enclosure URL`);
+    }
+    if (ep.downloadState === 'DONE' && ep.downloadPath) {
+      return;
+    }
+
+    const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(ep.enclosureUrl);
+    const storedCreds = await secretsStore.getFeedCredentials(ep.feedKey);
+    const creds = inlineCreds ?? storedCreds;
+    const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
+    const destPath = `downloads/${episodeKey}.${ext}`;
+
+    cancelledDownloads.delete(episodeKey);
+    lastDownloadEmitAt.delete(episodeKey);
+    if (ep.enclosureSize !== undefined && ep.enclosureSize > 0) {
+      inFlightEnclosureSize.set(episodeKey, ep.enclosureSize);
+    } else {
+      inFlightEnclosureSize.delete(episodeKey);
+    }
+    await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
+    emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
+
+    const settleCancelled = async (): Promise<void> => {
+      await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
+      emit({ type: 'download-updated', episodeKey, state: 'NONE' });
+    };
+
+    try {
+      const res = await plugin.httpToFile({
+        episodeKey,
+        url: cleanUrl,
+        destPath,
+        headers: { 'User-Agent': userAgent },
+        ...(creds !== undefined ? { auth: creds } : {}),
+      });
+      if (cancelledDownloads.has(episodeKey)) {
+        // User stopped the download right as it finished: discard the file and stay `NONE`.
+        await plugin.deleteLocalFile({ path: res.path }).catch(() => undefined);
+        await settleCancelled();
+        return;
+      }
+      await syncStore.setEpisodeDownloadState(episodeKey, 'DONE', res.path);
+      emit({ type: 'download-updated', episodeKey, state: 'DONE', progress: 1 });
+      emit({ type: 'episodes-changed', feedKey: ep.feedKey });
+      await syncNativeQueue();
+    } catch (err) {
+      const wrapped = MiniPodError.wrap(err, 'network');
+      if (cancelledDownloads.has(episodeKey) || wrapped.code === 'cancelled') {
+        await settleCancelled();
+        return;
+      }
+      await syncStore.setEpisodeDownloadState(episodeKey, 'FAILED');
+      emit({
+        type: 'download-updated',
+        episodeKey,
+        state: 'FAILED',
+        error: wrapped.toShape(),
+      });
+      throw wrapped;
+    } finally {
+      lastDownloadEmitAt.delete(episodeKey);
+      inFlightEnclosureSize.delete(episodeKey);
+    }
+  };
 
   // Chapters & embedded chapter images (`data:` URLs on Android per `types.ts` line 791)
   const readLocalByteSlice = async (
@@ -1476,77 +1555,20 @@ export async function createCapacitorPlatformHost(
       },
 
       async download(episodeKey: EpisodeKey): Promise<void> {
-        const ep = await syncStore.getEpisodeRecord(episodeKey);
-        if (!ep) {
-          throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
+        // One transfer per episode: a double-tapped `继续下载` (or overlapping auto-download) must
+        // never run two native `httpToFile` tasks on the same `.part` file.
+        let existing = inFlightDownloads.get(episodeKey);
+        if (existing && cancelledDownloads.has(episodeKey)) {
+          // Stopped but not settled yet: let it settle (`NONE`) before starting a fresh transfer.
+          await existing.catch(() => undefined);
+          existing = inFlightDownloads.get(episodeKey);
         }
-        if (ep.feedKey.startsWith('l_') || ep.enclosureUrl?.startsWith('content://')) {
-          return;
-        }
-        if (!ep.enclosureUrl) {
-          throw new MiniPodError('invalid-argument', `Episode ${episodeKey} has no enclosure URL`);
-        }
-        if (ep.downloadState === 'DONE' && ep.downloadPath) {
-          return;
-        }
-
-        const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(ep.enclosureUrl);
-        const storedCreds = await secretsStore.getFeedCredentials(ep.feedKey);
-        const creds = inlineCreds ?? storedCreds;
-        const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
-        const destPath = `downloads/${episodeKey}.${ext}`;
-
-        cancelledDownloads.delete(episodeKey);
-        lastDownloadEmitAt.delete(episodeKey);
-        if (ep.enclosureSize !== undefined && ep.enclosureSize > 0) {
-          inFlightEnclosureSize.set(episodeKey, ep.enclosureSize);
-        } else {
-          inFlightEnclosureSize.delete(episodeKey);
-        }
-        await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
-        emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
-
-        const settleCancelled = async (): Promise<void> => {
-          await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
-          emit({ type: 'download-updated', episodeKey, state: 'NONE' });
-        };
-
-        try {
-          const res = await plugin.httpToFile({
-            episodeKey,
-            url: cleanUrl,
-            destPath,
-            headers: { 'User-Agent': userAgent },
-            ...(creds !== undefined ? { auth: creds } : {}),
-          });
-          if (cancelledDownloads.has(episodeKey)) {
-            // User stopped the download right as it finished: discard the file and stay `NONE`.
-            await plugin.deleteLocalFile({ path: res.path }).catch(() => undefined);
-            await settleCancelled();
-            return;
-          }
-          await syncStore.setEpisodeDownloadState(episodeKey, 'DONE', res.path);
-          emit({ type: 'download-updated', episodeKey, state: 'DONE', progress: 1 });
-          emit({ type: 'episodes-changed', feedKey: ep.feedKey });
-          await syncNativeQueue();
-        } catch (err) {
-          const wrapped = MiniPodError.wrap(err, 'network');
-          if (cancelledDownloads.has(episodeKey) || wrapped.code === 'cancelled') {
-            await settleCancelled();
-            return;
-          }
-          await syncStore.setEpisodeDownloadState(episodeKey, 'FAILED');
-          emit({
-            type: 'download-updated',
-            episodeKey,
-            state: 'FAILED',
-            error: wrapped.toShape(),
-          });
-          throw wrapped;
-        } finally {
-          lastDownloadEmitAt.delete(episodeKey);
-          inFlightEnclosureSize.delete(episodeKey);
-        }
+        if (existing) return existing;
+        const transfer: Promise<void> = runEpisodeDownload(episodeKey).finally(() => {
+          if (inFlightDownloads.get(episodeKey) === transfer) inFlightDownloads.delete(episodeKey);
+        });
+        inFlightDownloads.set(episodeKey, transfer);
+        return transfer;
       },
 
       async deleteDownload(episodeKey: EpisodeKey): Promise<void> {

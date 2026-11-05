@@ -27,6 +27,7 @@ import {
   DownloadPercentText,
   DownloadProgressRing,
   ResumeDownloadChip,
+  inlineRowActionProps,
 } from '../../components/DownloadControls';
 import { useEpisodeDownloadStatus } from '../../hooks/useEpisodeDownloadStatus';
 import { useRowGestures } from '../../hooks/useRowGestures';
@@ -407,13 +408,20 @@ export function EpisodeRow({
                   {isDownloading && (
                     <span
                       className="m-queue-cache-status is-downloading"
-                      title={t('queue.cachingProgress', { percent: downloadPercent })}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={t('detail.stopDownload')}
+                      title={`${t('queue.cachingProgress', { percent: downloadPercent })} · ${t('detail.stopDownload')}`}
                       data-testid={`ep-download-progress-${episode.episodeKey}`}
                       data-cache-state="downloading"
                       data-cache-progress={downloadPercent}
+                      style={{ cursor: 'pointer' }}
+                      {...inlineRowActionProps(() => {
+                        void handleStopDownload();
+                      })}
                     >
                       <DownloadPercentText percent={downloadPercent} />
-                      <DownloadProgressRing ratio={downloadRatio ?? 0} withStop={false} />
+                      <DownloadProgressRing ratio={downloadRatio ?? 0} withStop />
                     </span>
                   )}
                   {isDownloadFailed && (

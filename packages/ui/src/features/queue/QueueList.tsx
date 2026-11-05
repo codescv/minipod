@@ -183,6 +183,12 @@ export function QueueList() {
       // cleared on DONE/NONE) so a remount mid-download never flashes back to `0%`.
       applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
       setDownloadProgressByKey(new Map(getHostViewCache(host).downloadProgressByKey));
+      // Keep an open `episode-detail-sheet` live even after its episode left the queue.
+      setDetailsSnapshot((prev) =>
+        prev && prev.episode.episodeKey === ev.episodeKey && prev.episode.downloadState !== ev.state
+          ? { ...prev, episode: { ...prev.episode, downloadState: ev.state } }
+          : prev,
+      );
       setRows((prev) => {
         if (!prev.some((r) => r.episode.episodeKey === ev.episodeKey)) return prev;
         const next = prev.map((r) =>
@@ -507,7 +513,7 @@ export function QueueList() {
     if (!canDownload || downloadableRows.length === 0) return;
     const keys = downloadableRows.map((r) => r.episode.episodeKey);
     await Promise.allSettled(keys.map((key) => host.episodes.download(key)));
-    await loadQueue();
+    await loadQueue().catch(() => undefined);
   }, [canDownload, downloadableRows, host.episodes, loadQueue]);
 
   const downloadingRows = canDownload
@@ -519,8 +525,17 @@ export function QueueList() {
   /** Optimistically flips the given episodes to `downloadState: 'NONE'` and clears their progress. */
   const markDownloadsStopped = useCallback(
     (keySet: ReadonlySet<EpisodeKey>) => {
-      const cachedProgress = getHostViewCache(host).downloadProgressByKey;
-      for (const key of keySet) cachedProgress.delete(key);
+      for (const key of keySet) {
+        // Wins over any `loadQueue()` already in flight (it must not revert the row to RUNNING).
+        downloadEventSeqRef.current += 1;
+        lastDownloadEventRef.current.set(key, { seq: downloadEventSeqRef.current, state: 'NONE' });
+        applyDownloadStateToViewCache(host, key, 'NONE');
+      }
+      setDetailsSnapshot((prev) =>
+        prev && keySet.has(prev.episode.episodeKey)
+          ? { ...prev, episode: { ...prev.episode, downloadState: 'NONE' as const } }
+          : prev,
+      );
       setDownloadProgressByKey((prev) => {
         let changed = false;
         const next = new Map(prev);
@@ -548,8 +563,10 @@ export function QueueList() {
       markDownloadsStopped(new Set([epKey]));
       try {
         await host.episodes.deleteDownload(epKey);
+      } catch {
+        // ignore: the revalidation below shows the real state
       } finally {
-        await loadQueue();
+        await loadQueue().catch(() => undefined);
       }
     },
     [host.episodes, loadQueue, markDownloadsStopped],
@@ -579,7 +596,7 @@ export function QueueList() {
     const keySet = new Set(keys);
     markDownloadsStopped(keySet);
     await Promise.allSettled(keys.map((key) => host.episodes.deleteDownload(key)));
-    await loadQueue();
+    await loadQueue().catch(() => undefined);
   }, [canDownload, downloadingRows, host.episodes, loadQueue, markDownloadsStopped]);
 
   const headerMenuItems: MenuEntry[] = [
