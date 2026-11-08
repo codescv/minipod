@@ -4,6 +4,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import android.view.KeyEvent;
 import androidx.media3.common.C;
 import androidx.media3.common.Player;
 import java.lang.reflect.Proxy;
@@ -77,9 +78,19 @@ public class LockScreenSessionPlayerTest {
                         case "seekToPrevious":
                         case "seekToNextMediaItem":
                         case "seekToPreviousMediaItem":
-                        case "play":
-                        case "pause":
                             calls.add(method.getName());
+                            return null;
+                        case "play":
+                            calls.add("play");
+                            playWhenReady = true;
+                            return null;
+                        case "pause":
+                            calls.add("pause");
+                            playWhenReady = false;
+                            return null;
+                        case "setPlayWhenReady":
+                            calls.add("setPlayWhenReady:" + args[0]);
+                            playWhenReady = (Boolean) args[0];
                             return null;
                         case "hashCode":
                             return System.identityHashCode(proxy);
@@ -134,6 +145,13 @@ public class LockScreenSessionPlayerTest {
         @Override
         public long durationHintMs() {
             return durationHintMs;
+        }
+
+        int sessionPlayCalls = 0;
+
+        @Override
+        public void onSessionPlay() {
+            sessionPlayCalls++;
         }
     }
 
@@ -489,5 +507,354 @@ public class LockScreenSessionPlayerTest {
         }
         assertTrue(wrapper.equals(wrapper));
         assertFalse(wrapper.equals(p.wrapListener(new Player.Listener() {})));
+    }
+
+    // -------------------------------------------------------------------------
+    // bc737679: session / headset Play in every state (paused READY, unprepared or post-error IDLE,
+    // empty-but-restorable, ENDED) + Play/Pause key mapping.
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void play_onPausedReady_justPlays_noPrepareNoSeek() {
+        FakePlayer fake = new FakePlayer();
+        fake.positionMs = 42_000L;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(List.of("play"), fake.calls);
+        assertEquals(42_000L, fake.positionMs);
+        assertTrue(fake.playWhenReady);
+        assertEquals(1, host.sessionPlayCalls);
+        assertEquals(0, host.restoreCalls);
+    }
+
+    @Test
+    public void play_onRestoredUnpreparedIdleTrack_preparesAtRestoredPosition() {
+        // `onCreate` -> restoreLastTrackIfNeeded(false): item set at 42 s, never prepared.
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_IDLE;
+        fake.positionMs = 42_000L;
+        FakeHost host = new FakeHost(fake);
+        host.lastKnownPositionMs = 42_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(List.of("prepare", "play"), fake.calls);
+        assertEquals(42_000L, fake.positionMs);
+        assertEquals(1, host.sessionPlayCalls);
+    }
+
+    @Test
+    public void play_onIdleAfterErrorReportingZero_reseeksToPausedPositionThenPrepares() {
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_IDLE;
+        fake.playWhenReady = true; // ExoPlayer keeps playWhenReady after a playback error
+        fake.positionMs = 0L;
+        FakeHost host = new FakeHost(fake);
+        host.lastKnownPositionMs = 125_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(List.of("seekTo:125000", "prepare", "play"), fake.calls);
+        assertEquals(125_000L, fake.positionMs);
+    }
+
+    @Test
+    public void play_onIdle_tinyDriftIsNotReseeked_andNeverSeeksBackwards() {
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_IDLE;
+        fake.positionMs = 60_300L;
+        FakeHost host = new FakeHost(fake);
+        host.lastKnownPositionMs = 60_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(List.of("prepare", "play"), fake.calls);
+        assertEquals(60_300L, fake.positionMs);
+    }
+
+    @Test
+    public void play_onEmptyPlayerWithLastTrack_restoresThenPlays() {
+        FakePlayer fake = new FakePlayer();
+        fake.mediaItemCount = 0;
+        fake.playbackState = Player.STATE_IDLE;
+        FakeHost host = new FakeHost(fake);
+        host.restorable = true;
+        host.restoredPositionMs = 1_234_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(1, host.restoreCalls);
+        assertEquals(List.of("restore", "play"), fake.calls);
+        assertEquals(1_234_000L, fake.positionMs);
+        assertEquals(1, host.sessionPlayCalls);
+    }
+
+    @Test
+    public void play_onEmptyPlayerWithNothingToRestore_isNoOp() {
+        FakePlayer fake = new FakePlayer();
+        fake.mediaItemCount = 0;
+        fake.playbackState = Player.STATE_IDLE;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+        p.prepare();
+
+        assertTrue(fake.calls.isEmpty());
+        assertFalse(fake.playWhenReady);
+        assertEquals(0, host.sessionPlayCalls);
+    }
+
+    @Test
+    public void play_onEndedEpisode_restartsFromZero() {
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_ENDED;
+        fake.playWhenReady = true;
+        fake.positionMs = 600_000L;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.play();
+
+        assertEquals(List.of("seekTo:0", "play"), fake.calls);
+        assertEquals(0L, fake.positionMs);
+    }
+
+    @Test
+    public void setPlayWhenReady_trueRoutesThroughRobustPlay_falseForwards() {
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_IDLE;
+        fake.positionMs = 30_000L;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.setPlayWhenReady(true);
+        assertEquals(List.of("prepare", "play"), fake.calls);
+        assertEquals(1, host.sessionPlayCalls);
+
+        p.setPlayWhenReady(false);
+        assertEquals("setPlayWhenReady:false", fake.calls.get(fake.calls.size() - 1));
+        assertFalse(fake.playWhenReady);
+    }
+
+    @Test
+    public void prepareThenPlay_likeMediaUtilHandlePlayButtonAction_preparesOnce() {
+        // Media3 `Util.handlePlayButtonAction`: prepare() when IDLE, then play().
+        FakePlayer fake = new FakePlayer();
+        fake.playbackState = Player.STATE_IDLE;
+        fake.positionMs = 0L;
+        FakeHost host = new FakeHost(fake);
+        host.lastKnownPositionMs = 90_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.prepare();
+        p.play();
+
+        assertEquals(List.of("seekTo:90000", "prepare", "play"), fake.calls);
+        assertEquals(90_000L, fake.positionMs);
+    }
+
+    @Test
+    public void prepare_onEmptyRestorablePlayer_restores_andDoesNotPlay() {
+        FakePlayer fake = new FakePlayer();
+        fake.mediaItemCount = 0;
+        fake.playbackState = Player.STATE_IDLE;
+        FakeHost host = new FakeHost(fake);
+        host.restorable = true;
+        host.restoredPositionMs = 5_000L;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.prepare();
+
+        assertEquals(List.of("restore"), fake.calls);
+        assertFalse(fake.playWhenReady);
+        assertEquals(0, host.sessionPlayCalls);
+    }
+
+    @Test
+    public void isCommandAvailable_playPauseAndPrepareServedWhenLoadedOrRestorable() {
+        FakePlayer fake = new FakePlayer();
+        fake.mediaItemCount = 0;
+        fake.playbackState = Player.STATE_IDLE;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        // Wrapped player reports neither; nothing restorable -> wrapped answer.
+        assertFalse(p.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+        assertFalse(p.isCommandAvailable(Player.COMMAND_PREPARE));
+
+        host.restorable = true;
+        assertTrue(p.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+        assertTrue(p.isCommandAvailable(Player.COMMAND_PREPARE));
+
+        host.restorable = false;
+        fake.mediaItemCount = 1;
+        assertTrue(p.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+        assertTrue(p.isCommandAvailable(Player.COMMAND_PREPARE));
+        assertTrue(fake.calls.isEmpty());
+
+        assertTrue(LockScreenSessionPlayer.isServedTransportCommand(Player.COMMAND_PLAY_PAUSE));
+        assertTrue(LockScreenSessionPlayer.isServedTransportCommand(Player.COMMAND_PREPARE));
+        assertFalse(LockScreenSessionPlayer.isServedTransportCommand(Player.COMMAND_STOP));
+    }
+
+    // --- Headset / Bluetooth keys through `handlePlayPauseKey` (what PlaybackService dispatches) ---
+
+    private static final int[] RESUME_KEYS = {
+        KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK,
+    };
+
+    @Test
+    public void headsetResumeKeys_resumePausedReady() {
+        for (int key : RESUME_KEYS) {
+            FakePlayer fake = new FakePlayer();
+            fake.positionMs = 42_000L;
+            FakeHost host = new FakeHost(fake);
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertTrue("key " + key, fake.playWhenReady);
+            assertEquals(List.of("play"), fake.calls);
+            assertEquals(42_000L, fake.positionMs);
+        }
+    }
+
+    @Test
+    public void headsetResumeKeys_resumeRestoredUnpreparedIdle_keepingPausedPosition() {
+        for (int key : RESUME_KEYS) {
+            FakePlayer fake = new FakePlayer();
+            fake.playbackState = Player.STATE_IDLE;
+            fake.positionMs = 0L; // masked position lost
+            FakeHost host = new FakeHost(fake);
+            host.lastKnownPositionMs = 754_000L;
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertEquals("key " + key, List.of("seekTo:754000", "prepare", "play"), fake.calls);
+            assertEquals(754_000L, fake.positionMs);
+        }
+    }
+
+    @Test
+    public void headsetPlayPause_afterErrorIdleWithPlayWhenReady_resumesInsteadOfPausing() {
+        // Media3 1.5.1's default would toggle on playWhenReady alone and *pause* here.
+        for (int key : new int[] {KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK}) {
+            FakePlayer fake = new FakePlayer();
+            fake.playbackState = Player.STATE_IDLE;
+            fake.playWhenReady = true;
+            fake.positionMs = 300_000L;
+            FakeHost host = new FakeHost(fake);
+            host.lastKnownPositionMs = 300_000L;
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertEquals(List.of("prepare", "play"), fake.calls);
+            assertFalse(fake.calls.contains("pause"));
+        }
+    }
+
+    @Test
+    public void headsetResumeKeys_onEmptyPlayerWithLastTrack_restoreAndPlay() {
+        for (int key : RESUME_KEYS) {
+            FakePlayer fake = new FakePlayer();
+            fake.mediaItemCount = 0;
+            fake.playbackState = Player.STATE_IDLE;
+            FakeHost host = new FakeHost(fake);
+            host.restorable = true;
+            host.restoredPositionMs = 61_000L;
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertEquals(List.of("restore", "play"), fake.calls);
+            assertEquals(61_000L, fake.positionMs);
+            assertEquals(1, host.sessionPlayCalls);
+        }
+    }
+
+    @Test
+    public void headsetResumeKeys_onEndedEpisode_restartFromZero() {
+        for (int key : RESUME_KEYS) {
+            FakePlayer fake = new FakePlayer();
+            fake.playbackState = Player.STATE_ENDED;
+            fake.playWhenReady = true;
+            fake.positionMs = 600_000L;
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), new FakeHost(fake));
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertEquals(List.of("seekTo:0", "play"), fake.calls);
+        }
+    }
+
+    @Test
+    public void headsetToggleKeys_pauseWhilePlaying_andPauseKeyPauses() {
+        for (int key : new int[] {
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK, KeyEvent.KEYCODE_MEDIA_PAUSE,
+        }) {
+            FakePlayer fake = new FakePlayer();
+            fake.playWhenReady = true; // READY + playing
+            FakeHost host = new FakeHost(fake);
+            LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+            assertTrue(p.handlePlayPauseKey(key, 0));
+            assertEquals(List.of("pause"), fake.calls);
+            assertFalse(fake.playWhenReady);
+            assertEquals(0, host.sessionPlayCalls);
+        }
+        // Buffering while playing is "playing" too.
+        FakePlayer buffering = new FakePlayer();
+        buffering.playWhenReady = true;
+        buffering.playbackState = Player.STATE_BUFFERING;
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(buffering.asPlayer(), new FakeHost(buffering));
+        assertTrue(p.handlePlayPauseKey(KeyEvent.KEYCODE_HEADSETHOOK, 0));
+        assertEquals(List.of("pause"), buffering.calls);
+    }
+
+    @Test
+    public void headsetKeys_longPressRepeatsAreConsumedButIgnored_otherKeysNotHandled() {
+        FakePlayer fake = new FakePlayer();
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), new FakeHost(fake));
+
+        assertTrue(p.handlePlayPauseKey(KeyEvent.KEYCODE_HEADSETHOOK, 3));
+        assertTrue(fake.calls.isEmpty());
+        // Seek keys / stop stay with the -10 s / +30 s mapping and Media3.
+        assertFalse(p.handlePlayPauseKey(KeyEvent.KEYCODE_MEDIA_NEXT, 0));
+        assertFalse(p.handlePlayPauseKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS, 0));
+        assertFalse(p.handlePlayPauseKey(KeyEvent.KEYCODE_MEDIA_STOP, 0));
+        assertTrue(fake.calls.isEmpty());
+    }
+
+    @Test
+    public void headsetScenario_play_pause_resume_keepsPositionAndSeeksStillWork() {
+        // play -> background -> headset pause -> (idle reset) -> headset resume -> lock-screen -10 s.
+        FakePlayer fake = new FakePlayer();
+        fake.durationMs = 600_000L;
+        FakeHost host = new FakeHost(fake);
+        LockScreenSessionPlayer p = new LockScreenSessionPlayer(fake.asPlayer(), host);
+
+        p.handlePlayPauseKey(KeyEvent.KEYCODE_MEDIA_PLAY, 0);
+        fake.positionMs = 200_000L;
+        p.handlePlayPauseKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0);
+        assertFalse(fake.playWhenReady);
+        // Network glitch / service restore leaves an idle player that reports 0.
+        fake.playbackState = Player.STATE_IDLE;
+        fake.positionMs = 0L;
+        host.lastKnownPositionMs = 200_000L;
+        p.handlePlayPauseKey(KeyEvent.KEYCODE_HEADSETHOOK, 0);
+        assertTrue(fake.playWhenReady);
+        assertEquals(200_000L, fake.positionMs);
+        fake.playbackState = Player.STATE_READY;
+
+        p.seekBack();
+        assertEquals(190_000L, fake.positionMs);
+        p.seekForward();
+        assertEquals(220_000L, fake.positionMs);
+        assertEquals(2, host.sessionPlayCalls);
     }
 }

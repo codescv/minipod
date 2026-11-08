@@ -1445,6 +1445,10 @@ public class MiniPodPlugin extends Plugin {
         }
         PlaybackService svc = PlaybackService.peekInstance();
         if (svc == null) {
+            // Service stopped (paused in the background / process restarted): keep the persisted
+            // queue current for a headless headset / Bluetooth resume (bc737679).
+            final Context appCtx = getContext().getApplicationContext();
+            ioPool.execute(() -> PlaybackService.persistQueue(appCtx, specs));
             call.resolve();
             return;
         }
@@ -1526,6 +1530,10 @@ public class MiniPodPlugin extends Plugin {
     public void mediaStop(PluginCall call) {
         PlaybackService svc = PlaybackService.peekInstance();
         if (svc == null) {
+            // Nothing running, but a headset / Bluetooth Play could still resume the persisted
+            // episode via `MediaButtonReceiver` (bc737679): forget it, like `stopPlayback()`.
+            final Context appCtx = getContext().getApplicationContext();
+            ioPool.execute(() -> PlaybackService.clearResumeState(appCtx));
             call.resolve();
             return;
         }

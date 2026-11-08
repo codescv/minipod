@@ -151,8 +151,8 @@ public final class LockScreenControls {
      * the platform session, headset NEXT / PREVIOUS (and AVRCP skip) seek like the lock-screen
      * buttons instead of being ignored. REWIND / FAST_FORWARD are handled here too (Media3 would
      * otherwise drop them while ExoPlayer reports `COMMAND_SEEK_BACK/FORWARD` unavailable, e.g. on a
-     * restored, still unprepared track). Returns 0 for keys Media3 should handle itself
-     * (play/pause, headset hook, stop, ...).
+     * restored, still unprepared track). Returns 0 for other keys (play / pause / headset hook are
+     * mapped by {@link #playPauseActionForMediaKey}; stop etc. are left to Media3).
      */
     public static long deltaForMediaKey(int keyCode) {
         switch (keyCode) {
@@ -167,6 +167,50 @@ public final class LockScreenControls {
             default:
                 return 0L;
         }
+    }
+
+    /** {@link #playPauseActionForMediaKey}: not a play / pause key (let Media3 / seek mapping handle it). */
+    public static final int MEDIA_KEY_NONE = 0;
+    /** {@link #playPauseActionForMediaKey}: resume playback. */
+    public static final int MEDIA_KEY_PLAY = 1;
+    /** {@link #playPauseActionForMediaKey}: pause playback. */
+    public static final int MEDIA_KEY_PAUSE = 2;
+
+    /**
+     * Wired / Bluetooth / TWS Play-Pause key mapping (bc737679), handled by `PlaybackService`
+     * itself instead of Media3 1.5.1's default, which (verified via `javap`):
+     * <ul>
+     *   <li>toggles `KEYCODE_MEDIA_PLAY_PAUSE` / `KEYCODE_HEADSETHOOK` on {@code playWhenReady}
+     *       alone, so after a network error (`STATE_IDLE` keeps {@code playWhenReady = true}) or at
+     *       the end of an episode (`STATE_ENDED`) the first press <i>pauses</i> a player that is
+     *       not playing — the press seems ignored;</li>
+     *   <li>delays every single press by the double-tap timeout and turns a double tap into
+     *       `seekToNext` (a track skip the notification controller is not granted);</li>
+     *   <li>dispatches through `checkNotNull(getMediaNotificationControllerInfo())`, which is not
+     *       yet connected right after `MediaButtonReceiver` cold-starts the service.</li>
+     * </ul>
+     * Play / pause then goes through `LockScreenSessionPlayer.play()` / `pause()`, which restores
+     * an empty player, re-prepares an idle one at its paused position and restarts an ended one.
+     */
+    public static int playPauseActionForMediaKey(int keyCode, boolean playWhenReady, int playbackState) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_MEDIA_PLAY:
+                return MEDIA_KEY_PLAY;
+            case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                return MEDIA_KEY_PAUSE;
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_HEADSETHOOK:
+                return shouldShowPlay(playWhenReady, playbackState) ? MEDIA_KEY_PLAY : MEDIA_KEY_PAUSE;
+            default:
+                return MEDIA_KEY_NONE;
+        }
+    }
+
+    /** True when a toggle should resume: paused, or not actually playing (idle / ended). */
+    public static boolean shouldShowPlay(boolean playWhenReady, int playbackState) {
+        return !playWhenReady
+            || playbackState == Player.STATE_IDLE
+            || playbackState == Player.STATE_ENDED;
     }
 
     /**

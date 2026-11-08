@@ -22,6 +22,7 @@ import android.view.KeyEvent;
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
 import androidx.core.app.NotificationCompat;
+import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.IntentCompat;
 import androidx.media3.common.AudioAttributes;
@@ -45,6 +46,7 @@ import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
 import androidx.media3.session.MediaStyleNotificationHelper;
 import androidx.media3.session.SessionCommand;
+import androidx.media3.session.SessionError;
 import androidx.media3.session.SessionResult;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -85,6 +87,12 @@ public class PlaybackService extends MediaSessionService {
     private static final String KEY_COMPLETED = "completed";
     /** Full `TrackSpec` (+ latest `positionMs`) of the active episode so a restarted service can resume. */
     private static final String KEY_LAST_TRACK = "lastTrack";
+    /**
+     * Remaining native queue (`setQueueTracks` items) so a headless restart (headset / Bluetooth
+     * Play via `MediaButtonReceiver`, System UI resumption) keeps marathon auto-advance (bc737679).
+     */
+    static final String KEY_LAST_QUEUE = "lastQueue";
+    private static final long PAUSED_FOREGROUND_GRACE_MS = PlaybackForegroundPolicy.PAUSED_FOREGROUND_GRACE_MS;
 
     private static final long STATE_TICK_MS = 1_000L;
     private static final long JOURNAL_CHECKPOINT_MS = 5_000L;
@@ -168,7 +176,16 @@ public class PlaybackService extends MediaSessionService {
     private ImmutableList<CommandButton> lockScreenLayout = ImmutableList.of();
     private MediaSession mediaSession;
     private PowerManager.WakeLock flushWakeLock;
-    private boolean foregroundStarted = false;
+    /**
+     * `SystemClock.elapsedRealtime()` when playback last ran (`playWhenReady && READY/BUFFERING`),
+     * `0` = not in this service instance. Drives the paused-notification foreground grace window.
+     */
+    private long lastActivePlaybackElapsedMs = 0L;
+    private boolean wasActivelyPlaying = false;
+    /** `onStartCommand` posted the placeholder; {@link #settleAfterStartCommand()} hands it back to Media3. */
+    private boolean bootstrapForegroundPending = false;
+    /** Set while re-posting the notification after Android denied a foreground (re)start. */
+    private boolean foregroundStartDenied = false;
 
     @Nullable private String activeEpisodeKey;
     @Nullable private TrackSpec activeTrackSpec;
@@ -240,6 +257,16 @@ public class PlaybackService extends MediaSessionService {
     };
 
     private final Runnable releaseWakeLockRunnable = this::releaseFlushWakeLockInternal;
+
+    /** Paused grace window over: let Media3 detach the paused notification from the foreground. */
+    private final Runnable pausedForegroundExpiryRunnable = this::refreshMediaNotification;
+
+    /**
+     * Runs after `onStartCommand` (and therefore after Media3's posted media-button dispatch and
+     * the drained `execute()` actions): stop when nothing is loaded, otherwise hand the
+     * notification back to Media3 so the placeholder never lingers.
+     */
+    private final Runnable settleAfterStartRunnable = this::settleAfterStartCommand;
 
     // -------------------------------------------------------------------------
     // Static bridge methods called by `MiniPodPlugin`
@@ -419,7 +446,8 @@ public class PlaybackService extends MediaSessionService {
     public void onCreate() {
         super.onCreate();
         instance = this;
-        foregroundStarted = false;
+        lastActivePlaybackElapsedMs = 0L;
+        wasActivelyPlaying = false;
 
         ensureNotificationChannel();
 
@@ -490,6 +518,23 @@ public class PlaybackService extends MediaSessionService {
             .build();
         addSession(mediaSession);
 
+        // Android 12+ refused a (re)promotion (`ForegroundServiceStartNotAllowedException`, caught
+        // by Media3): still post an up-to-date, non-foreground notification instead of leaving a
+        // stale one (e.g. a Pause button on a paused player).
+        setListener(new MediaSessionService.Listener() {
+            @Override
+            public void onForegroundServiceStartNotAllowedException() {
+                MAIN_HANDLER.post(() -> {
+                    foregroundStartDenied = true;
+                    try {
+                        refreshMediaNotification();
+                    } finally {
+                        foregroundStartDenied = false;
+                    }
+                });
+            }
+        });
+
         // Restore the last paused track (without preparing) so a fresh service started by
         // `mediaPlay` / `mediaSeekTo` after Android killed it in the background can resume.
         restoreLastTrackIfNeeded(false);
@@ -503,27 +548,103 @@ public class PlaybackService extends MediaSessionService {
         }
     }
 
+    /**
+     * Start requests come from `execute()` (`startForegroundService`), from Media3's own
+     * `MediaNotificationManager.startForeground` (`startSelfIntent`), and — when the process was
+     * dead or the service stopped — from `androidx.media3.session.MediaButtonReceiver`
+     * (`ACTION_MEDIA_BUTTON`, headset / Bluetooth Play). Every `startForegroundService` must be
+     * answered with `startForeground` (Android 12+ `ForegroundServiceDidNotStartInTimeException`),
+     * so a placeholder is posted — but only while Media3 is not already foreground with its real
+     * `MediaStyle` notification (never overwrite it while playing). `super.onStartCommand` then
+     * routes media-button intents to the session (`onMediaButtonEvent`), and
+     * {@link #settleAfterStartCommand()} runs right after that dispatch.
+     */
     @Override
     public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
-        if (!foregroundStarted || player == null || !player.isPlaying()) {
-            try {
-                Notification notification = buildBootstrapForegroundNotification();
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                    );
-                } else {
-                    startForeground(NOTIFICATION_ID, notification);
-                }
-                foregroundStarted = true;
-            } catch (Exception ignored) {
-                // Guard against background foreground-service restrictions if any
-            }
+        if (PlaybackForegroundPolicy.shouldPostBootstrapForeground(intent != null, isPlaybackOngoing())) {
+            bootstrapForegroundPending = startBootstrapForeground() || bootstrapForegroundPending;
         }
         super.onStartCommand(intent, flags, startId);
+        if (intent != null) {
+            MAIN_HANDLER.removeCallbacks(settleAfterStartRunnable);
+            MAIN_HANDLER.post(settleAfterStartRunnable);
+        }
         return START_STICKY;
+    }
+
+    /** Returns true when the placeholder foreground notification was posted. */
+    private boolean startBootstrapForeground() {
+        try {
+            Notification notification = buildBootstrapForegroundNotification();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                );
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
+            return true;
+        } catch (Exception ignored) {
+            // e.g. `ForegroundServiceStartNotAllowedException` for a plain `startService` fallback
+            return false;
+        }
+    }
+
+    private void settleAfterStartCommand() {
+        boolean bootstrapPosted = bootstrapForegroundPending;
+        bootstrapForegroundPending = false;
+        if (player == null || mediaSession == null) return;
+        if (PlaybackForegroundPolicy.shouldStopAfterStart(player.getMediaItemCount())) {
+            // Nothing loaded and nothing restorable (e.g. a headset press after the queue was
+            // stopped): no orphan placeholder notification / foreground service.
+            try {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
+            } catch (Exception ignored) {
+                // ignore
+            }
+            stopSelf();
+            return;
+        }
+        if (bootstrapPosted
+            && !PlaybackForegroundPolicy.isActivelyPlaying(player.getPlayWhenReady(), player.getPlaybackState())) {
+            // Paused / idle: Media3 replaces the placeholder with its paused notification (kept in
+            // the foreground during the grace window) or removes it (`STATE_IDLE`). While playing,
+            // Media3's own player events already promote it. Only after *our* placeholder: Media3's
+            // own `startSelfIntent` never posts one, so this cannot loop.
+            refreshMediaNotification();
+        }
+    }
+
+    /** Re-evaluates Media3's notification + foreground state (see {@link #onUpdateNotification}). */
+    private void refreshMediaNotification() {
+        if (mediaSession == null || !isSessionAdded(mediaSession)) return;
+        try {
+            onUpdateNotification(mediaSession, false);
+        } catch (RuntimeException ignored) {
+            // e.g. `ForegroundServiceStartNotAllowedException` on Android 12+: keep running
+        }
+    }
+
+    /**
+     * Keeps the media notification in the foreground for {@link #PAUSED_FOREGROUND_GRACE_MS}
+     * after playback last ran (paused in-app / from the notification / by a headset, audio focus
+     * loss, `AudioBecomingNoisy` when earbuds disconnect, or an ended episode). Media3 1.5.1 would
+     * otherwise `stopForeground(DETACH)` immediately and Android stops the unbound background
+     * service about a minute later, cancelling the notification and the headset Play route.
+     */
+    @Override
+    public void onUpdateNotification(MediaSession session, boolean startInForegroundRequired) {
+        boolean keep = !foregroundStartDenied && player != null && PlaybackForegroundPolicy.shouldKeepForeground(
+            player.getMediaItemCount(),
+            player.getPlaybackState(),
+            player.getPlayWhenReady(),
+            lastActivePlaybackElapsedMs,
+            SystemClock.elapsedRealtime(),
+            PAUSED_FOREGROUND_GRACE_MS
+        );
+        super.onUpdateNotification(session, startInForegroundRequired || keep);
     }
 
     @Nullable
@@ -535,12 +656,15 @@ public class PlaybackService extends MediaSessionService {
     @Override
     public void onTaskRemoved(@Nullable Intent rootIntent) {
         writeCurrentCheckpoint();
-        if (player != null
-            && player.getMediaItemCount() > 0
-            && (player.isPlaying() || player.getPlayWhenReady())
-            && player.getPlaybackState() != Player.STATE_ENDED
-            && player.getPlaybackState() != Player.STATE_IDLE) {
-            // Keep playing in the background when the user exits or swipes away the Activity.
+        if (player != null && PlaybackForegroundPolicy.shouldKeepServiceOnTaskRemoved(
+            player.getMediaItemCount(),
+            player.getPlaybackState(),
+            player.getPlayWhenReady(),
+            lastActivePlaybackElapsedMs,
+            SystemClock.elapsedRealtime(),
+            PAUSED_FOREGROUND_GRACE_MS)) {
+            // Keep playing (or keep the paused notification + headset Play) when the user swipes
+            // the Activity away; the paused grace window still demotes it later.
             return;
         }
         stopSelf();
@@ -550,9 +674,10 @@ public class PlaybackService extends MediaSessionService {
     public void onDestroy() {
         MAIN_HANDLER.removeCallbacks(tickRunnable);
         MAIN_HANDLER.removeCallbacks(sleepTimerRunnable);
+        MAIN_HANDLER.removeCallbacks(pausedForegroundExpiryRunnable);
+        MAIN_HANDLER.removeCallbacks(settleAfterStartRunnable);
         writeCurrentCheckpoint();
         releaseFlushWakeLockInternal();
-        foregroundStarted = false;
 
         if (mediaSession != null) {
             removeSession(mediaSession);
@@ -685,6 +810,7 @@ public class PlaybackService extends MediaSessionService {
         startMsByEpisodeKey.clear();
         queuedSpecs.clear();
         queuedSpecs.addAll(items);
+        persistQueue(items);
         // Offline (e.g. Airplane Mode): never hand remote URLs to ExoPlayer. It would pre-buffer
         // the next playlist item right after a local file is fully buffered, fail with a network
         // `PlaybackException` and drop the *whole* player (incl. the playing local file) to IDLE.
@@ -819,6 +945,7 @@ public class PlaybackService extends MediaSessionService {
         lastKnownPositionMs = 0L;
         positionFromSeek = false;
         clearLastTrack(null);
+        clearPersistedQueue();
         emitCurrentState();
     }
 
@@ -904,6 +1031,16 @@ public class PlaybackService extends MediaSessionService {
         public long durationHintMs() {
             return resolveCurrentDurationMs();
         }
+
+        @Override
+        public void onSessionPlay() {
+            // Same side effects as the in-app `play()` (headset / Bluetooth / System UI resume,
+            // possibly with no WebView running at all).
+            if (player == null) return;
+            player.setVolume(1.0f);
+            scheduleTicks();
+            emitCurrentState();
+        }
     };
 
     private final MediaSession.Callback sessionCallback = new MediaSession.Callback() {
@@ -942,7 +1079,7 @@ public class PlaybackService extends MediaSessionService {
                 sessionPlayer.seekBy(deltaMs);
                 return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_SUCCESS));
             }
-            return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_ERROR_NOT_SUPPORTED));
+            return Futures.immediateFuture(new SessionResult(SessionError.ERROR_NOT_SUPPORTED));
         }
 
         @Override
@@ -953,6 +1090,12 @@ public class PlaybackService extends MediaSessionService {
         ) {
             KeyEvent keyEvent = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_KEY_EVENT, KeyEvent.class);
             if (keyEvent == null) return false;
+            if (sessionPlayer != null
+                && sessionPlayer.handlePlayPauseKey(keyEvent.getKeyCode(), keyEvent.getRepeatCount())) {
+                // Headset / Bluetooth / TWS Play-Pause (bc737679): resumes in every state (paused,
+                // idle after an error or restored unprepared, empty-but-restorable, ended).
+                return true;
+            }
             long deltaMs = LockScreenControls.deltaForMediaKey(keyEvent.getKeyCode());
             if (deltaMs == 0L) return false;
             // Long-press auto-repeat would fire a seek storm: seek once per press.
@@ -960,6 +1103,25 @@ public class PlaybackService extends MediaSessionService {
                 sessionPlayer.seekBy(deltaMs);
             }
             return true;
+        }
+
+        /**
+         * Media3 calls this for a Play request (System UI resumption card, AVRCP / controller Play,
+         * Bluetooth after process death) when the player has no current item. Restores the last
+         * episode at its exact checkpoint with speed, auth headers, duration hints and the
+         * remaining queue; Media3 then sets the items, prepares and plays.
+         */
+        @Override
+        public ListenableFuture<MediaSession.MediaItemsWithStartPosition> onPlaybackResumption(
+            MediaSession session,
+            MediaSession.ControllerInfo controller
+        ) {
+            MediaSession.MediaItemsWithStartPosition items = preparePlaybackResumption();
+            if (items == null) {
+                return Futures.immediateFailedFuture(
+                    new IllegalStateException("No MiniPod episode to resume"));
+            }
+            return Futures.immediateFuture(items);
         }
     };
 
@@ -1033,7 +1195,13 @@ public class PlaybackService extends MediaSessionService {
         }
 
         @Override
+        public void onPlayWhenReadyChanged(boolean playWhenReady, int reason) {
+            updateForegroundGrace();
+        }
+
+        @Override
         public void onPlaybackStateChanged(int playbackState) {
+            updateForegroundGrace();
             if (playbackState == Player.STATE_READY) {
                 long d = player.getDuration();
                 if (d != C.TIME_UNSET && d > 0L) {
@@ -1280,6 +1448,27 @@ public class PlaybackService extends MediaSessionService {
         MAIN_HANDLER.postDelayed(tickRunnable, STATE_TICK_MS);
     }
 
+    /**
+     * Tracks when playback last ran and (re)arms the paused-notification grace expiry. Called from
+     * `playerListener` (registered on ExoPlayer before the session's listener, so it runs before
+     * Media3 refreshes the notification for the same change).
+     */
+    private void updateForegroundGrace() {
+        if (player == null) return;
+        boolean active =
+            PlaybackForegroundPolicy.isActivelyPlaying(player.getPlayWhenReady(), player.getPlaybackState());
+        long now = SystemClock.elapsedRealtime();
+        if (active) {
+            lastActivePlaybackElapsedMs = now;
+            MAIN_HANDLER.removeCallbacks(pausedForegroundExpiryRunnable);
+        } else if (wasActivelyPlaying) {
+            lastActivePlaybackElapsedMs = now;
+            MAIN_HANDLER.removeCallbacks(pausedForegroundExpiryRunnable);
+            MAIN_HANDLER.postDelayed(pausedForegroundExpiryRunnable, PAUSED_FOREGROUND_GRACE_MS + 1_000L);
+        }
+        wasActivelyPlaying = active;
+    }
+
     private void emitCurrentState() {
         if (player != null && player.getPlaybackState() == Player.STATE_ENDED) {
             lastKnownPositionMs = 0L;
@@ -1463,55 +1652,147 @@ public class PlaybackService extends MediaSessionService {
         if (player == null) return false;
         if (player.getMediaItemCount() > 0 && activeEpisodeKey != null) return false;
 
-        TrackSpec spec = activeTrackSpec;
-        long resumePosMs = lastKnownPositionMs;
-        long savedDurMs = 0L;
-        float savedSpeed = spec != null ? spec.speed : 1.0f;
-        if (spec == null) {
-            synchronized (JOURNAL_LOCK) {
-                SharedPreferences prefs = getApplicationContext()
-                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-                JSONObject lastJson = parseJson(prefs.getString(KEY_LAST_TRACK, null));
-                spec = parseTrackSpecJson(lastJson != null ? lastJson.toString() : null);
-                if (spec == null) return false;
-                resumePosMs = spec.startMs;
-                savedSpeed = spec.speed;
-                if (lastJson != null) {
-                    resumePosMs = Math.max(resumePosMs, lastJson.optLong("positionMs", 0L));
-                }
-                long lastWallMs = lastJson != null ? lastJson.optLong("wallMs", 0L) : 0L;
-                JSONObject cur = parseJson(prefs.getString(KEY_CURRENT, null));
-                if (cur != null
-                    && spec.episodeKey.equals(cur.optString("episodeKey"))
-                    && cur.optLong("wallMs", 0L) >= lastWallMs) {
-                    long p = cur.optLong("positionMs", -1L);
-                    if (p >= 0L) resumePosMs = p;
-                    savedDurMs = cur.optLong("durationMs", 0L);
-                }
-            }
-        }
-
-        activeTrackSpec = spec;
-        primaryTrackSpec = spec;
-        activeEpisodeKey = spec.episodeKey;
-        long durMs = savedDurMs > 0L ? savedDurMs : spec.durationMs;
-        lastKnownDurationMs = Math.max(0L, durMs);
-        if (durMs > 0L) {
-            durationHintByEpisodeKey.put(spec.episodeKey, durMs);
-        }
-        resumePosMs = Math.max(0L, resumePosMs);
-        lastKnownPositionMs = resumePosMs;
+        PlaybackResumption.Plan plan = resolveResumptionPlan();
+        if (plan == null) return false;
+        List<MediaItem> items = applyResumptionPlan(plan);
 
         if (player.getMediaItemCount() == 0) {
-            applyWakeModeFor(spec);
-            float clampedSpeed = Math.max(0.5f, Math.min(3.0f, savedSpeed));
-            player.setPlaybackParameters(new PlaybackParameters(clampedSpeed));
-            player.setMediaItem(toMediaItem(spec), resumePosMs);
+            // Active episode + remaining queue (marathon auto-advance keeps working headless).
+            player.setMediaItems(items, 0, plan.positionMs);
             if (prepareNow) {
                 player.prepare();
             }
         }
         return true;
+    }
+
+    /**
+     * `MediaSession.Callback.onPlaybackResumption` payload: restores the service state (active
+     * episode, checkpoint, speed, wake mode, auth headers, duration hints, queue) and returns the
+     * items for Media3 to set, prepare and play. `null` when there is nothing to resume.
+     */
+    @Nullable
+    private MediaSession.MediaItemsWithStartPosition preparePlaybackResumption() {
+        if (player == null) return null;
+        PlaybackResumption.Plan plan = resolveResumptionPlan();
+        if (plan == null) return null;
+        List<MediaItem> items = applyResumptionPlan(plan);
+        return new MediaSession.MediaItemsWithStartPosition(items, 0, plan.positionMs);
+    }
+
+    /**
+     * In-memory episode (the player lost its items) or, for a fresh service / after process
+     * death, `lastTrack` + `current` checkpoint + `lastQueue` from `minipod_playback.xml`.
+     */
+    @Nullable
+    private PlaybackResumption.Plan resolveResumptionPlan() {
+        boolean online = isNetworkConnected();
+        TrackSpec spec = activeTrackSpec;
+        if (spec != null) {
+            List<TrackSpec> upcoming = PlaybackResumption.upcomingAfter(
+                new ArrayList<>(queuedSpecs), spec.episodeKey, Collections.emptySet(), online);
+            Long hinted = durationHintByEpisodeKey.get(spec.episodeKey);
+            long durMs = hinted != null && hinted > 0L ? hinted : spec.durationMs;
+            float speed = player != null ? player.getPlaybackParameters().speed : spec.speed;
+            return new PlaybackResumption.Plan(
+                spec, lastKnownPositionMs, durMs, PlaybackResumption.clampSpeed(speed), upcoming);
+        }
+        synchronized (JOURNAL_LOCK) {
+            SharedPreferences prefs = getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            return PlaybackResumption.resolve(
+                prefs.getString(KEY_LAST_TRACK, null),
+                prefs.getString(KEY_CURRENT, null),
+                prefs.getString(KEY_LAST_QUEUE, null),
+                prefs.getString(KEY_COMPLETED, null),
+                online
+            );
+        }
+    }
+
+    /** Applies a resume plan to the service state and returns its playlist (item 0 = active). */
+    private List<MediaItem> applyResumptionPlan(PlaybackResumption.Plan plan) {
+        TrackSpec spec = plan.spec;
+        activeTrackSpec = spec;
+        primaryTrackSpec = spec;
+        activeEpisodeKey = spec.episodeKey;
+        positionFromSeek = false;
+        lastKnownDurationMs = plan.durationMs;
+        if (plan.durationMs > 0L) {
+            durationHintByEpisodeKey.put(spec.episodeKey, plan.durationMs);
+        }
+        lastKnownPositionMs = plan.positionMs;
+
+        queuedSpecs.clear();
+        queuedSpecs.addAll(plan.upcoming);
+        startMsByEpisodeKey.clear();
+        List<MediaItem> items = new ArrayList<>(1 + plan.upcoming.size());
+        items.add(toMediaItem(spec)); // also registers auth headers for the active URL
+        for (TrackSpec next : plan.upcoming) {
+            startMsByEpisodeKey.put(next.episodeKey, next.startMs);
+            if (next.durationMs > 0L) {
+                durationHintByEpisodeKey.put(next.episodeKey, next.durationMs);
+            }
+            items.add(toMediaItem(next));
+        }
+
+        if (player != null) {
+            applyWakeModeFor(spec);
+            player.setPlaybackParameters(new PlaybackParameters(PlaybackResumption.clampSpeed(plan.speed)));
+        }
+        return items;
+    }
+
+    private void persistQueue(List<TrackSpec> items) {
+        persistQueue(getApplicationContext(), items);
+    }
+
+    /**
+     * Persists the upcoming native queue (`lastQueue`). Also called by `MiniPodPlugin.mediaSetQueue`
+     * while the service is not running, so a later headless resume never uses a stale queue.
+     */
+    public static void persistQueue(Context context, List<TrackSpec> items) {
+        synchronized (JOURNAL_LOCK) {
+            try {
+                SharedPreferences.Editor editor = context.getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit();
+                if (items.isEmpty()) {
+                    editor.remove(KEY_LAST_QUEUE);
+                } else {
+                    editor.putString(KEY_LAST_QUEUE, PlaybackResumption.queueToJson(items));
+                }
+                editor.apply();
+            } catch (JSONException ignored) {
+                // ignore
+            }
+        }
+    }
+
+    /**
+     * `mediaStop` while the service is not running: forget the resumable episode + queue (the
+     * user stopped playback), exactly like `stopPlayback()` does, so a later headset / Bluetooth
+     * Play press does not resurrect it. The `current` checkpoint is kept for journal reconcile.
+     */
+    public static void clearResumeState(Context context) {
+        synchronized (JOURNAL_LOCK) {
+            context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_LAST_TRACK)
+                .remove(KEY_LAST_QUEUE)
+                .apply();
+        }
+    }
+
+    private void clearPersistedQueue() {
+        synchronized (JOURNAL_LOCK) {
+            getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_LAST_QUEUE)
+                .apply();
+        }
     }
 
     private void persistLastTrack(long positionMs) {
@@ -1549,72 +1830,17 @@ public class PlaybackService extends MediaSessionService {
 
     private static JSONObject trackSpecToJson(TrackSpec spec, long positionMs, long durationMs, float speed)
         throws JSONException {
-        JSONObject o = new JSONObject();
-        o.put("episodeKey", spec.episodeKey);
-        o.put("sourceKind", spec.sourceKind);
-        o.put("uriOrPath", spec.uriOrPath);
-        if (spec.mime != null) o.put("mime", spec.mime);
-        JSONObject headers = new JSONObject();
-        for (Map.Entry<String, String> e : spec.headers.entrySet()) {
-            headers.put(e.getKey(), e.getValue());
-        }
-        o.put("headers", headers);
-        o.put("startMs", Math.max(0L, positionMs));
-        o.put("positionMs", Math.max(0L, positionMs));
-        o.put("speed", (double) speed);
-        o.put("title", spec.title);
-        if (spec.artist != null) o.put("artist", spec.artist);
-        if (spec.album != null) o.put("album", spec.album);
-        if (spec.artworkUrl != null) o.put("artworkUrl", spec.artworkUrl);
-        o.put("durationMs", durationMs > 0L ? durationMs : spec.durationMs);
-        o.put("wallMs", System.currentTimeMillis());
-        return o;
+        return PlaybackResumption.trackSpecToJson(spec, positionMs, durationMs, speed, System.currentTimeMillis());
     }
 
     @Nullable
     private static TrackSpec parseTrackSpecJson(@Nullable String json) {
-        JSONObject o = parseJson(json);
-        if (o == null) return null;
-        String episodeKey = o.optString("episodeKey", "");
-        String uriOrPath = o.optString("uriOrPath", "");
-        if (episodeKey.isEmpty() || uriOrPath.isEmpty()) return null;
-        Map<String, String> headers = new HashMap<>();
-        JSONObject h = o.optJSONObject("headers");
-        if (h != null) {
-            JSONArray names = h.names();
-            if (names != null) {
-                for (int i = 0; i < names.length(); i++) {
-                    String k = names.optString(i);
-                    headers.put(k, h.optString(k));
-                }
-            }
-        }
-        long pos = Math.max(o.optLong("startMs", 0L), o.optLong("positionMs", 0L));
-        return new TrackSpec(
-            episodeKey,
-            o.optString("sourceKind", "url"),
-            uriOrPath,
-            o.has("mime") && !o.isNull("mime") ? o.optString("mime") : null,
-            headers,
-            pos,
-            (float) o.optDouble("speed", 1.0),
-            o.optString("title", ""),
-            o.has("artist") && !o.isNull("artist") ? o.optString("artist") : null,
-            o.has("album") && !o.isNull("album") ? o.optString("album") : null,
-            o.has("artworkUrl") && !o.isNull("artworkUrl") ? o.optString("artworkUrl") : null,
-            o.optLong("durationMs", 0L),
-            false
-        );
+        return PlaybackResumption.parseTrackSpecJson(json);
     }
 
     @Nullable
     private static JSONObject parseJson(@Nullable String json) {
-        if (json == null || json.isEmpty()) return null;
-        try {
-            return new JSONObject(json);
-        } catch (JSONException ignored) {
-            return null;
-        }
+        return PlaybackResumption.parseJson(json);
     }
 
     private void acquireFlushWakeLock() {

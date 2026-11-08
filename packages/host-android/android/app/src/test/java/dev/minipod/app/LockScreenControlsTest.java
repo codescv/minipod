@@ -166,4 +166,77 @@ public class LockScreenControlsTest {
         assertTrue(flags.containsKey("android.media.playback.ALWAYS_RESERVE_SPACE_FOR.ACTION_SKIP_TO_PREVIOUS"));
         assertTrue(flags.containsKey("android.media.playback.ALWAYS_RESERVE_SPACE_FOR.ACTION_SKIP_TO_NEXT"));
     }
+
+    // -------------------------------------------------------------------------
+    // bc737679: headset / Bluetooth Play-Pause mapping
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void playKey_alwaysPlays_pauseKey_alwaysPauses() {
+        int[] states = {Player.STATE_IDLE, Player.STATE_BUFFERING, Player.STATE_READY, Player.STATE_ENDED};
+        for (int state : states) {
+            for (boolean pwr : new boolean[] {false, true}) {
+                assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                    LockScreenControls.playPauseActionForMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, pwr, state));
+                assertEquals(LockScreenControls.MEDIA_KEY_PAUSE,
+                    LockScreenControls.playPauseActionForMediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE, pwr, state));
+            }
+        }
+    }
+
+    @Test
+    public void toggleKeys_resumeUnlessActuallyPlaying() {
+        for (int key : new int[] {KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK}) {
+            // Paused (any state) -> play.
+            assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                LockScreenControls.playPauseActionForMediaKey(key, false, Player.STATE_READY));
+            assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                LockScreenControls.playPauseActionForMediaKey(key, false, Player.STATE_IDLE));
+            assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                LockScreenControls.playPauseActionForMediaKey(key, false, Player.STATE_BUFFERING));
+            // playWhenReady but not playing (post-error IDLE, ENDED) -> play, not pause.
+            assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                LockScreenControls.playPauseActionForMediaKey(key, true, Player.STATE_IDLE));
+            assertEquals(LockScreenControls.MEDIA_KEY_PLAY,
+                LockScreenControls.playPauseActionForMediaKey(key, true, Player.STATE_ENDED));
+            // Playing / buffering -> pause.
+            assertEquals(LockScreenControls.MEDIA_KEY_PAUSE,
+                LockScreenControls.playPauseActionForMediaKey(key, true, Player.STATE_READY));
+            assertEquals(LockScreenControls.MEDIA_KEY_PAUSE,
+                LockScreenControls.playPauseActionForMediaKey(key, true, Player.STATE_BUFFERING));
+        }
+    }
+
+    @Test
+    public void nonPlayPauseKeys_areNotMapped_andSeekKeysKeepTheirDeltas() {
+        int[] others = {
+            KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_PREVIOUS, KeyEvent.KEYCODE_MEDIA_STOP,
+            KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_VOLUME_UP,
+        };
+        for (int key : others) {
+            assertEquals(LockScreenControls.MEDIA_KEY_NONE,
+                LockScreenControls.playPauseActionForMediaKey(key, false, Player.STATE_READY));
+        }
+        for (int key : new int[] {
+            KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK,
+        }) {
+            assertEquals(0L, LockScreenControls.deltaForMediaKey(key));
+        }
+        assertEquals(30_000L, LockScreenControls.deltaForMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT));
+        assertEquals(-10_000L, LockScreenControls.deltaForMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS));
+    }
+
+    @Test
+    public void hiddenSystemUiCommands_neverIncludePlayPausePrepareOrStop() {
+        // Headset / Bluetooth / MediaButtonReceiver key events are dispatched as the media
+        // notification controller: it must keep Play/Pause + Prepare (only track skips hidden).
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_PLAY_PAUSE));
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_PREPARE));
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_STOP));
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_SEEK_BACK));
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_SEEK_FORWARD));
+        assertFalse(LockScreenControls.isHiddenSystemUiPlayerCommand(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM));
+        assertEquals(4, LockScreenControls.HIDDEN_SYSTEM_UI_PLAYER_COMMANDS.length);
+    }
 }

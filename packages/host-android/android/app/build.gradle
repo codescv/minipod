@@ -59,6 +59,9 @@ dependencies {
     implementation "com.google.android.gms:play-services-auth:21.3.0"
 
     testImplementation "junit:junit:$junitVersion"
+    // Real org.json on the JVM unit-test classpath (android.jar only has throwing stubs), for the
+    // `PlaybackResumption` persistence tests.
+    testImplementation "org.json:json:20250517"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
 }
