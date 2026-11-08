@@ -147,6 +147,12 @@ export class NativeAudioEngine implements PlayerEngine {
       if (!this.disposed && initial.episodeKey) {
         this.requestedEpisodeKey = initial.episodeKey;
         this.applySnapshotFromPayload(initial, false);
+        // Publish the adopted native state (bc737679): subscribers (usePlayer) mounted before this
+        // async read resolved. Without it a paused episode never hydrates the MiniPlayer, and live
+        // playback resumed headless (headset / Bluetooth) stays shown as paused, because every
+        // later 1 s tick is then "unchanged" and only emits `position`. State only: no `position`
+        // event, so nothing is re-saved at boot.
+        this.emit({ type: 'state', snapshot: this.snapshot });
       }
     } catch {
       // Service may not be running yet; ignore.
@@ -411,7 +417,15 @@ export class NativeAudioEngine implements PlayerEngine {
     }
 
     const result = await this.plugin.media.play();
-    if (item !== null) {
+    if (item === null) {
+      // Episode adopted from native state (WebView reconnect / cold boot), not `load()`ed here:
+      // trust the native result instead of assuming playback started, so the caller can reload
+      // from storage when the service could not restore the track (bc737679).
+      if (result) {
+        this.applySnapshotFromPayload(result, true);
+        return;
+      }
+    } else {
       let native: NativeMediaStatePayload | null = result ? result : null;
       if (native === null) {
         try {

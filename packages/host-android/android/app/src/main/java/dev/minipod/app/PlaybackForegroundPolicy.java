@@ -93,6 +93,22 @@ public final class PlaybackForegroundPolicy {
     }
 
     /**
+     * A late (async artwork) Media3 notification update would `stopForeground(DETACH)` a paused
+     * player (`onNotificationUpdated` hard-codes `shouldRunInForeground(session, false)`).
+     * Intercept it — and re-post through `onUpdateNotification` — only while Media3 is still
+     * foreground, playback is paused/ended inside the grace window, and Android has not just
+     * refused a foreground start. Actively playing updates stay foreground on their own.
+     */
+    public static boolean shouldInterceptAsyncNotificationUpdate(
+        boolean media3InForeground,
+        boolean activelyPlaying,
+        boolean keepForeground,
+        boolean foregroundStartDenied
+    ) {
+        return media3InForeground && !activelyPlaying && keepForeground && !foregroundStartDenied;
+    }
+
+    /**
      * `onTaskRemoved` (app swiped from Recents): keep the service — and with it the media
      * notification, lock-screen controls and headset Play — while playing or within the paused
      * grace window; otherwise stop it (Media3's default when nothing is ongoing).

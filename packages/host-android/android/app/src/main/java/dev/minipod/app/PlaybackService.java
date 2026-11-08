@@ -452,9 +452,13 @@ public class PlaybackService extends MediaSessionService {
         ensureNotificationChannel();
 
         // Rewind -10 s | Play/Pause | Fast-forward +30 s in the `MediaStyle` notification
-        // (expanded + collapsed compact view) — see `LockScreenNotificationProvider`.
+        // (expanded + collapsed compact view) — see `LockScreenNotificationProvider`; late artwork
+        // updates keep the paused grace window foreground (`GraceAwareNotificationProvider`).
         setMediaNotificationProvider(
-            new LockScreenNotificationProvider(this, NOTIFICATION_ID, NOTIFICATION_CHANNEL_ID)
+            new GraceAwareNotificationProvider(
+                new LockScreenNotificationProvider(this, NOTIFICATION_ID, NOTIFICATION_CHANNEL_ID),
+                this::interceptAsyncNotificationUpdate
+            )
         );
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -636,7 +640,12 @@ public class PlaybackService extends MediaSessionService {
      */
     @Override
     public void onUpdateNotification(MediaSession session, boolean startInForegroundRequired) {
-        boolean keep = !foregroundStartDenied && player != null && PlaybackForegroundPolicy.shouldKeepForeground(
+        boolean keep = !foregroundStartDenied && shouldKeepForegroundNow();
+        super.onUpdateNotification(session, startInForegroundRequired || keep);
+    }
+
+    private boolean shouldKeepForegroundNow() {
+        return player != null && PlaybackForegroundPolicy.shouldKeepForeground(
             player.getMediaItemCount(),
             player.getPlaybackState(),
             player.getPlayWhenReady(),
@@ -644,7 +653,24 @@ public class PlaybackService extends MediaSessionService {
             SystemClock.elapsedRealtime(),
             PAUSED_FOREGROUND_GRACE_MS
         );
-        super.onUpdateNotification(session, startInForegroundRequired || keep);
+    }
+
+    /**
+     * {@link GraceAwareNotificationProvider} hook: a late artwork update would detach the paused
+     * notification from the foreground inside the grace window; re-post it through
+     * {@link #onUpdateNotification} instead (synchronous: the artwork is cached now).
+     */
+    private boolean interceptAsyncNotificationUpdate() {
+        if (player == null || mediaSession == null) return false;
+        if (!PlaybackForegroundPolicy.shouldInterceptAsyncNotificationUpdate(
+            isPlaybackOngoing(),
+            PlaybackForegroundPolicy.isActivelyPlaying(player.getPlayWhenReady(), player.getPlaybackState()),
+            shouldKeepForegroundNow(),
+            foregroundStartDenied)) {
+            return false;
+        }
+        refreshMediaNotification();
+        return true;
     }
 
     @Nullable

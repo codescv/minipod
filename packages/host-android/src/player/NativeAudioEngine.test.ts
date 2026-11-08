@@ -412,4 +412,109 @@ describe('NativeAudioEngine', () => {
       engine.dispose();
     });
   });
+
+  describe('cold WebView reconnect after headless headset resume (bc737679)', () => {
+    it('publishes the adopted live playing state so subscribers do not stay on "paused"', async () => {
+      const { plugin, emitNative, media } = createMockMediaHarness();
+      vi.mocked(media.getState).mockResolvedValue({
+        episodeKey: 'e_live',
+        playing: true,
+        buffering: false,
+        positionMs: 754_000,
+        durationMs: 1_800_000,
+        speed: 1.5,
+      });
+      const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+      // usePlayer subscribes right away, before the async `getState()` resolved.
+      const events: PlayerEvent[] = [];
+      engine.subscribe((e) => events.push(e));
+      await new Promise((r) => setTimeout(r, 0));
+
+      const states = events.filter((e) => e.type === 'state');
+      expect(states).toHaveLength(1);
+      expect(states[0]).toMatchObject({
+        type: 'state',
+        snapshot: { episodeKey: 'e_live', playing: true, positionMs: 754_000, speed: 1.5 },
+      });
+      // No progress `position` re-save at boot; no stop / reload / speed change of live audio.
+      expect(events.some((e) => e.type === 'position')).toBe(false);
+      expect(media.load).not.toHaveBeenCalled();
+      expect(media.stop).not.toHaveBeenCalled();
+      expect(media.setSpeed).not.toHaveBeenCalled();
+      expect(media.play).not.toHaveBeenCalled();
+
+      // The next native tick only advances the position.
+      emitNative('media-state', {
+        episodeKey: 'e_live',
+        playing: true,
+        buffering: false,
+        positionMs: 755_000,
+        durationMs: 1_800_000,
+        speed: 1.5,
+      });
+      expect(engine.getSnapshot()).toMatchObject({ playing: true, positionMs: 755_000 });
+      engine.dispose();
+    });
+
+    it('publishes an adopted paused episode (saved idle state) so the MiniPlayer hydrates', async () => {
+      const { plugin, media } = createMockMediaHarness();
+      vi.mocked(media.getState).mockResolvedValue({
+        episodeKey: 'e_paused',
+        playing: false,
+        buffering: false,
+        positionMs: 42_000,
+        speed: 1,
+      });
+      const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+      const events: PlayerEvent[] = [];
+      engine.subscribe((e) => events.push(e));
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(events).toEqual([
+        { type: 'state', snapshot: expect.objectContaining({ episodeKey: 'e_paused', playing: false, positionMs: 42_000 }) },
+      ]);
+      engine.dispose();
+    });
+
+    it('emits nothing when native has no episode', async () => {
+      const { plugin } = createMockMediaHarness();
+      const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+      const events: PlayerEvent[] = [];
+      engine.subscribe((e) => events.push(e));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(events).toEqual([]);
+      engine.dispose();
+    });
+
+    it('play() on an adopted (not load()ed) episode trusts the native result instead of forcing playing', async () => {
+      const { plugin, media } = createMockMediaHarness();
+      vi.mocked(media.getState).mockResolvedValue({
+        episodeKey: 'e_paused',
+        playing: false,
+        buffering: false,
+        positionMs: 42_000,
+        speed: 1,
+      });
+      const engine = new NativeAudioEngine({ plugin, isVisible: () => true });
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Service could not restore the track (e.g. downloaded file gone): nothing playing.
+      vi.mocked(media.play).mockResolvedValueOnce({ playing: false, buffering: false, positionMs: 0, speed: 1 });
+      await engine.play();
+      expect(engine.getSnapshot()).toMatchObject({ episodeKey: 'e_paused', playing: false, buffering: false, positionMs: 42_000 });
+
+      // Restored and buffering: reflected as such (usePlayer will not reload).
+      vi.mocked(media.play).mockResolvedValueOnce({
+        episodeKey: 'e_paused',
+        playing: false,
+        buffering: true,
+        positionMs: 42_000,
+        speed: 1,
+      });
+      await engine.play();
+      expect(engine.getSnapshot()).toMatchObject({ episodeKey: 'e_paused', buffering: true });
+      expect(media.load).not.toHaveBeenCalled();
+      engine.dispose();
+    });
+  });
 });

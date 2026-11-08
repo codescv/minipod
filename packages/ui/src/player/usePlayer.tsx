@@ -99,6 +99,7 @@ export function PlayerProvider({
   tRef.current = t;
 
   const configuredSpeed = useSettingsStore((s) => s.settings.playbackSpeed);
+  const settingsLoaded = useSettingsStore((s) => s.loaded);
   const updateSettings = useSettingsStore((s) => s.update);
 
   const [episode, setEpisode] = useState<Episode | null>(null);
@@ -361,16 +362,26 @@ export function PlayerProvider({
     [host, playEpisode],
   );
 
-  // Sync speed when settings load/change
+  // Sync speed when settings load/change. Never before the persisted settings loaded: the store's
+  // default 1.0x would audibly reset live native playback (e.g. resumed at 1.5x by a headset while
+  // the WebView was gone) on a cold open (bc737679).
   useEffect(() => {
+    if (!settingsLoaded) return;
     const clamped = clampSpeed(configuredSpeed);
     if (Math.abs(engine.getSnapshot().speed - clamped) >= 0.01) {
       engine.setSpeed(clamped);
     }
-  }, [configuredSpeed, engine]);
+  }, [configuredSpeed, settingsLoaded, engine]);
 
   // Subscribe to PlayerEngine events
   useEffect(() => {
+    // The engine may have adopted native state (async `getState()` on a cold WebView start)
+    // between the initial render and this subscription: pick it up now (bc737679).
+    const current = engine.getSnapshot();
+    if (current !== snapshotRef.current && episodeRef.current === null) {
+      snapshotRef.current = current;
+      setSnapshot(current);
+    }
     return engine.subscribe((ev) => {
       if (ev.type === 'state') {
         const prev = snapshotRef.current;
@@ -572,7 +583,15 @@ export function PlayerProvider({
           title = nonEmptyUrl(feed.title) ?? '';
           feedImg = nonEmptyUrl(feed.imageUrl);
         } catch {
-          // ignore
+          // Unsubscribed (preview) episode: fall back to its queue stub, like `nativeAdvanced`.
+          try {
+            const qList = await host.queue.list();
+            const stub = qList.find((q) => q.episode.episodeKey === key)?.entry.stub;
+            title = nonEmptyUrl(stub?.feedTitle) ?? '';
+            feedImg = nonEmptyUrl(stub?.imageUrl);
+          } catch {
+            // ignore
+          }
         }
         if (episodeRef.current) return;
         episodeRef.current = row.episode;
