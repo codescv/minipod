@@ -6,4 +6,11 @@
     <string name="lock_screen_rewind_10">快退 10 秒</string>
     <string name="lock_screen_fast_forward_30">快进 30 秒</string>
     <string name="playback_channel_name">播客播放</string>
+    <!-- 后台单集下载 (EpisodeDownloadService) -->
+    <string name="download_channel_name">播客下载</string>
+    <plurals name="download_notification_title">
+        <item quantity="other">正在下载 %d 个单集</item>
+    </plurals>
+    <string name="download_notification_running">%d 个下载中</string>
+    <string name="download_notification_queued">%1$d 个下载中 · %2$d 个等待中</string>
 </resources>

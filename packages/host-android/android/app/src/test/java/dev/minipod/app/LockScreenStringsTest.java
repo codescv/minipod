@@ -78,10 +78,23 @@ public class LockScreenStringsTest {
             for (String key : new String[] {
                 "app_name", "title_activity_main", "lock_screen_rewind_10",
                 "lock_screen_fast_forward_30", "playback_channel_name",
+                "download_channel_name", "download_notification_running",
+                "download_notification_queued",
             }) {
                 assertTrue(key + " in values", en.containsKey(key));
                 assertTrue(key + " in " + locale, loc.containsKey(key));
             }
         }
+    }
+
+    @Test
+    public void downloadNotificationStrings_keepPositionalPlaceholders() throws Exception {
+        for (String locale : new String[] {"values", "values-zh-rCN", "values-ja"}) {
+            Map<String, String> s = readStrings(locale);
+            assertTrue(locale, s.get("download_notification_queued").contains("%1$d"));
+            assertTrue(locale, s.get("download_notification_queued").contains("%2$d"));
+            assertTrue(locale, s.get("download_notification_running").contains("%d"));
+        }
+        assertEquals("播客下载", readStrings("values-zh-rCN").get("download_channel_name"));
     }
 }

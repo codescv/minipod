@@ -48,6 +48,16 @@ export interface MiniPodHttpToFileRequest {
   readonly headers?: Readonly<Record<string, string>>;
   readonly auth?: HttpBasicCredentials;
   readonly resumeFrom?: number;
+  /** RSS `<enclosure length>`: native notification progress fallback when `Content-Length` is absent. */
+  readonly enclosureSize?: number;
+  /** Episode title for the native foreground download notification. */
+  readonly title?: string;
+  /**
+   * Re-attach only (never starts a transfer): joins the live QUEUED/RUNNING native task, or settles
+   * at once from the journaled result (DONE resolves, FAILED rejects `network`), else rejects
+   * `not-found`.
+   */
+  readonly attachOnly?: boolean;
 }
 
 export interface MiniPodHttpToFileResponse {
@@ -172,6 +182,40 @@ export interface DownloadProgressPayload {
   readonly totalBytes?: number;
 }
 
+/** Native process-wide download queue states (`MiniPodPlugin.java` 3-slot FIFO). */
+export type NativeDownloadQueueState = 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED';
+
+export interface NativeDownloadSnapshotEntry {
+  readonly episodeKey: EpisodeKey;
+  readonly state: NativeDownloadQueueState;
+  readonly bytesDownloaded?: number;
+  readonly totalBytes?: number;
+  readonly path?: string;
+  readonly size?: number;
+  readonly mime?: string;
+  readonly error?: MiniPodErrorShape;
+  readonly updatedWallMs: EpochMs;
+}
+
+export interface NativeDownloadSnapshot {
+  readonly entries: readonly NativeDownloadSnapshotEntry[];
+}
+
+/** `download-state`: emitted on every native queue transition (QUEUED/RUNNING/retry/terminal). */
+export interface DownloadStatePayload {
+  readonly episodeKey: EpisodeKey;
+  readonly state: NativeDownloadQueueState | 'NONE';
+  readonly bytesDownloaded?: number;
+  readonly totalBytes?: number;
+  readonly path?: string;
+  readonly size?: number;
+  readonly mime?: string;
+  readonly error?: MiniPodErrorShape;
+  /** 1-based attempt number; `> 1` while auto-retrying with HTTP `Range` resume. */
+  readonly attempt?: number;
+  readonly retryInMs?: number;
+}
+
 export interface DeepLinkPayload {
   readonly action: 'view' | 'send';
   readonly uri?: string;
@@ -216,6 +260,7 @@ export interface MiniPodEventMap {
   readonly 'media-error': NativeMediaErrorPayload;
   readonly 'sleep-timer-state': NativeSleepTimerPayload;
   readonly 'download-progress': DownloadProgressPayload;
+  readonly 'download-state': DownloadStatePayload;
   readonly 'deep-link': DeepLinkPayload;
   readonly apkDownloadProgress: ApkDownloadProgressPayload;
 }
@@ -225,8 +270,16 @@ export interface MiniPodEventMap {
  */
 export interface MiniPodPlugin {
   http(req: MiniPodPluginHttpRequest): Promise<MiniPodPluginHttpResponse>;
+  /**
+   * Enqueues into the native 3-slot download queue and resolves when the episode finishes (rejects
+   * `cancelled` / `network`). Calling it for a key already QUEUED/RUNNING natively joins that task.
+   */
   httpToFile(req: MiniPodHttpToFileRequest): Promise<MiniPodHttpToFileResponse>;
   cancelDownload(opts: { readonly episodeKey: EpisodeKey }): Promise<void>;
+  /** Optional: older natives / test mocks lack the native download queue APIs. */
+  cancelAllDownloads?(): Promise<void>;
+  getDownloadSnapshot?(): Promise<NativeDownloadSnapshot>;
+  ackDownloadResults?(opts: { readonly episodeKeys: readonly EpisodeKey[] }): Promise<void>;
   deleteLocalFile(opts: { readonly path: string }): Promise<void>;
   readLocalFileRange(opts: {
     readonly path: string;
@@ -292,6 +345,9 @@ export interface MiniPodNativeBridge {
   http(req: MiniPodPluginHttpRequest): Promise<MiniPodPluginHttpResponse>;
   httpToFile(req: MiniPodHttpToFileRequest): Promise<MiniPodHttpToFileResponse>;
   cancelDownload(opts: { episodeKey: EpisodeKey }): Promise<void>;
+  cancelAllDownloads(): Promise<void>;
+  getDownloadSnapshot(): Promise<NativeDownloadSnapshot>;
+  ackDownloadResults(opts: { episodeKeys: readonly EpisodeKey[] }): Promise<void>;
   deleteLocalFile(opts: { path: string }): Promise<void>;
   readLocalFileRange(opts: { path: string; start: number; length: number }): Promise<{ base64: string }>;
 
@@ -341,6 +397,12 @@ export function wrapNativeBridge(bridge: MiniPodNativeBridge): MiniPodPlugin {
     http: (req) => bridge.http(req),
     httpToFile: (req) => bridge.httpToFile(req),
     cancelDownload: (opts) => bridge.cancelDownload(opts),
+    cancelAllDownloads: () => bridge.cancelAllDownloads(),
+    async getDownloadSnapshot() {
+      const res = await bridge.getDownloadSnapshot();
+      return { entries: Array.isArray(res?.entries) ? res.entries : [] };
+    },
+    ackDownloadResults: (opts) => bridge.ackDownloadResults({ episodeKeys: [...opts.episodeKeys] }),
     deleteLocalFile: (opts) => bridge.deleteLocalFile(opts),
     readLocalFileRange: (opts) => bridge.readLocalFileRange(opts),
 

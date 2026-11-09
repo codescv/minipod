@@ -92,7 +92,9 @@ import org.json.JSONObject;
  * Capacitor native bridge `MiniPod` (`ARCHITECTURE.md §3.2`, `§3.3`, `§8.2`, `§10`):
  *   - `http`: OkHttp manual redirect loop recording `chain: [{status, url, location}]`,
  *     Basic Auth retry (`ISO-8859-1` -> `UTF-8`) + cross-host redirect re-injection, `Range`, `maxBodyBytes`.
- *   - `httpToFile` / `cancelDownload` / `deleteLocalFile` / `readLocalFileRange`: episode downloads.
+ *   - `httpToFile` / `cancelDownload` / `cancelAllDownloads` / `getDownloadSnapshot` /
+ *     `ackDownloadResults` / `deleteLocalFile` / `readLocalFileRange`: episode downloads (native
+ *     3-slot FIFO queue + auto-retry + `EpisodeDownloadService`, see {@link EpisodeDownloadManager}).
  *   - `safPick` / `safStat` / `safRead` / `safReadRange` / `safWrite` (`rw` + `truncate` + `fsync`) / `safListTree`.
  *   - `media*`: Media3 `PlaybackService` control, marathon queue, sleep timer, and native journal reconciliation.
  *   - `authStatus` / `authGoogleSignIn`: Google Drive OAuth2 token acquisition.
@@ -111,11 +113,8 @@ public class MiniPodPlugin extends Plugin {
     @Nullable private volatile Account pendingConsentAccount;
 
     private final ExecutorService ioPool = Executors.newCachedThreadPool();
-    private final Map<String, Call> activeDownloadCalls = new ConcurrentHashMap<>();
-    /** `.part` temp files of in-flight downloads so `cancelDownload` can remove them. */
-    private final Map<String, File> activeDownloadPartFiles = new ConcurrentHashMap<>();
-    /** Episode keys whose in-flight download was stopped via `cancelDownload`. */
-    private final Set<String> cancelledDownloadKeys = ConcurrentHashMap.newKeySet();
+    /** Forwards native download events (`download-state` / `download-progress`) to the WebView. */
+    private final EpisodeDownloadManager.EventSink downloadSink = this::notifyListeners;
 
     private final OkHttpClient okHttp = new OkHttpClient.Builder()
         .followRedirects(false)
@@ -153,11 +152,25 @@ public class MiniPodPlugin extends Plugin {
         super.load();
         activeInstance = this;
         PlaybackService.addEventListener(serviceListener);
+        EpisodeDownloadManager.get(getContext()).addSink(downloadSink);
+    }
+
+    @Override
+    protected void handleOnResume() {
+        super.handleOnResume();
+        // Back in the foreground: Android 15+ resets the `dataSync` FGS budget, so a queue that
+        // kept running best-effort after `onTimeout` is promoted again.
+        EpisodeDownloadManager.get(getContext()).onAppForeground();
     }
 
     @Override
     protected void handleOnDestroy() {
         PlaybackService.removeEventListener(serviceListener);
+        EpisodeDownloadManager manager = EpisodeDownloadManager.peek();
+        if (manager != null) {
+            // Downloads keep running natively; results are journaled for the next WebView.
+            manager.removeSink(downloadSink);
+        }
         if (activeInstance == this) {
             activeInstance = null;
         }
@@ -794,174 +807,114 @@ public class MiniPodPlugin extends Plugin {
         }
     }
 
+    /**
+     * Enqueues an episode download into the process-wide native FIFO queue
+     * ({@link EpisodeDownloadManager}: max {@value DownloadQueue#MAX_CONCURRENT_DOWNLOADS} running,
+     * automatic Range-resuming retries, `dataSync` foreground service while active) and resolves
+     * `{path, size, mime?}` once that episode finishes; rejects `cancelled` on stop or `network`
+     * when retries are exhausted. A key already QUEUED / RUNNING joins the existing task (used by
+     * the WebView to re-attach after a cold reconnect) instead of restarting the transfer.
+     */
     @PluginMethod
     public void httpToFile(PluginCall call) {
-        String startKey = call.getString("episodeKey");
-        if (startKey != null) {
-            // Cleared synchronously (plugin thread) so a later `cancelDownload` is never lost.
-            cancelledDownloadKeys.remove(startKey);
+        String episodeKey = call.getString("episodeKey");
+        String rawUrl = call.getString("url");
+        String destPath = call.getString("destPath");
+        if (episodeKey == null || rawUrl == null || destPath == null) {
+            call.reject("episodeKey, url, and destPath are required", "invalid-argument");
+            return;
         }
-        ioPool.execute(() -> {
-            String episodeKey = call.getString("episodeKey");
-            String rawUrl = call.getString("url");
-            String destPath = call.getString("destPath");
-            if (episodeKey == null || rawUrl == null || destPath == null) {
-                call.reject("episodeKey, url, and destPath are required", "invalid-argument");
-                return;
-            }
-
-            File filesDir = getContext().getFilesDir();
-            File finalFile = resolveSafeChild(filesDir, destPath);
-            if (finalFile == null) {
-                call.reject("Invalid destPath outside filesDir", "invalid-argument");
-                return;
-            }
-            File parent = finalFile.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                call.reject("Unable to create downloads directory", "internal");
-                return;
-            }
-            File partFile = new File(finalFile.getAbsolutePath() + ".part");
-            activeDownloadPartFiles.put(episodeKey, partFile);
-            long existingBytes = partFile.exists() ? partFile.length() : 0L;
-            long resumeFrom = safeLong(call, "resumeFrom", existingBytes);
-
-            Map<String, String> headers = jsonObjectToMap(call.getObject("headers"));
-            JSObject authObj = call.getObject("auth");
-            String authUser = authObj != null && authObj.has("username")
-                ? authObj.optString("username", "")
-                : null;
-            String authPass = authObj != null ? authObj.optString("password", "") : "";
-
-            try {
-                DownloadTransfer.Result result = DownloadTransfer.run(
-                    rs -> openDownloadStream(rawUrl, headers, authUser, authPass, rs, episodeKey),
-                    partFile,
-                    finalFile,
-                    resumeFrom,
-                    () -> cancelledDownloadKeys.contains(episodeKey),
-                    (bytesDownloaded, totalBytes) -> {
-                        JSObject prog = new JSObject();
-                        prog.put("episodeKey", episodeKey);
-                        prog.put("bytesDownloaded", bytesDownloaded);
-                        if (totalBytes > 0) prog.put("totalBytes", totalBytes);
-                        notifyListeners("download-progress", prog);
-                    },
-                    DOWNLOAD_PROGRESS_THROTTLE_MS,
-                    System::currentTimeMillis
-                );
-
-                JSObject res = new JSObject();
-                res.put("path", finalFile.getAbsolutePath());
-                res.put("size", result.size);
-                if (result.contentType != null) res.put("mime", result.contentType);
-                call.resolve(res);
-            } catch (Exception e) {
-                if (cancelledDownloadKeys.contains(episodeKey)) {
-                    //noinspection ResultOfMethodCallIgnored
-                    partFile.delete();
-                    call.reject("Download cancelled", "cancelled", e);
-                } else {
-                    call.reject(
-                        e.getMessage() != null ? e.getMessage() : "Episode download failed",
-                        "network",
-                        e
-                    );
-                }
-            } finally {
-                activeDownloadCalls.remove(episodeKey);
-                activeDownloadPartFiles.remove(episodeKey, partFile);
-            }
-        });
-    }
-
-    private Response openDownloadStream(
-        String rawUrl,
-        Map<String, String> baseHeaders,
-        @Nullable String authUser,
-        String authPass,
-        long resumeFrom,
-        String episodeKey
-    ) throws IOException {
-        HttpUrl startUrl = HttpUrl.parse(rawUrl);
-        if (startUrl == null) {
-            throw new IOException("Invalid download URL: " + rawUrl);
+        File filesDir = getContext().getFilesDir();
+        File finalFile = resolveSafeChild(filesDir, destPath);
+        if (finalFile == null) {
+            call.reject("Invalid destPath outside filesDir", "invalid-argument");
+            return;
         }
+        Map<String, String> headers = jsonObjectToMap(call.getObject("headers"));
+        JSObject authObj = call.getObject("auth");
+        String authUser = authObj != null && authObj.has("username")
+            ? authObj.optString("username", "")
+            : null;
+        String authPass = authObj != null ? authObj.optString("password", "") : "";
+        String title = call.getString("title");
+        // Capacitor gotcha: numbers via `opt()` + `instanceof Number`, never `call.getLong`.
+        long enclosureSize = safeLong(call, "enclosureSize", -1L);
 
-        Charset[] charsets = authUser != null
-            ? new Charset[] { null, StandardCharsets.ISO_8859_1, StandardCharsets.UTF_8 }
-            : new Charset[] { null };
-
-        Response lastResp = null;
-        HttpUrl targetUrl = startUrl;
-
-        for (Charset cs : charsets) {
-            if (lastResp != null) {
-                lastResp.close();
-            }
-            String authHeader = cs != null && authUser != null
-                ? Credentials.basic(authUser, authPass, cs)
-                : null;
-
-            HttpUrl cur = targetUrl;
-            for (int hop = 0; hop <= DEFAULT_MAX_REDIRECTS; hop++) {
-                Request.Builder rb = new Request.Builder().url(cur).get();
-                for (Map.Entry<String, String> e : baseHeaders.entrySet()) {
-                    rb.header(e.getKey(), e.getValue());
-                }
-                if (resumeFrom > 0L) {
-                    rb.header("Range", "bytes=" + resumeFrom + "-");
-                }
-                if (authHeader != null) {
-                    rb.header("Authorization", authHeader);
+        EpisodeDownloadManager.Spec spec = new EpisodeDownloadManager.Spec(
+            episodeKey, rawUrl, finalFile, headers, authUser, authPass, title, enclosureSize
+        );
+        DownloadQueue.Waiter<DownloadTransfer.Result> waiter =
+            new DownloadQueue.Waiter<DownloadTransfer.Result>() {
+                @Override
+                public void onSuccess(DownloadTransfer.Result result) {
+                    JSObject res = new JSObject();
+                    res.put("path", finalFile.getAbsolutePath());
+                    res.put("size", result.size);
+                    if (result.contentType != null) res.put("mime", result.contentType);
+                    call.resolve(res);
                 }
 
-                Call netCall = okHttp.newCall(rb.build());
-                activeDownloadCalls.put(episodeKey, netCall);
-                Response resp = netCall.execute();
-                int code = resp.code();
-                String loc = resp.header("Location");
-                if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308)
-                    && loc != null
-                    && hop < DEFAULT_MAX_REDIRECTS) {
-                    HttpUrl next = cur.resolve(loc.trim());
-                    resp.close();
-                    if (next == null) throw new IOException("Invalid redirect Location: " + loc);
-                    cur = next;
-                    continue;
+                @Override
+                public void onFailure(Throwable error, boolean cancelled) {
+                    if (cancelled) {
+                        call.reject("Download cancelled", "cancelled");
+                        return;
+                    }
+                    String msg = error != null && error.getMessage() != null
+                        ? error.getMessage()
+                        : "Episode download failed";
+                    String code = error instanceof EpisodeDownloadManager.NotActiveException
+                        ? "not-found"
+                        : "network";
+                    call.reject(msg, code, error instanceof Exception ? (Exception) error : null);
                 }
-
-                targetUrl = cur;
-                lastResp = resp;
-                break;
-            }
-
-            if (lastResp != null && lastResp.code() != 401) {
-                return lastResp;
-            }
+            };
+        EpisodeDownloadManager manager = EpisodeDownloadManager.get(getContext());
+        Boolean attachOnly = call.getBoolean("attachOnly", false);
+        if (attachOnly != null && attachOnly) {
+            // WebView re-attach after a cold reconnect: never (re)start a finished transfer.
+            manager.attach(episodeKey, waiter);
+        } else {
+            manager.enqueue(spec, waiter);
         }
-
-        if (lastResp == null) {
-            throw new IOException("Download failed with no response");
-        }
-        return lastResp;
     }
 
     @PluginMethod
     public void cancelDownload(PluginCall call) {
         String episodeKey = call.getString("episodeKey");
         if (episodeKey != null) {
-            cancelledDownloadKeys.add(episodeKey);
-            Call active = activeDownloadCalls.remove(episodeKey);
-            if (active != null) {
-                active.cancel();
-            }
-            File partFile = activeDownloadPartFiles.remove(episodeKey);
-            if (partFile != null && partFile.exists()) {
-                //noinspection ResultOfMethodCallIgnored
-                partFile.delete();
+            EpisodeDownloadManager.get(getContext()).cancel(episodeKey);
+        }
+        call.resolve();
+    }
+
+    /** Queue `停止全部`: stops every RUNNING and QUEUED native download. */
+    @PluginMethod
+    public void cancelAllDownloads(PluginCall call) {
+        EpisodeDownloadManager.get(getContext()).cancelAll();
+        call.resolve();
+    }
+
+    /**
+     * Native download state for WebView reconciliation (`visibilitychange` / cold reconnect):
+     * active QUEUED / RUNNING entries plus un-acked terminal DONE {path} / FAILED results.
+     */
+    @PluginMethod
+    public void getDownloadSnapshot(PluginCall call) {
+        call.resolve(EpisodeDownloadManager.get(getContext()).snapshot());
+    }
+
+    @PluginMethod
+    public void ackDownloadResults(PluginCall call) {
+        List<String> keys = new ArrayList<>();
+        JSArray arr = call.getArray("episodeKeys");
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                Object k = arr.opt(i);
+                if (k instanceof String) keys.add((String) k);
             }
         }
+        EpisodeDownloadManager.get(getContext()).ack(keys);
         call.resolve();
     }
 

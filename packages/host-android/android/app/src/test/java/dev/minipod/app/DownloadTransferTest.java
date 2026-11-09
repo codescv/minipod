@@ -306,4 +306,57 @@ public class DownloadTransferTest {
         assertNull(DownloadTransfer.parseContentRange("bytes */10"));
         assertNull(DownloadTransfer.parseContentRange("garbage"));
     }
+
+    // ------------------------------------------------ 4daa0030 typed failures for the retry policy
+
+    @Test
+    public void nonSuccessStatus_isTypedHttpStatusException_withRetryAfter() throws IOException {
+        try {
+            run(rs -> base(503).header("Retry-After", "12").body(ResponseBody.create(new byte[0], AUDIO)).build(), 0L, 0L);
+            fail("expected HttpStatusException");
+        } catch (DownloadTransfer.HttpStatusException e) {
+            assertEquals(503, e.code);
+            assertEquals("12", e.retryAfter);
+            assertTrue(e.getMessage().contains("HTTP 503"));
+        }
+    }
+
+    @Test
+    public void prematureEndOfStream_keepsPart_andIsTransient() throws IOException {
+        byte[] half = Arrays.copyOf(payload, 20_000);
+        try {
+            // Declares the full length but the server closes after 20 000 bytes.
+            run(rs -> base(200).body(ResponseBody.create(
+                Okio.buffer(Okio.source(new ByteArrayInputStream(half))), AUDIO, payload.length)).build(), 0L, 0L);
+            fail("expected premature EOF");
+        } catch (IOException e) {
+            assertTrue(e instanceof java.io.EOFException);
+            assertTrue(DownloadRetryPolicy.isTransient(e));
+            assertFalse(e instanceof DownloadTransfer.DownloadFileException);
+        }
+        assertFalse(finalFile.exists());
+        assertEquals(20_000L, partFile.length());
+    }
+
+    @Test
+    public void unwritablePartPath_isDownloadFileException() throws IOException {
+        assertTrue(partFile.mkdirs());
+        try {
+            run(rs -> full(payload), 0L, 0L);
+            fail("expected DownloadFileException");
+        } catch (DownloadTransfer.DownloadFileException e) {
+            assertFalse(DownloadRetryPolicy.isTransient(e));
+        }
+    }
+
+    @Test
+    public void cancelledMidStream_isTypedCancelledException() throws IOException {
+        byte[] prefix = Arrays.copyOf(payload, 7_000);
+        try {
+            run(rs -> streaming(failingAfter(prefix, cancelled, true), payload.length), 0L, 0L);
+            fail("expected cancel");
+        } catch (DownloadTransfer.CancelledException e) {
+            assertFalse(DownloadRetryPolicy.isTransient(e));
+        }
+    }
 }

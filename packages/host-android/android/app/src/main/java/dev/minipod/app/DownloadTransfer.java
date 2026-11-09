@@ -1,5 +1,6 @@
 package dev.minipod.app;
 
+import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -15,9 +16,42 @@ import okhttp3.ResponseBody;
  * to the final path. Pure Java + okhttp3 (no android.*) so it is JVM-unit-testable.
  *
  * <p>Failure semantics: when the transfer was cancelled by the user the `.part` file is deleted;
- * on any other failure it is kept so a later call can resume from its length via Range.
+ * on any other failure it is kept (every written byte is already on disk: `RandomAccessFile`
+ * writes are unbuffered) so a later attempt can resume from its length via Range.
+ *
+ * <p>Failures are typed so {@link DownloadRetryPolicy} can tell transient from permanent errors:
+ * {@link HttpStatusException} (non-2xx), {@link DownloadFileException} (local disk / path error,
+ * e.g. ENOSPC), {@link CancelledException} (user stop), any other {@link IOException} is a
+ * network-level failure (timeout, reset, premature EOF, DNS, TLS, ...).
  */
 final class DownloadTransfer {
+
+    /** Non-2xx HTTP status (after the 416 restart); carries `Retry-After` for 429 / 503. */
+    static final class HttpStatusException extends IOException {
+        final int code;
+        /** Raw `Retry-After` header value, or null. */
+        final String retryAfter;
+
+        HttpStatusException(int code, String retryAfter) {
+            super("Download failed with HTTP " + code);
+            this.code = code;
+            this.retryAfter = retryAfter;
+        }
+    }
+
+    /** Local file-system failure (disk full, unwritable path, rename failure): never retried. */
+    static final class DownloadFileException extends IOException {
+        DownloadFileException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /** The user stopped the download. */
+    static final class CancelledException extends IOException {
+        CancelledException() {
+            super("Canceled");
+        }
+    }
 
     /** Opens the HTTP response; sends `Range: bytes=<resumeFrom>-` when resumeFrom > 0. */
     interface StreamOpener {
@@ -99,7 +133,7 @@ final class DownloadTransfer {
         try {
             int code = resp.code();
             if (code < 200 || code >= 300) {
-                throw new IOException("Download failed with HTTP " + code);
+                throw new HttpStatusException(code, resp.header("Retry-After"));
             }
             ResponseBody body = resp.body();
             if (body == null) {
@@ -136,13 +170,22 @@ final class DownloadTransfer {
 
             long written = appending ? resumeFrom : 0L;
 
-            try (InputStream in = body.byteStream();
-                 RandomAccessFile raf = new RandomAccessFile(partFile, "rw")) {
-                if (appending) {
-                    raf.setLength(resumeFrom);
-                    raf.seek(resumeFrom);
-                } else {
-                    raf.setLength(0L);
+            RandomAccessFile raf;
+            try {
+                raf = new RandomAccessFile(partFile, "rw");
+            } catch (IOException e) {
+                throw new DownloadFileException("Unable to open " + partFile + ": " + e.getMessage(), e);
+            }
+            try (InputStream in = body.byteStream(); RandomAccessFile out = raf) {
+                try {
+                    if (appending) {
+                        out.setLength(resumeFrom);
+                        out.seek(resumeFrom);
+                    } else {
+                        out.setLength(0L);
+                    }
+                } catch (IOException e) {
+                    throw new DownloadFileException("Unable to prepare " + partFile + ": " + e.getMessage(), e);
                 }
                 // Immediate snapshot so the UI shows % (incl. resumed offset) without waiting.
                 sink.onProgress(written, totalBytes);
@@ -152,9 +195,13 @@ final class DownloadTransfer {
                 int n;
                 while ((n = in.read(buf)) != -1) {
                     if (cancel.isCancelled()) {
-                        throw new IOException("Canceled");
+                        throw new CancelledException();
                     }
-                    raf.write(buf, 0, n);
+                    try {
+                        out.write(buf, 0, n);
+                    } catch (IOException e) {
+                        throw new DownloadFileException("Unable to write " + partFile + ": " + e.getMessage(), e);
+                    }
                     written += n;
                     long now = clock.getAsLong();
                     if (now - lastEmitMs >= throttleMs) {
@@ -162,17 +209,29 @@ final class DownloadTransfer {
                         sink.onProgress(written, totalBytes);
                     }
                 }
-                raf.getFD().sync();
+                if (cancel.isCancelled()) {
+                    throw new CancelledException();
+                }
+                if (totalBytes > 0L && written < totalBytes) {
+                    // Server / proxy closed the connection early: keep `.part` and resume via Range.
+                    throw new EOFException(
+                        "Premature end of stream (" + written + " of " + totalBytes + " bytes)"
+                    );
+                }
+                try {
+                    out.getFD().sync();
+                } catch (IOException e) {
+                    throw new DownloadFileException("Unable to sync " + partFile + ": " + e.getMessage(), e);
+                }
             }
-
             if (cancel.isCancelled()) {
-                throw new IOException("Canceled");
+                throw new CancelledException();
             }
             if (finalFile.exists() && !finalFile.delete()) {
-                throw new IOException("Unable to replace existing file " + finalFile);
+                throw new DownloadFileException("Unable to replace existing file " + finalFile, null);
             }
             if (!partFile.renameTo(finalFile)) {
-                throw new IOException("Unable to rename .part file to " + finalFile);
+                throw new DownloadFileException("Unable to rename .part file to " + finalFile, null);
             }
             return new Result(finalFile.length(), resp.header("Content-Type"));
         } finally {

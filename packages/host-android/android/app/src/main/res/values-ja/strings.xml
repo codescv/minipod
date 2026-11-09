@@ -6,4 +6,11 @@
     <string name="lock_screen_rewind_10">10秒戻す</string>
     <string name="lock_screen_fast_forward_30">30秒送る</string>
     <string name="playback_channel_name">ポッドキャストの再生</string>
+    <!-- バックグラウンドのエピソードダウンロード (EpisodeDownloadService) -->
+    <string name="download_channel_name">Podcasts ダウンロード</string>
+    <plurals name="download_notification_title">
+        <item quantity="other">%d 件のエピソードをダウンロード中</item>
+    </plurals>
+    <string name="download_notification_running">%d 件ダウンロード中</string>
+    <string name="download_notification_queued">%1$d 件ダウンロード中 · %2$d 件待機中</string>
 </resources>

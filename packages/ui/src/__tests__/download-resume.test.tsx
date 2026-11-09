@@ -27,7 +27,7 @@ describe('Download percentage + 继续下载 (resume failed downloads)', () => {
     expect(screen.getByTestId(`queue-download-${secondKey}`)).toHaveTextContent('Download episode');
     fireEvent.click(screen.getByTestId(`queue-download-${secondKey}`));
 
-    // QUEUED -> visible `0%`
+    // QUEUED (waiting for a host download slot) -> visible `Waiting` (no `%` yet), still a stop control
     await waitFor(() => {
       expect(screen.getByTestId(`queue-cache-status-${secondKey}`)).toHaveAttribute(
         'data-cache-state',
@@ -35,12 +35,16 @@ describe('Download percentage + 继续下载 (resume failed downloads)', () => {
       );
     });
     const badge = () => screen.getByTestId(`queue-cache-status-${secondKey}`);
-    expect(screen.getByTestId(`queue-cache-percent-${secondKey}`)).toHaveTextContent(/^0%$/);
+    expect(badge()).toHaveAttribute('data-download-phase', 'queued');
+    expect(screen.getByTestId(`queue-cache-waiting-${secondKey}`)).toHaveTextContent(/^Waiting$/);
+    expect(screen.queryByTestId(`queue-cache-percent-${secondKey}`)).not.toBeInTheDocument();
     expect(badge()).toHaveAttribute('data-cache-progress', '0');
     expect(badge()).toHaveAttribute('aria-label', 'Stop download');
 
     // RUNNING 42% is rendered as visible text inside the clickable badge (tabular digits)
     act(() => dl.progress(0.42));
+    expect(badge()).toHaveAttribute('data-download-phase', 'running');
+    expect(screen.queryByTestId(`queue-cache-waiting-${secondKey}`)).not.toBeInTheDocument();
     expect(screen.getByTestId(`queue-cache-percent-${secondKey}`)).toHaveTextContent(/^42%$/);
     expect(screen.getByTestId(`queue-cache-percent-${secondKey}`)).toHaveClass('m-download-percent');
     expect(badge()).toHaveTextContent('42%');
@@ -154,12 +158,17 @@ describe('Download percentage + 继续下载 (resume failed downloads)', () => {
     expect(await screen.findByTestId('snackbar')).toHaveTextContent('下载失败');
     expect((await host.episodes.get(secondKey)).episode.downloadState).toBe('FAILED');
 
-    // 2nd retry via keyboard (Enter) resumes from the last known 30% and finishes DONE (✓)
+    // 2nd retry via keyboard (Enter): QUEUED `等待中` keeps the last known 30% (ring), then
+    // resumes and finishes DONE (✓)
     const attempt2 = host.holdNextDownload(secondKey);
     fireEvent.keyDown(screen.getByTestId(`queue-resume-download-${secondKey}`), { key: 'Enter' });
     await waitFor(() => {
-      expect(screen.getByTestId(`queue-cache-percent-${secondKey}`)).toHaveTextContent(/^30%$/);
+      expect(screen.getByTestId(`queue-cache-waiting-${secondKey}`)).toHaveTextContent(/^等待中$/);
     });
+    expect(screen.getByTestId(`queue-cache-status-${secondKey}`)).toHaveAttribute(
+      'data-cache-progress',
+      '30',
+    );
     act(() => attempt2.progress(0.88));
     expect(screen.getByTestId(`queue-cache-percent-${secondKey}`)).toHaveTextContent(/^88%$/);
     act(() => attempt2.finish());

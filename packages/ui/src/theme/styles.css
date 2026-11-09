@@ -977,6 +977,39 @@ textarea,
   white-space: nowrap;
 }
 
+/*
+ * `QUEUED` (hosts run at most 3 downloads at once and hold the rest): muted badge, `等待中` label
+ * instead of `{percent}%`, and a slowly spinning dashed track (stop square stays still).
+ */
+.m-queue-cache-status.is-downloading.is-queued {
+  color: var(--md-sys-color-on-surface-variant);
+  background: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 10%, transparent);
+}
+
+.m-download-waiting {
+  display: inline-block;
+  font: var(--md-sys-typescale-label-small);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.m-download-ring.is-waiting .m-download-ring__track {
+  transform-box: view-box;
+  transform-origin: 7px 7px;
+  animation: m-spin 2.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-download-ring.is-waiting .m-download-ring__track {
+    animation: none;
+  }
+}
+
+.m-detail-download-status.is-queued {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
 /* `继续下载` pill for FAILED downloads: compact tonal, error-accented, finger-sized hit target. */
 .m-resume-download-chip {
   display: inline-flex;

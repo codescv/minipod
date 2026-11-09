@@ -87,7 +87,12 @@ import { resolveCapacitorHostDeps, type CapacitorHostDeps } from './default-deps
 import { scanSafLocalFolder, type ExistingSafEpisodeHint } from './feeds/local-folder';
 import { createPluginHttpClient } from './net/plugin-http';
 import { NativeAudioEngine } from './player/NativeAudioEngine';
-import type { DeepLinkPayload } from './plugin-types';
+import type {
+  DeepLinkPayload,
+  DownloadStatePayload,
+  MiniPodHttpToFileResponse,
+  NativeDownloadSnapshotEntry,
+} from './plugin-types';
 import {
   AndroidSecretsStore,
   createDefaultAndroidAppSettings,
@@ -105,6 +110,15 @@ const MAX_CACHED_PREVIEWS = 64;
 const DOWNLOAD_EVENT_MIN_INTERVAL_MS = 500; // <= 2/s per ARCHITECTURE.md §3 rule 4
 const UTF8_DECODER = new TextDecoder('utf-8');
 const UTF8_ENCODER = new TextEncoder();
+
+/** Terminal native download result (`download-state` event or snapshot entry). */
+interface NativeDownloadTerminal {
+  readonly state: 'DONE' | 'FAILED' | 'NONE';
+  readonly path?: string;
+  readonly size?: number;
+  readonly mime?: string;
+  readonly error?: MiniPodErrorShape;
+}
 
 interface CachedPreviewEntry {
   readonly preview: FeedPreview;
@@ -125,6 +139,8 @@ export interface CapacitorHostBundle {
   readonly syncEngine: SyncEngine;
   readonly syncScheduler: SyncScheduler;
   readonly reconcileJournal: () => Promise<void>;
+  /** Reconciles IndexedDB download states with the native download queue snapshot. */
+  readonly reconcileNativeDownloads: () => Promise<void>;
   readonly emit: (event: HostEvent) => void;
 }
 
@@ -212,9 +228,6 @@ export async function createCapacitorPlatformHost(
   });
 
   const bootSyncState = await syncStore.init();
-  // No download task survives a WebView/process restart: stale `QUEUED`/`RUNNING` -> `FAILED`
-  // (keeping the native `.part`) so the user sees `继续下载` and resumes via HTTP `Range`.
-  await syncStore.failStaleInFlightDownloads().catch(() => []);
 
   const readSettings = async (): Promise<AppSettings> => {
     const rec = await db.get('settings', 'app');
@@ -261,6 +274,14 @@ export async function createCapacitorPlatformHost(
   // Episodes whose in-flight download was stopped (`deleteDownload` / played auto-delete while
   // RUNNING/QUEUED). Declared before the first `reconcileJournal()` (boot) can reach it.
   const cancelledDownloads = new Set<EpisodeKey>();
+  /** In-flight `episodes.download` transfers (deduplicated per episode, incl. native re-attaches). */
+  const inFlightDownloads = new Map<EpisodeKey, Promise<void>>();
+  /**
+   * Terminal `download-state` (DONE/FAILED/NONE) / snapshot results routed to the in-flight
+   * `runEpisodeDownload` awaiting that episode, so a result is handled exactly once even when the
+   * `httpToFile` call itself was lost (e.g. WebView frozen when the native task finished).
+   */
+  const terminalWaiters = new Map<EpisodeKey, (result: NativeDownloadTerminal) => void>();
 
   /**
    * Thoroughly removes an episode's download: cancels any in-flight/queued transfer, deletes the
@@ -282,6 +303,9 @@ export async function createCapacitorPlatformHost(
     await Promise.resolve()
       .then(() => plugin.cancelDownload({ episodeKey }))
       .catch(() => undefined);
+    // Drop any native terminal result (e.g. DONE right as the user stopped it) so a later
+    // snapshot reconcile never resurrects it.
+    await ackNativeDownloadResults([episodeKey]);
     if (ep.downloadPath) {
       await plugin.deleteLocalFile({ path: ep.downloadPath }).catch(() => undefined);
       await plugin.deleteLocalFile({ path: `${ep.downloadPath}.part` }).catch(() => undefined);
@@ -304,6 +328,199 @@ export async function createCapacitorPlatformHost(
     emit({ type: 'download-updated', episodeKey, state: 'NONE', progress: 0 });
     emit({ type: 'episodes-changed', feedKey: ep.feedKey });
   };
+
+  // --- Native download queue reconciliation (4daa0030) ---------------------------------------
+  // `MiniPodPlugin.java` owns a process-wide 3-slot FIFO download queue that keeps running while
+  // the WebView is frozen/destroyed; finished results are persisted natively until acked.
+
+  const ackNativeDownloadResults = async (episodeKeys: readonly EpisodeKey[]): Promise<void> => {
+    if (episodeKeys.length === 0 || !plugin.ackDownloadResults) return;
+    await Promise.resolve()
+      .then(() => plugin.ackDownloadResults?.({ episodeKeys }))
+      .catch(() => undefined);
+  };
+
+  /** `undefined` when the native snapshot API is missing (older APK) or failed. */
+  const readNativeDownloadSnapshot = async (): Promise<
+    readonly NativeDownloadSnapshotEntry[] | undefined
+  > => {
+    if (!plugin.getDownloadSnapshot) return undefined;
+    try {
+      const res = await plugin.getDownloadSnapshot();
+      return Array.isArray(res?.entries) ? res.entries : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const downloadRatio = (
+    bytesDownloaded: number | undefined,
+    totalBytes: number | undefined,
+    declaredTotal: number | undefined,
+  ): number | undefined => {
+    if (bytesDownloaded === undefined || !Number.isFinite(bytesDownloaded)) return undefined;
+    if (totalBytes !== undefined && totalBytes > 0) {
+      return Math.min(1, Math.max(0, bytesDownloaded / totalBytes));
+    }
+    if (declaredTotal !== undefined && declaredTotal > 0) {
+      // RSS sizes are often approximate: cap at 99% until the transfer really completes.
+      return Math.min(0.99, Math.max(0, bytesDownloaded / declaredTotal));
+    }
+    return undefined;
+  };
+
+  /**
+   * Applies a native terminal result (from `download-state` or the snapshot) for an episode with
+   * no in-flight JS transfer. Never resurrects DONE for a cancelled/deleted (`NONE`) episode.
+   * Returns the applied state.
+   */
+  const applyNativeDownloadTerminal = async (
+    episodeKey: EpisodeKey,
+    result: NativeDownloadTerminal,
+  ): Promise<'DONE' | 'FAILED' | undefined> => {
+    const waiter = terminalWaiters.get(episodeKey);
+    if (waiter) {
+      waiter(result);
+      return undefined;
+    }
+    const discardFile = async (): Promise<void> => {
+      if (result.state === 'DONE' && result.path) {
+        await plugin.deleteLocalFile({ path: result.path }).catch(() => undefined);
+      }
+    };
+    if (cancelledDownloads.has(episodeKey)) {
+      await discardFile();
+      return undefined;
+    }
+    const rec = await syncStore.getEpisodeRecord(episodeKey);
+    if (!rec) {
+      await discardFile();
+      return undefined;
+    }
+    if (result.state === 'DONE') {
+      if (!result.path) return undefined;
+      if (rec.downloadState === 'DONE') return undefined;
+      if (rec.downloadState === 'NONE') {
+        // Deleted/stopped by the user while the native task finished: drop the orphan file.
+        await discardFile();
+        return undefined;
+      }
+      const prev = await syncStore.updateEpisodeDownloadStateIf(
+        episodeKey,
+        ['QUEUED', 'RUNNING', 'FAILED'],
+        'DONE',
+        result.path,
+      );
+      if (prev === undefined || cancelledDownloads.has(episodeKey)) return undefined;
+      emit({ type: 'download-updated', episodeKey, state: 'DONE', progress: 1 });
+      emit({ type: 'episodes-changed', feedKey: rec.feedKey });
+      return 'DONE';
+    }
+    if (result.state === 'FAILED') {
+      const prev = await syncStore.updateEpisodeDownloadStateIf(
+        episodeKey,
+        ['QUEUED', 'RUNNING'],
+        'FAILED',
+      );
+      if (prev === undefined || cancelledDownloads.has(episodeKey)) return undefined;
+      emit({
+        type: 'download-updated',
+        episodeKey,
+        state: 'FAILED',
+        error: result.error ?? new MiniPodError('network', 'Download failed').toShape(),
+      });
+      return 'FAILED';
+    }
+    return undefined;
+  };
+
+  interface NativeActiveDownload {
+    readonly episodeKey: EpisodeKey;
+    readonly state: 'QUEUED' | 'RUNNING';
+  }
+
+  /**
+   * Applies a native snapshot to IndexedDB: terminal DONE/FAILED results are persisted (and acked),
+   * active QUEUED/RUNNING tasks keep/persist that state and are returned for re-attaching.
+   */
+  const applyNativeDownloadSnapshot = async (
+    entries: readonly NativeDownloadSnapshotEntry[],
+  ): Promise<{ readonly active: readonly NativeActiveDownload[]; readonly doneChanged: boolean }> => {
+    const active: NativeActiveDownload[] = [];
+    const ack: EpisodeKey[] = [];
+    let doneChanged = false;
+    for (const entry of entries) {
+      const episodeKey = entry?.episodeKey;
+      if (!episodeKey) continue;
+      try {
+        if (entry.state === 'DONE' || entry.state === 'FAILED') {
+          const applied = await applyNativeDownloadTerminal(episodeKey, {
+            state: entry.state,
+            ...(entry.path !== undefined ? { path: entry.path } : {}),
+            ...(entry.size !== undefined ? { size: entry.size } : {}),
+            ...(entry.mime !== undefined ? { mime: entry.mime } : {}),
+            ...(entry.error !== undefined ? { error: entry.error } : {}),
+          });
+          if (applied === 'DONE') doneChanged = true;
+          // An in-flight transfer acks after handling the routed result itself.
+          if (!terminalWaiters.has(episodeKey)) ack.push(episodeKey);
+          continue;
+        }
+        if (entry.state !== 'QUEUED' && entry.state !== 'RUNNING') continue;
+        if (cancelledDownloads.has(episodeKey)) {
+          // Stopped by the user but the native task is still alive: cancel it again.
+          await Promise.resolve()
+            .then(() => plugin.cancelDownload({ episodeKey }))
+            .catch(() => undefined);
+          continue;
+        }
+        const rec = await syncStore.getEpisodeRecord(episodeKey);
+        if (!rec || rec.downloadState === 'NONE') {
+          // Orphan native task (episode unsubscribed / download removed): stop it.
+          if (!inFlightDownloads.has(episodeKey)) {
+            await Promise.resolve()
+              .then(() => plugin.cancelDownload({ episodeKey }))
+              .catch(() => undefined);
+          }
+          continue;
+        }
+        if (rec.downloadState === 'DONE') continue;
+        const prev = await syncStore.updateEpisodeDownloadStateIf(
+          episodeKey,
+          ['QUEUED', 'RUNNING', 'FAILED'],
+          entry.state,
+        );
+        if (prev !== undefined && prev !== entry.state && !cancelledDownloads.has(episodeKey)) {
+          const progress = downloadRatio(entry.bytesDownloaded, entry.totalBytes, rec.enclosureSize);
+          emit({
+            type: 'download-updated',
+            episodeKey,
+            state: entry.state,
+            ...(progress !== undefined ? { progress } : {}),
+          });
+        }
+        if (prev !== undefined) active.push({ episodeKey, state: entry.state });
+      } catch {
+        // One bad entry never blocks the rest of the reconciliation.
+      }
+    }
+    await ackNativeDownloadResults(ack);
+    return { active, doneChanged };
+  };
+
+  // Cold start: downloads that finished natively while the WebView was dead become DONE, and
+  // tasks still QUEUED/RUNNING natively stay in flight (re-attached below). Only stale
+  // `QUEUED`/`RUNNING` records the native queue no longer knows about flip to `FAILED` (keeping the
+  // native `.part`) so the user sees `继续下载` and resumes via HTTP `Range`.
+  const bootDownloadSnapshot = await readNativeDownloadSnapshot();
+  const bootNativeDownloads = bootDownloadSnapshot
+    ? await applyNativeDownloadSnapshot(bootDownloadSnapshot).catch(() => undefined)
+    : undefined;
+  await syncStore
+    .failStaleInFlightDownloads(
+      bootNativeDownloads ? new Set(bootNativeDownloads.active.map((a) => a.episodeKey)) : undefined,
+    )
+    .catch(() => []);
 
   const handleEpisodeCompletedSideEffects = async (
     episodeKey: EpisodeKey,
@@ -1072,9 +1289,86 @@ export async function createCapacitorPlatformHost(
     },
   );
 
-  /** In-flight `episodes.download` transfers (deduplicated per episode). */
-  const inFlightDownloads = new Map<EpisodeKey, Promise<void>>();
-  const runEpisodeDownload = async (episodeKey: EpisodeKey): Promise<void> => {
+  const handleNativeDownloadState = async (ev: DownloadStatePayload): Promise<void> => {
+    const episodeKey = ev.episodeKey;
+    if (!episodeKey) return;
+    // Cancelled keys: only terminal results pass (a late DONE file is discarded, never adopted).
+    if (cancelledDownloads.has(episodeKey) && ev.state !== 'DONE' && ev.state !== 'FAILED') return;
+    switch (ev.state) {
+      case 'QUEUED':
+        // Persisted by `runEpisodeDownload` before dispatching to native.
+        return;
+      case 'RUNNING': {
+        // Slot promotion (or a retry attempt): QUEUED -> RUNNING. Never resurrects NONE/DONE/FAILED.
+        const prev = await syncStore.updateEpisodeDownloadStateIf(
+          episodeKey,
+          ['QUEUED', 'RUNNING'],
+          'RUNNING',
+        );
+        if (prev === undefined || cancelledDownloads.has(episodeKey)) return;
+        const progress = downloadRatio(
+          ev.bytesDownloaded,
+          ev.totalBytes,
+          inFlightEnclosureSize.get(episodeKey),
+        );
+        emit({
+          type: 'download-updated',
+          episodeKey,
+          state: 'RUNNING',
+          ...(progress !== undefined ? { progress } : {}),
+        });
+        return;
+      }
+      case 'DONE':
+      case 'FAILED': {
+        const routed = terminalWaiters.has(episodeKey);
+        const applied = await applyNativeDownloadTerminal(episodeKey, {
+          state: ev.state,
+          ...(ev.path !== undefined ? { path: ev.path } : {}),
+          ...(ev.size !== undefined ? { size: ev.size } : {}),
+          ...(ev.mime !== undefined ? { mime: ev.mime } : {}),
+          ...(ev.error !== undefined ? { error: ev.error } : {}),
+        });
+        if (!routed) {
+          await ackNativeDownloadResults([episodeKey]);
+          if (applied === 'DONE') await syncNativeQueue().catch(() => undefined);
+        }
+        return;
+      }
+      case 'NONE': {
+        const waiter = terminalWaiters.get(episodeKey);
+        if (waiter) {
+          waiter({ state: 'NONE' });
+          return;
+        }
+        // Removed natively (e.g. notification `Cancel`) with no JS transfer attached.
+        const prev = await syncStore.updateEpisodeDownloadStateIf(
+          episodeKey,
+          ['QUEUED', 'RUNNING'],
+          'NONE',
+        );
+        if (prev !== undefined) emit({ type: 'download-updated', episodeKey, state: 'NONE', progress: 0 });
+        return;
+      }
+      default:
+        return;
+    }
+  };
+  const dlStateListenerHandle: PluginListenerHandle = await plugin.addListener(
+    'download-state',
+    (ev) => {
+      void handleNativeDownloadState(ev).catch(() => undefined);
+    },
+  );
+
+  /**
+   * Runs one episode download through the native queue. `reattach` re-joins a native task that
+   * survived a WebView restart (no QUEUED re-persist/flash; `httpToFile` joins the native task).
+   */
+  const runEpisodeDownload = async (
+    episodeKey: EpisodeKey,
+    reattach?: 'QUEUED' | 'RUNNING',
+  ): Promise<void> => {
     const ep = await syncStore.getEpisodeRecord(episodeKey);
     if (!ep) {
       throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
@@ -1095,29 +1389,85 @@ export async function createCapacitorPlatformHost(
     const ext = guessDownloadExtension(cleanUrl, ep.enclosureMime);
     const destPath = `downloads/${episodeKey}.${ext}`;
 
-    cancelledDownloads.delete(episodeKey);
+    if (reattach !== undefined) {
+      // Stopped/purged (or settled) since the snapshot was read: nothing to re-attach.
+      if (
+        cancelledDownloads.has(episodeKey) ||
+        (ep.downloadState !== 'QUEUED' && ep.downloadState !== 'RUNNING')
+      ) {
+        return;
+      }
+    } else {
+      cancelledDownloads.delete(episodeKey);
+    }
     lastDownloadEmitAt.delete(episodeKey);
     if (ep.enclosureSize !== undefined && ep.enclosureSize > 0) {
       inFlightEnclosureSize.set(episodeKey, ep.enclosureSize);
     } else {
       inFlightEnclosureSize.delete(episodeKey);
     }
-    await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
-    emit({ type: 'download-updated', episodeKey, state: 'QUEUED' });
+    if (reattach === undefined) {
+      // Dispatched to native right away: the native queue owns the 3 running slots, so items
+      // 4..N still start while the WebView is frozen. A resumable `.part` keeps its last %.
+      const resumable =
+        ep.downloadState === 'FAILED' || ep.downloadState === 'QUEUED' || ep.downloadState === 'RUNNING';
+      await syncStore.setEpisodeDownloadState(episodeKey, 'QUEUED');
+      emit({
+        type: 'download-updated',
+        episodeKey,
+        state: 'QUEUED',
+        ...(resumable ? {} : { progress: 0 }),
+      });
+    }
 
     const settleCancelled = async (): Promise<void> => {
       await syncStore.setEpisodeDownloadState(episodeKey, 'NONE');
       emit({ type: 'download-updated', episodeKey, state: 'NONE' });
     };
 
+    // A terminal `download-state` / snapshot result settles this transfer even if the pending
+    // `httpToFile` call never resolves (Capacitor drops calls across a WebView restart).
+    let settleTerminal: (result: NativeDownloadTerminal) => void = () => undefined;
+    const terminal = new Promise<MiniPodHttpToFileResponse>((resolve, reject) => {
+      settleTerminal = (result) => {
+        if (result.state === 'DONE') {
+          if (!result.path) return; // let `httpToFile` deliver the path
+          resolve({
+            path: result.path,
+            size: result.size ?? 0,
+            ...(result.mime !== undefined ? { mime: result.mime } : {}),
+          });
+        } else if (result.state === 'NONE') {
+          reject(new MiniPodError('cancelled', 'Download cancelled'));
+        } else {
+          reject(
+            result.error
+              ? MiniPodError.fromShape(result.error)
+              : new MiniPodError('network', 'Download failed'),
+          );
+        }
+      };
+    });
+    terminal.catch(() => undefined);
+    const waiter = (result: NativeDownloadTerminal): void => settleTerminal(result);
+    terminalWaiters.set(episodeKey, waiter);
+
     try {
-      const res = await plugin.httpToFile({
+      const native = plugin.httpToFile({
         episodeKey,
         url: cleanUrl,
         destPath,
         headers: { 'User-Agent': userAgent },
         ...(creds !== undefined ? { auth: creds } : {}),
+        ...(ep.enclosureSize !== undefined && ep.enclosureSize > 0
+          ? { enclosureSize: ep.enclosureSize }
+          : {}),
+        ...(ep.title ? { title: ep.title } : {}),
+        // Re-attach never starts a transfer: join the live task or settle from the native journal.
+        ...(reattach !== undefined ? { attachOnly: true } : {}),
       });
+      native.catch(() => undefined);
+      const res = await Promise.race([native, terminal]);
       if (cancelledDownloads.has(episodeKey)) {
         // User stopped the download right as it finished: discard the file and stay `NONE`.
         await plugin.deleteLocalFile({ path: res.path }).catch(() => undefined);
@@ -1134,6 +1484,20 @@ export async function createCapacitorPlatformHost(
         await settleCancelled();
         return;
       }
+      if (reattach !== undefined && wrapped.code === 'not-found') {
+        // `attachOnly`: native has neither a live task nor a journaled result (lost between the
+        // snapshot read and the re-attach). Treat like a stale record: FAILED, keeping the `.part`
+        // for 继续下载, unless the record already moved on (DONE / cancelled NONE).
+        const prev = await syncStore.updateEpisodeDownloadStateIf(
+          episodeKey,
+          ['QUEUED', 'RUNNING'],
+          'FAILED',
+        );
+        if (prev !== undefined && !cancelledDownloads.has(episodeKey)) {
+          emit({ type: 'download-updated', episodeKey, state: 'FAILED', error: wrapped.toShape() });
+        }
+        return;
+      }
       await syncStore.setEpisodeDownloadState(episodeKey, 'FAILED');
       emit({
         type: 'download-updated',
@@ -1143,10 +1507,58 @@ export async function createCapacitorPlatformHost(
       });
       throw wrapped;
     } finally {
+      if (terminalWaiters.get(episodeKey) === waiter) terminalWaiters.delete(episodeKey);
       lastDownloadEmitAt.delete(episodeKey);
       inFlightEnclosureSize.delete(episodeKey);
+      // The terminal result was handled: drop the native persisted entry.
+      await ackNativeDownloadResults([episodeKey]);
     }
   };
+
+  /** Starts (or joins) the single deduplicated transfer for an episode. */
+  const startEpisodeDownload = async (
+    episodeKey: EpisodeKey,
+    reattach?: 'QUEUED' | 'RUNNING',
+  ): Promise<void> => {
+    // One transfer per episode: a double-tapped `继续下载` (or overlapping auto-download) must
+    // never run two native `httpToFile` tasks on the same `.part` file.
+    let existing = inFlightDownloads.get(episodeKey);
+    if (existing && cancelledDownloads.has(episodeKey) && reattach === undefined) {
+      // Stopped but not settled yet: let it settle (`NONE`) before starting a fresh transfer.
+      await existing.catch(() => undefined);
+      existing = inFlightDownloads.get(episodeKey);
+    }
+    if (existing) return existing;
+    const transfer: Promise<void> = runEpisodeDownload(episodeKey, reattach).finally(() => {
+      if (inFlightDownloads.get(episodeKey) === transfer) inFlightDownloads.delete(episodeKey);
+    });
+    inFlightDownloads.set(episodeKey, transfer);
+    return transfer;
+  };
+
+  /** Re-joins a native task still QUEUED/RUNNING so its completion flows into IndexedDB. */
+  const attachNativeDownload = (download: NativeActiveDownload): void => {
+    if (inFlightDownloads.has(download.episodeKey) || cancelledDownloads.has(download.episodeKey)) return;
+    void startEpisodeDownload(download.episodeKey, download.state).catch(() => undefined);
+  };
+
+  let downloadReconcileChain: Promise<void> = Promise.resolve();
+  /** Foreground (and boot) reconciliation against the native download queue snapshot. */
+  const reconcileNativeDownloads = (): Promise<void> => {
+    const run = async (): Promise<void> => {
+      if (disposed) return;
+      const entries = await readNativeDownloadSnapshot();
+      if (!entries) return;
+      const res = await applyNativeDownloadSnapshot(entries);
+      for (const download of res.active) attachNativeDownload(download);
+      if (res.doneChanged) await syncNativeQueue().catch(() => undefined);
+    };
+    downloadReconcileChain = downloadReconcileChain.then(run).catch(() => undefined);
+    return downloadReconcileChain;
+  };
+
+  // Cold start: re-attach native tasks that survived the WebView restart.
+  for (const download of bootNativeDownloads?.active ?? []) attachNativeDownload(download);
 
   // Chapters & embedded chapter images (`data:` URLs on Android per `types.ts` line 791)
   const readLocalByteSlice = async (
@@ -1264,6 +1676,8 @@ export async function createCapacitorPlatformHost(
       // Re-read native playback state (never clobbers a paused position with 0 when the service
       // was stopped in the background) and refresh the native queue for current connectivity.
       void engine.syncStateFromNative().catch(() => undefined);
+      // Downloads that progressed/finished natively while the WebView was frozen.
+      void reconcileNativeDownloads();
       void reconcileJournal().then(() => {
         void syncNativeQueue().catch(() => undefined);
         if (syncEngine.getProvider()) {
@@ -1555,20 +1969,7 @@ export async function createCapacitorPlatformHost(
       },
 
       async download(episodeKey: EpisodeKey): Promise<void> {
-        // One transfer per episode: a double-tapped `继续下载` (or overlapping auto-download) must
-        // never run two native `httpToFile` tasks on the same `.part` file.
-        let existing = inFlightDownloads.get(episodeKey);
-        if (existing && cancelledDownloads.has(episodeKey)) {
-          // Stopped but not settled yet: let it settle (`NONE`) before starting a fresh transfer.
-          await existing.catch(() => undefined);
-          existing = inFlightDownloads.get(episodeKey);
-        }
-        if (existing) return existing;
-        const transfer: Promise<void> = runEpisodeDownload(episodeKey).finally(() => {
-          if (inFlightDownloads.get(episodeKey) === transfer) inFlightDownloads.delete(episodeKey);
-        });
-        inFlightDownloads.set(episodeKey, transfer);
-        return transfer;
+        return startEpisodeDownload(episodeKey);
       },
 
       async deleteDownload(episodeKey: EpisodeKey): Promise<void> {
@@ -2208,6 +2609,7 @@ export async function createCapacitorPlatformHost(
       engine.dispose();
       await Promise.all([
         dlListenerHandle.remove().catch(() => undefined),
+        dlStateListenerHandle.remove().catch(() => undefined),
         deepLinkPluginHandle.remove().catch(() => undefined),
       ]);
       db.close();
@@ -2223,6 +2625,7 @@ export async function createCapacitorPlatformHost(
     syncEngine,
     syncScheduler,
     reconcileJournal,
+    reconcileNativeDownloads,
     emit,
   };
 }

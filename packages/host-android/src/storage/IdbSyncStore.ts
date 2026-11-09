@@ -1541,19 +1541,55 @@ export class IdbSyncStore implements SyncStore {
   }
 
   /**
+   * Atomic compare-and-set of an episode's download state: writes `downloadState` (+ `downloadPath`,
+   * cleared when omitted) only when the current state is one of `from`. Lets late native download
+   * events / snapshot reconciliation never resurrect a state the user already moved past (e.g. a
+   * cancelled `NONE`). Returns the previous state when applied, otherwise `undefined`.
+   */
+  async updateEpisodeDownloadStateIf(
+    episodeKey: EpisodeKey,
+    from: readonly DownloadState[],
+    downloadState: DownloadState,
+    downloadPath?: string,
+  ): Promise<DownloadState | undefined> {
+    const tx = this.db.transaction(['episodes'], 'readwrite');
+    const store = tx.objectStore('episodes');
+    const ep = await store.get(episodeKey);
+    let previous: DownloadState | undefined;
+    if (ep && from.includes(ep.downloadState)) {
+      previous = ep.downloadState;
+      const next: IdbEpisodeRecord = { ...ep, downloadState };
+      if (downloadPath !== undefined) {
+        (next as { downloadPath?: string }).downloadPath = downloadPath;
+      } else {
+        delete (next as { downloadPath?: string }).downloadPath;
+      }
+      await store.put(next);
+    }
+    await tx.done;
+    return previous;
+  }
+
+  /**
    * Boot reconciliation: `QUEUED` / `RUNNING` records can only be stale at startup (the WebView /
    * process died mid-download, leaving the `.part` behind). Flip them to `FAILED` so the UI shows
    * `继续下载` (resumable via HTTP `Range`) instead of a stuck progress ring. Feed refreshes and
    * sync merges preserve `FAILED` as-is. Returns the affected episode keys.
+   *
+   * `keep`: episodes the native download queue still reports as QUEUED/RUNNING (the native task
+   * survived the WebView restart and will be re-attached) are left untouched.
    */
-  async failStaleInFlightDownloads(): Promise<EpisodeKey[]> {
+  async failStaleInFlightDownloads(keep?: ReadonlySet<EpisodeKey>): Promise<EpisodeKey[]> {
     const tx = this.db.transaction(['episodes'], 'readwrite');
     const store = tx.objectStore('episodes');
     const affected: EpisodeKey[] = [];
     let cursor = await store.openCursor();
     while (cursor) {
       const ep = cursor.value;
-      if (ep.downloadState === 'QUEUED' || ep.downloadState === 'RUNNING') {
+      if (
+        (ep.downloadState === 'QUEUED' || ep.downloadState === 'RUNNING') &&
+        !keep?.has(ep.episodeKey)
+      ) {
         const next: IdbEpisodeRecord = { ...ep, downloadState: 'FAILED' };
         delete (next as { downloadPath?: string }).downloadPath;
         await cursor.update(next);

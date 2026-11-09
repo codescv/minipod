@@ -96,11 +96,24 @@ public class AndroidManifestTest {
         for (String p : List.of(
             "android.permission.FOREGROUND_SERVICE",
             "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
             "android.permission.WAKE_LOCK",
+            "android.permission.ACCESS_WIFI_STATE",
             "android.permission.POST_NOTIFICATIONS",
             "android.permission.ACCESS_NETWORK_STATE",
             "android.permission.INTERNET")) {
             assertTrue("missing " + p, perms.contains(p));
         }
+    }
+
+    /** 4daa0030: background downloads survive Android 14-17 freezer / Doze via a dataSync FGS. */
+    @Test
+    public void episodeDownloadService_isPrivateDataSyncForegroundService() {
+        Element service = component("service", ".EpisodeDownloadService");
+        assertNotNull(".EpisodeDownloadService must be declared", service);
+        assertEquals("dataSync", attr(service, "foregroundServiceType"));
+        assertEquals("false", attr(service, "exported"));
+        assertEquals("false", attr(service, "stopWithTask"));
+        assertTrue("no intent filters on a private service", actions(service).isEmpty());
     }
 }

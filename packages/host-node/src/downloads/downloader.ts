@@ -3,6 +3,10 @@
  *
  * - Downloads enclosures into `${dataDir}/downloads/${episodeKey}.${ext}` via `.part`
  *   temporary file with HTTP `Range` resume when a `.part` file exists.
+ * - Bounded FIFO queue: at most `MAX_CONCURRENT_DOWNLOADS` (3) transfers in flight; the rest
+ *   wait as `QUEUED` and are promoted when a slot frees (DONE / FAILED / cancelled).
+ * - Auto retry of transient failures (network / timeouts / 408 / 429 / 5xx) with exponential
+ *   backoff + jitter and `Retry-After`, resuming from the kept `.part` (`retry-policy.ts`).
  * - Coalesces `download-updated` events to `<= 2/s` per episode.
  * - Supports `deleteDownload` and `deleteDownloadWhenPlayed` cleanup.
  */
@@ -20,6 +24,19 @@ import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync 
 import { join } from 'node:path';
 import type { Database } from '../db/sqlite';
 import { EpisodesRepository } from '../db/repositories/episodes';
+import {
+  abortReason,
+  backoffDelayMs,
+  DownloadAttemptError,
+  httpStatusError,
+  isRetryableDownloadError,
+  raceAbort,
+  resolveRetryOptions,
+  type DownloadRetryOptions,
+  type ResolvedDownloadRetryOptions,
+} from './retry-policy';
+
+export type { DownloadRetryOptions } from './retry-policy';
 
 const EVENT_COALESCE_MS = 500; // <= 2 updates / sec
 const STREAM_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -68,6 +85,30 @@ function parseContentRangeTotal(header: string | null): number | undefined {
   return Number.isFinite(total) && total > 0 ? total : undefined;
 }
 
+/** Restart-offset parsed from `Content-Range: bytes <start>-<end>/<total>`. */
+function parseContentRangeStart(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const m = /^\s*bytes\s+(\d+)\s*-/i.exec(header);
+  if (!m) return undefined;
+  const start = Number.parseInt(m[1]!, 10);
+  return Number.isFinite(start) ? start : undefined;
+}
+
+const noop = (): undefined => undefined;
+
+/** Abort reason used when an attempt receives no bytes for `stallTimeoutMs`. */
+class StallTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Enclosure download stalled (no data for ${Math.round(ms / 1000)}s)`);
+    this.name = 'TimeoutError';
+  }
+}
+
+/** Max simultaneous enclosure transfers; further `download()` calls wait FIFO as `QUEUED`. */
+export const MAX_CONCURRENT_DOWNLOADS = 3;
+/** Default per-attempt stall timeout: abort (and retry) when no bytes arrive for this long. */
+export const DEFAULT_STALL_TIMEOUT_MS = 60_000;
+
 export interface EpisodeDownloaderDeps {
   readonly db: Database;
   readonly downloadsDir: string;
@@ -75,6 +116,26 @@ export interface EpisodeDownloaderDeps {
   readonly fetchImpl?: typeof fetch;
   readonly getCredentials: (feedKey: FeedKey) => HttpBasicCredentials | undefined;
   readonly emit: (event: HostEvent) => void;
+  /** Concurrent transfer slots (default {@link MAX_CONCURRENT_DOWNLOADS}). */
+  readonly maxConcurrent?: number;
+  /** Auto-retry tuning (backoff, caps, injectable sleep / random for tests). */
+  readonly retry?: DownloadRetryOptions;
+  /** Per-attempt no-data timeout in ms (default {@link DEFAULT_STALL_TIMEOUT_MS}; `0` disables). */
+  readonly stallTimeoutMs?: number;
+}
+
+interface DownloadTask {
+  readonly episodeKey: EpisodeKey;
+  readonly feedKey: FeedKey;
+  readonly enclosureUrl: string;
+  readonly declaredSize?: number | undefined;
+  readonly destPath: string;
+  readonly partPath: string;
+  readonly controller: AbortController;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (err: MiniPodError) => void;
+  state: 'QUEUED' | 'RUNNING';
 }
 
 export class EpisodeDownloader {
@@ -83,10 +144,15 @@ export class EpisodeDownloader {
   private readonly userAgent: string;
   private readonly fetchFn: typeof fetch;
   private readonly deps: EpisodeDownloaderDeps;
-  private readonly activeDownloads = new Map<
-    EpisodeKey,
-    { readonly controller: AbortController; readonly promise: Promise<void> }
-  >();
+  private readonly maxConcurrent: number;
+  private readonly retry: ResolvedDownloadRetryOptions;
+  private readonly stallTimeoutMs: number;
+  /** Every live task (QUEUED or RUNNING), keyed by episode for dedupe / cancellation. */
+  private readonly tasks = new Map<EpisodeKey, DownloadTask>();
+  /** FIFO of QUEUED tasks waiting for a slot. */
+  private readonly waiting: DownloadTask[] = [];
+  private running = 0;
+  private disposed = false;
 
   constructor(deps: EpisodeDownloaderDeps) {
     this.deps = deps;
@@ -94,13 +160,53 @@ export class EpisodeDownloader {
     this.downloadsDir = deps.downloadsDir;
     this.userAgent = deps.userAgent;
     this.fetchFn = deps.fetchImpl ?? globalThis.fetch;
+    this.maxConcurrent = Math.max(1, Math.floor(deps.maxConcurrent ?? MAX_CONCURRENT_DOWNLOADS));
+    this.retry = resolveRetryOptions(deps.retry);
+    this.stallTimeoutMs = Math.max(0, deps.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS);
   }
 
+  /**
+   * Host shutdown: drops QUEUED items (→ `NONE`, zero fetches) and aborts RUNNING transfers
+   * immediately. RUNNING rows and their `.part` bytes are intentionally left untouched (the
+   * database is closed right after this), so the next launch's `failStaleInFlightDownloads`
+   * offers `继续下载` / `Resume download` instead of losing the partial file.
+   */
   dispose(): void {
-    for (const [, active] of this.activeDownloads) {
-      active.controller.abort();
+    this.disposed = true;
+    for (const task of this.waiting.splice(0)) {
+      this.cancelQueuedTask(task);
     }
-    this.activeDownloads.clear();
+    for (const task of this.tasks.values()) {
+      task.controller.abort();
+    }
+  }
+
+  /**
+   * Stops every QUEUED and RUNNING download (no promotion of the cancelled ones), removes their
+   * `.part` files and settles each to `NONE`.
+   */
+  async cancelAll(): Promise<void> {
+    const queued = this.waiting.splice(0);
+    for (const task of queued) {
+      this.cancelQueuedTask(task);
+      rmSync(task.partPath, { force: true });
+    }
+    const running = [...this.tasks.values()];
+    for (const task of running) {
+      task.controller.abort();
+    }
+    await Promise.all(running.map((t) => t.promise.catch(noop)));
+    for (const task of running) {
+      rmSync(task.partPath, { force: true });
+    }
+  }
+
+  /** Current in-memory queue (for diagnostics / tests). */
+  getQueueSnapshot(): { readonly running: EpisodeKey[]; readonly queued: EpisodeKey[] } {
+    return {
+      running: [...this.tasks.values()].filter((t) => t.state === 'RUNNING').map((t) => t.episodeKey),
+      queued: this.waiting.map((t) => t.episodeKey),
+    };
   }
 
   /**
@@ -113,7 +219,7 @@ export class EpisodeDownloader {
     const rows = this.deps.db
       .prepare("SELECT episode_key FROM episodes WHERE download_state IN ('QUEUED', 'RUNNING')")
       .all() as Array<{ episode_key: EpisodeKey }>;
-    const stale = rows.map((r) => r.episode_key).filter((k) => !this.activeDownloads.has(k));
+    const stale = rows.map((r) => r.episode_key).filter((k) => !this.tasks.has(k));
     for (const key of stale) {
       this.episodesRepo.setDownloadState(key, 'FAILED', null);
     }
@@ -132,22 +238,34 @@ export class EpisodeDownloader {
     }
   }
 
-  async download(episodeKey: EpisodeKey): Promise<void> {
-    const existingActive = this.activeDownloads.get(episodeKey);
-    if (existingActive) {
-      return existingActive.promise;
+  /**
+   * Queues a download (FIFO, at most `maxConcurrent` in flight). Calling it again for an episode
+   * that is already QUEUED / RUNNING returns the same promise. Resolves on `DONE` or cancellation;
+   * rejects with a `MiniPodError` once the download is `FAILED` (after automatic retries).
+   */
+  download(episodeKey: EpisodeKey): Promise<void> {
+    const existing = this.tasks.get(episodeKey);
+    if (existing) {
+      return existing.promise;
     }
+    try {
+      return this.enqueue(episodeKey);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
 
+  private enqueue(episodeKey: EpisodeKey): Promise<void> {
     const row = this.episodesRepo.getRawByKey(episodeKey);
     if (!row) {
       throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
     }
     if (row.feed_key.startsWith('l_')) {
       // Local folder episodes are already local files on disk
-      return;
+      return Promise.resolve();
     }
     if (row.download_state === 'DONE' && row.download_path && existsSync(row.download_path)) {
-      return;
+      return Promise.resolve();
     }
     if (!row.enclosure_url || !/^https?:\/\//i.test(row.enclosure_url)) {
       throw new MiniPodError('invalid-argument', 'Episode has no downloadable enclosure URL');
@@ -169,153 +287,298 @@ export class EpisodeDownloader {
       ...(hasPartial ? {} : { progress: 0 }),
     });
 
-    const controller = new AbortController();
-    const promise = this.runDownload({
+    let resolve!: () => void;
+    let reject!: (err: MiniPodError) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    const task: DownloadTask = {
       episodeKey,
       feedKey: row.feed_key,
       enclosureUrl: row.enclosure_url,
       declaredSize: row.enclosure_size ?? undefined,
       destPath,
       partPath,
-      signal: controller.signal,
-    }).finally(() => {
-      this.activeDownloads.delete(episodeKey);
-    });
-
-    this.activeDownloads.set(episodeKey, { controller, promise });
+      controller: new AbortController(),
+      promise,
+      resolve,
+      reject,
+      state: 'QUEUED',
+    };
+    this.tasks.set(episodeKey, task);
+    this.waiting.push(task);
+    this.pump();
     return promise;
   }
 
-  private async runDownload(params: {
-    readonly episodeKey: EpisodeKey;
-    readonly feedKey: FeedKey;
-    readonly enclosureUrl: string;
-    readonly declaredSize?: number | undefined;
-    readonly destPath: string;
-    readonly partPath: string;
-    readonly signal: AbortSignal;
-  }): Promise<void> {
+  /** Promotes QUEUED tasks (FIFO) into free slots. */
+  private pump(): void {
+    while (this.running < this.maxConcurrent && this.waiting.length > 0) {
+      this.startTask(this.waiting.shift()!);
+    }
+  }
+
+  private startTask(task: DownloadTask): void {
+    task.state = 'RUNNING';
+    this.running += 1;
+    // Free the slot (and promote the next item) before settling the caller's promise, so a
+    // caller that immediately re-requests the same episode gets a fresh task.
+    void this.runDownload(task).then(
+      () => {
+        this.finishTask(task);
+        task.resolve();
+      },
+      (err: unknown) => {
+        this.finishTask(task);
+        task.reject(MiniPodError.wrap(err, 'network'));
+      },
+    );
+  }
+
+  private finishTask(task: DownloadTask): void {
+    this.running -= 1;
+    if (this.tasks.get(task.episodeKey) === task) {
+      this.tasks.delete(task.episodeKey);
+    }
+    if (!this.disposed) {
+      this.pump();
+    }
+  }
+
+  /** Removes a QUEUED (never started) task: zero fetches, state `NONE`, promise resolves. */
+  private cancelQueuedTask(task: DownloadTask): void {
+    const idx = this.waiting.indexOf(task);
+    if (idx >= 0) this.waiting.splice(idx, 1);
+    if (this.tasks.get(task.episodeKey) === task) {
+      this.tasks.delete(task.episodeKey);
+    }
+    task.controller.abort();
+    this.episodesRepo.setDownloadState(task.episodeKey, 'NONE', null);
+    this.deps.emit({ type: 'download-updated', episodeKey: task.episodeKey, state: 'NONE' });
+    task.resolve();
+  }
+
+  private async runDownload(task: DownloadTask): Promise<void> {
+    const { episodeKey, feedKey } = task;
+    const signal = task.controller.signal;
     try {
-      let resumeBytes = partialFileSize(params.partPath);
-      this.episodesRepo.setDownloadState(params.episodeKey, 'RUNNING', null);
+      const resumeBytes = partialFileSize(task.partPath);
+      this.episodesRepo.setDownloadState(episodeKey, 'RUNNING', null);
       this.deps.emit({
         type: 'download-updated',
-        episodeKey: params.episodeKey,
+        episodeKey,
         state: 'RUNNING',
         // Resuming: the real resumed fraction is emitted as soon as the server answers `206`.
         ...(resumeBytes > 0 ? {} : { progress: 0 }),
       });
 
-      const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(params.enclosureUrl);
-      const creds = inlineCreds ?? this.deps.getCredentials(params.feedKey);
+      const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(task.enclosureUrl);
+      const creds = inlineCreds ?? this.deps.getCredentials(feedKey);
 
-      const resp = await this.fetchWithRedirectsAndAuth(
-        cleanUrl,
-        creds,
-        resumeBytes,
-        params.signal,
-      );
-
-      if (resp.status === 416 && resumeBytes > 0) {
-        await resp.body?.cancel().catch(() => undefined);
-        rmSync(params.partPath, { force: true });
-        return this.runDownload(params);
-      }
-
-      if (resp.status < 200 || resp.status >= 300) {
-        await resp.body?.cancel().catch(() => undefined);
-        throw new MiniPodError('network', `Enclosure download failed (HTTP ${resp.status})`);
-      }
-
-      const appending = resp.status === 206 && resumeBytes > 0;
-      if (!appending && resumeBytes > 0) {
-        resumeBytes = 0;
-      }
-
-      const contentLenHeader = resp.headers.get('content-length');
-      const contentLen = contentLenHeader ? Number.parseInt(contentLenHeader, 10) : Number.NaN;
-      const rangeTotal = appending ? parseContentRangeTotal(resp.headers.get('content-range')) : undefined;
-      const totalExpected =
-        rangeTotal ??
-        (Number.isFinite(contentLen) && contentLen > 0 ? resumeBytes + contentLen : params.declaredSize);
-
-      const ws = createWriteStream(params.partPath, { flags: appending ? 'a' : 'w' });
-      let written = resumeBytes;
-      let lastEmitAt = 0;
-
-      // Immediate snapshot of the resumed fraction (e.g. `42%`) instead of restarting at `0%`.
-      const progressOf = (bytes: number): number | undefined =>
-        totalExpected && totalExpected > 0 ? Math.min(0.99, bytes / totalExpected) : undefined;
-      if (appending) {
-        lastEmitAt = Date.now();
-        const resumedProgress = progressOf(written);
-        this.deps.emit({
-          type: 'download-updated',
-          episodeKey: params.episodeKey,
-          state: 'RUNNING',
-          ...(resumedProgress !== undefined ? { progress: resumedProgress } : {}),
-        });
-      }
-
-      try {
-        if (resp.body) {
-          const reader = resp.body.getReader();
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value || value.byteLength === 0) continue;
-
-            await new Promise<void>((resolve, reject) => {
-              ws.write(value, (err) => (err ? reject(err) : resolve()));
-            });
-            written += value.byteLength;
-
-            const now = Date.now();
-            if (now - lastEmitAt >= EVENT_COALESCE_MS) {
-              lastEmitAt = now;
-              const progress = progressOf(written);
-              this.deps.emit({
-                type: 'download-updated',
-                episodeKey: params.episodeKey,
-                state: 'RUNNING',
-                ...(progress !== undefined ? { progress } : {}),
-              });
-            }
+      // Transient failures stay RUNNING (keeping progress + `.part`) and retry with backoff,
+      // resuming via `Range`. Only an exhausted budget / permanent error surfaces as FAILED.
+      let consecutiveFailures = 0;
+      for (let attempt = 1; ; attempt++) {
+        if (signal.aborted) throw abortReason(signal);
+        const progress = { bytes: 0 };
+        try {
+          await this.runAttempt(task, cleanUrl, creds, progress);
+          break;
+        } catch (err) {
+          if (signal.aborted || !isRetryableDownloadError(err)) throw err;
+          if (progress.bytes >= this.retry.progressResetBytes) {
+            consecutiveFailures = 0; // real progress: this is a new stall point
           }
+          consecutiveFailures += 1;
+          if (consecutiveFailures > this.retry.maxRetries || attempt >= this.retry.maxTotalAttempts) {
+            throw err;
+          }
+          const retryAfterMs = err instanceof DownloadAttemptError ? err.retryAfterMs : undefined;
+          const delayMs =
+            retryAfterMs !== undefined
+              ? Math.min(retryAfterMs, this.retry.retryAfterCapMs)
+              : backoffDelayMs(consecutiveFailures, this.retry);
+          await raceAbort(this.retry.sleep(delayMs, signal), signal);
         }
-
-        await new Promise<void>((resolve, reject) => {
-          ws.end((err?: Error | null) => (err ? reject(err) : resolve()));
-        });
-      } catch (streamErr) {
-        ws.destroy();
-        throw streamErr;
       }
 
-      renameSync(params.partPath, params.destPath);
-      this.episodesRepo.setDownloadState(params.episodeKey, 'DONE', params.destPath);
+      renameSync(task.partPath, task.destPath);
+      this.episodesRepo.setDownloadState(episodeKey, 'DONE', task.destPath);
       this.deps.emit({
         type: 'download-updated',
-        episodeKey: params.episodeKey,
+        episodeKey,
         state: 'DONE',
         progress: 1,
       });
-      this.deps.emit({ type: 'episodes-changed', feedKey: params.feedKey });
+      this.deps.emit({ type: 'episodes-changed', feedKey });
     } catch (err) {
       const wrapped = MiniPodError.wrap(err, 'network');
-      if (wrapped.code === 'cancelled') {
-        this.episodesRepo.setDownloadState(params.episodeKey, 'NONE', null);
-        this.deps.emit({ type: 'download-updated', episodeKey: params.episodeKey, state: 'NONE' });
+      if (signal.aborted || wrapped.code === 'cancelled') {
+        if (this.disposed && signal.aborted) {
+          // Shutdown: leave the row RUNNING (+ `.part`) for next-launch reconciliation.
+          return;
+        }
+        this.episodesRepo.setDownloadState(episodeKey, 'NONE', null);
+        this.deps.emit({ type: 'download-updated', episodeKey, state: 'NONE' });
         return;
       }
-      this.episodesRepo.setDownloadState(params.episodeKey, 'FAILED', null);
+      this.episodesRepo.setDownloadState(episodeKey, 'FAILED', null);
       this.deps.emit({
         type: 'download-updated',
-        episodeKey: params.episodeKey,
+        episodeKey,
         state: 'FAILED',
         error: wrapped.toShape(),
       });
       throw wrapped;
+    }
+  }
+
+  /** One transfer attempt with its own abort scope (task cancellation + stall timeout). */
+  private async runAttempt(
+    task: DownloadTask,
+    url: string,
+    creds: HttpBasicCredentials | undefined,
+    progress: { bytes: number },
+  ): Promise<void> {
+    const parent = task.controller.signal;
+    const attemptCtl = new AbortController();
+    const onParentAbort = (): void => attemptCtl.abort(abortReason(parent));
+    if (parent.aborted) onParentAbort();
+    else parent.addEventListener('abort', onParentAbort, { once: true });
+
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    const touch = (): void => {
+      if (this.stallTimeoutMs <= 0) return;
+      if (stallTimer !== undefined) clearTimeout(stallTimer);
+      stallTimer = setTimeout(
+        () => attemptCtl.abort(new StallTimeoutError(this.stallTimeoutMs)),
+        this.stallTimeoutMs,
+      );
+      stallTimer.unref?.();
+    };
+
+    try {
+      touch();
+      await this.transfer(task, url, creds, attemptCtl.signal, touch, progress);
+    } catch (err) {
+      const reason: unknown = attemptCtl.signal.reason;
+      if (!parent.aborted && attemptCtl.signal.aborted && reason instanceof StallTimeoutError) {
+        throw new DownloadAttemptError(reason.message, { retryable: true, cause: reason });
+      }
+      throw err;
+    } finally {
+      if (stallTimer !== undefined) clearTimeout(stallTimer);
+      parent.removeEventListener('abort', onParentAbort);
+    }
+  }
+
+  private async transfer(
+    task: DownloadTask,
+    url: string,
+    creds: HttpBasicCredentials | undefined,
+    signal: AbortSignal,
+    touch: () => void,
+    progress: { bytes: number },
+  ): Promise<void> {
+    const rangeStartOf = (r: Response): number | undefined =>
+      r.status === 206 ? parseContentRangeStart(r.headers.get('content-range')) : undefined;
+
+    let resumeBytes = partialFileSize(task.partPath);
+    let resp = await raceAbort(this.fetchWithRedirectsAndAuth(url, creds, resumeBytes, signal), signal);
+    let rangeStart = rangeStartOf(resp);
+
+    // The server can no longer satisfy our `.part` offset (416, or a 206 for some other non-zero
+    // offset): drop the stale bytes and restart from 0.
+    if (
+      resumeBytes > 0 &&
+      (resp.status === 416 ||
+        (resp.status === 206 && rangeStart !== undefined && rangeStart !== 0 && rangeStart !== resumeBytes))
+    ) {
+      await resp.body?.cancel().catch(noop);
+      rmSync(task.partPath, { force: true });
+      resumeBytes = 0;
+      resp = await raceAbort(this.fetchWithRedirectsAndAuth(url, creds, 0, signal), signal);
+      rangeStart = rangeStartOf(resp);
+    }
+
+    if (resp.status < 200 || resp.status >= 300) {
+      await resp.body?.cancel().catch(noop);
+      throw httpStatusError(resp.status, resp.headers);
+    }
+    touch();
+
+    // `200` (Range ignored) or a `206` starting at 0 rewrites the file from scratch.
+    const appending = resp.status === 206 && resumeBytes > 0 && (rangeStart === undefined || rangeStart === resumeBytes);
+    if (!appending) {
+      resumeBytes = 0;
+    }
+
+    const contentLenHeader = resp.headers.get('content-length');
+    const contentLen = contentLenHeader ? Number.parseInt(contentLenHeader, 10) : Number.NaN;
+    const rangeTotal = appending ? parseContentRangeTotal(resp.headers.get('content-range')) : undefined;
+    const totalExpected =
+      rangeTotal ?? (Number.isFinite(contentLen) && contentLen > 0 ? resumeBytes + contentLen : task.declaredSize);
+
+    const ws = createWriteStream(task.partPath, { flags: appending ? 'a' : 'w' });
+    let wsError: Error | undefined;
+    ws.on('error', (e) => {
+      wsError ??= e;
+    });
+    let written = resumeBytes;
+    let lastEmitAt = 0;
+
+    // Immediate snapshot of the resumed fraction (e.g. `42%`) instead of restarting at `0%`.
+    const progressOf = (bytes: number): number | undefined =>
+      totalExpected && totalExpected > 0 ? Math.min(0.99, bytes / totalExpected) : undefined;
+    if (appending) {
+      lastEmitAt = Date.now();
+      const resumedProgress = progressOf(written);
+      this.deps.emit({
+        type: 'download-updated',
+        episodeKey: task.episodeKey,
+        state: 'RUNNING',
+        ...(resumedProgress !== undefined ? { progress: resumedProgress } : {}),
+      });
+    }
+
+    const reader = resp.body?.getReader();
+    try {
+      if (reader) {
+        for (;;) {
+          const { done, value } = await raceAbort(reader.read(), signal);
+          if (done) break;
+          touch();
+          if (!value || value.byteLength === 0) continue;
+
+          await new Promise<void>((resolve, reject) => {
+            ws.write(value, (err) => (err ? reject(wsError ?? err) : resolve()));
+          });
+          written += value.byteLength;
+          progress.bytes += value.byteLength;
+
+          const now = Date.now();
+          if (now - lastEmitAt >= EVENT_COALESCE_MS) {
+            lastEmitAt = now;
+            const p = progressOf(written);
+            this.deps.emit({
+              type: 'download-updated',
+              episodeKey: task.episodeKey,
+              state: 'RUNNING',
+              ...(p !== undefined ? { progress: p } : {}),
+            });
+          }
+        }
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        ws.end((err?: Error | null) => (err ? reject(wsError ?? err) : resolve()));
+      });
+      if (wsError) throw wsError;
+    } catch (streamErr) {
+      reader?.cancel().catch(noop);
+      ws.destroy();
+      throw streamErr;
     }
   }
 
@@ -350,7 +613,7 @@ export class EpisodeDownloader {
         }
         const loc = resp.headers.get('location');
         if (!loc) return { response: resp, finalUrl: currentUrl };
-        await resp.body?.cancel().catch(() => undefined);
+        await resp.body?.cancel().catch(noop);
         const extracted = extractUrlCredentials(new URL(loc, currentUrl).toString());
         if (extracted.credentials) {
           currentAuth = encodeBasicAuthHeaders(extracted.credentials)[0];
@@ -359,14 +622,14 @@ export class EpisodeDownloader {
         }
         currentUrl = extracted.cleanUrl;
       }
-      throw new MiniPodError('network', 'Too many redirects downloading enclosure');
+      throw new DownloadAttemptError('Too many redirects downloading enclosure', { retryable: false });
     };
 
     let res = await follow(startUrl);
     if (res.response.status === 401 && credentials) {
       const challengeUrl = res.finalUrl || startUrl;
       for (const candidate of encodeBasicAuthHeaders(credentials)) {
-        await res.response.body?.cancel().catch(() => undefined);
+        await res.response.body?.cancel().catch(noop);
         res = await follow(challengeUrl, candidate);
         if (res.response.status !== 401) break;
       }
@@ -375,10 +638,14 @@ export class EpisodeDownloader {
   }
 
   async deleteDownload(episodeKey: EpisodeKey): Promise<void> {
-    const active = this.activeDownloads.get(episodeKey);
-    if (active) {
-      active.controller.abort();
-      await active.promise.catch(() => undefined);
+    const task = this.tasks.get(episodeKey);
+    if (task) {
+      if (task.state === 'QUEUED') {
+        this.cancelQueuedTask(task);
+      } else {
+        task.controller.abort();
+        await task.promise.catch(noop);
+      }
     }
 
     const row = this.episodesRepo.getRawByKey(episodeKey);
@@ -391,7 +658,7 @@ export class EpisodeDownloader {
     if (row.download_path) {
       this.deleteFilesByPaths([row.download_path]);
     }
-    if (active || row.enclosure_url) {
+    if (task || row.enclosure_url) {
       // An in-flight (or interrupted) download has `download_path = NULL` in SQLite, so also
       // clean up the deterministic destination + `.part` temp file left behind by the abort.
       const ext = chooseExtension(row.enclosure_url ?? '', row.enclosure_mime ?? undefined);

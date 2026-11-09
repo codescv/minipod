@@ -60,6 +60,13 @@ export interface HostViewCache {
    * Kept on `FAILED` (partial `.part` resumes from there), cleared on `DONE` / `NONE`.
    */
   readonly downloadProgressByKey: Map<EpisodeKey, number>;
+  /**
+   * User-requested download stops (`停止下载` / `停止全部`) that must not be reverted by a stale
+   * `download-updated(QUEUED|RUNNING|...)` event emitted before the host processed the stop, or
+   * by a list snapshot fetched while `deleteDownload` was still in flight. See
+   * {@link beginDownloadStop}.
+   */
+  readonly downloadStopGuards: Map<EpisodeKey, DownloadStopGuard>;
   syncStatus: SyncStatus | null;
   topChartsCountries: readonly { readonly code: CountryCode; readonly name: string }[];
   readonly topChartsByCountry: Map<CountryCode, readonly SearchResult[]>;
@@ -87,6 +94,7 @@ function createEmptyHostViewCache(): HostViewCache {
     queueRows: [],
     queueLoaded: false,
     downloadProgressByKey: new Map(),
+    downloadStopGuards: new Map(),
     syncStatus: null,
     topChartsCountries: [],
     topChartsByCountry: new Map(),
@@ -197,8 +205,12 @@ export function downloadRatioToPercent(ratio: number | undefined): number {
 
 /**
  * Records a `download-updated` progress sample in `downloadProgressByKey` (idempotent):
- * - `QUEUED` / `RUNNING`: stores `progress` when given, otherwise keeps the last known ratio
- *   (seeding `0` for a brand-new download)
+ * - `QUEUED` (waiting for one of the host's 3 concurrent download slots): keeps the last known
+ *   ratio (a resumed `.part`), seeding `0` for a brand-new download. A `QUEUED` sample's
+ *   `progress: 0` carries no information (nothing transferred in this attempt yet), so it never
+ *   wipes a prior ratio; a positive `progress` is recorded.
+ * - `RUNNING`: stores `progress` when given; progress-less samples (e.g. a host auto-retry that
+ *   stays `RUNNING`) keep the last known ratio
  * - `FAILED`: keeps the last known ratio (the resumed download continues from there)
  * - `DONE` / `NONE`: clears it
  */
@@ -210,7 +222,11 @@ export function applyDownloadProgressToViewCache(
 ): void {
   const map = getHostViewCache(host).downloadProgressByKey;
   if (state === 'RUNNING' || state === 'QUEUED') {
-    if (progress !== undefined && Number.isFinite(progress)) {
+    const hasProgress =
+      progress !== undefined &&
+      Number.isFinite(progress) &&
+      (state === 'RUNNING' || progress > 0 || !map.has(episodeKey));
+    if (hasProgress) {
       map.set(episodeKey, Math.max(0, Math.min(1, progress)));
     } else if (!map.has(episodeKey)) {
       map.set(episodeKey, 0);
@@ -220,6 +236,121 @@ export function applyDownloadProgressToViewCache(
   if (state === 'DONE' || state === 'NONE') {
     map.delete(episodeKey);
   }
+}
+
+/**
+ * Without a host `download-updated(NONE)` confirmation, how long after `deleteDownload` settled
+ * late `RUNNING` / `FAILED` / `DONE` events for a stopped episode are still treated as stale
+ * (emitted by the transfer / auto-retry loop before the host processed the cancellation).
+ */
+export const DOWNLOAD_STOP_GRACE_MS = 2000;
+
+export interface DownloadStopGuard {
+  /** In-flight `deleteDownload` calls for this episode. */
+  pending: number;
+  /** `Date.now()` when the last in-flight `deleteDownload` settled. */
+  settledAt: number | null;
+  /** The host confirmed the stop with `download-updated(NONE)`. */
+  confirmed: boolean;
+}
+
+/**
+ * Starts a user-requested stop (`停止下载` / `停止全部`) of a `QUEUED` / `RUNNING` download:
+ * optimistically flips every SWR slice to `NONE` and guards the episode so that stale non-`NONE`
+ * events / list snapshots cannot revert it while `deleteDownload` is in flight. The guard lifts
+ * once `deleteDownload` settled ({@link endDownloadStop}) and the host confirmed with
+ * `download-updated(NONE)` (or {@link DOWNLOAD_STOP_GRACE_MS} later without a confirmation).
+ */
+export function beginDownloadStop(host: PlatformHost, episodeKey: EpisodeKey): void {
+  const guards = getHostViewCache(host).downloadStopGuards;
+  const prev = guards.get(episodeKey);
+  guards.set(episodeKey, { pending: (prev?.pending ?? 0) + 1, settledAt: null, confirmed: false });
+  applyDownloadStateToViewCache(host, episodeKey, 'NONE');
+}
+
+/** Marks one in-flight `deleteDownload` (see {@link beginDownloadStop}) as settled. */
+export function endDownloadStop(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  now: number = Date.now(),
+): void {
+  const guards = getHostViewCache(host).downloadStopGuards;
+  const guard = guards.get(episodeKey);
+  if (!guard) return;
+  guard.pending = Math.max(0, guard.pending - 1);
+  if (guard.pending > 0) return;
+  guard.settledAt = now;
+  if (guard.confirmed) guards.delete(episodeKey);
+}
+
+/** Drops the stop guard, e.g. when the user explicitly (re)starts the download. */
+export function clearDownloadStop(host: PlatformHost, episodeKey: EpisodeKey): void {
+  getHostViewCache(host).downloadStopGuards.delete(episodeKey);
+}
+
+/** Whether a user-requested stop of this episode's download is still guarded (see above). */
+export function isDownloadStopGuarded(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  now: number = Date.now(),
+): boolean {
+  const guards = getHostViewCache(host).downloadStopGuards;
+  const guard = guards.get(episodeKey);
+  if (!guard) return false;
+  if (guard.pending > 0) return true;
+  if (
+    !guard.confirmed &&
+    guard.settledAt !== null &&
+    now - guard.settledAt < DOWNLOAD_STOP_GRACE_MS
+  ) {
+    return true;
+  }
+  guards.delete(episodeKey);
+  return false;
+}
+
+/**
+ * Whether a `download-updated` event is stale because the user stopped this download:
+ * - `NONE` is never stale: it confirms the stop (lifting the guard once `deleteDownload` settled)
+ * - while `deleteDownload` is in flight, every other state is stale (progress ticks, auto-retry
+ *   `RUNNING`, `QUEUED` -> `RUNNING` promotion, a cancellation surfaced as `FAILED`, ...)
+ * - after it settled without a host confirmation (grace window): `RUNNING` / `FAILED` / `DONE`
+ *   are stale, while `QUEUED` can only come from a fresh `download()` and lifts the guard
+ */
+export function isStaleDownloadEvent(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  state: DownloadState,
+  now: number = Date.now(),
+): boolean {
+  if (!isDownloadStopGuarded(host, episodeKey, now)) return false;
+  const guards = getHostViewCache(host).downloadStopGuards;
+  const guard = guards.get(episodeKey);
+  if (!guard) return false;
+  if (state === 'NONE') {
+    guard.confirmed = true;
+    if (guard.pending === 0) guards.delete(episodeKey);
+    return false;
+  }
+  if (guard.pending > 0) return true;
+  if (state === 'QUEUED') {
+    guards.delete(episodeKey);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Overrides a list snapshot's `downloadState` with `NONE` for guarded stops, so a snapshot fetched
+ * while `deleteDownload` was still in flight never resurrects a stopped `QUEUED` / `RUNNING` row.
+ */
+export function guardStoppedDownloadState(
+  host: PlatformHost,
+  episodeKey: EpisodeKey,
+  state: DownloadState,
+  now: number = Date.now(),
+): DownloadState {
+  return state !== 'NONE' && isDownloadStopGuarded(host, episodeKey, now) ? 'NONE' : state;
 }
 
 /**

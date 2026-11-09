@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- v0.1.31 (4daa0030): background episode downloads run in a `dataSync` foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
@@ -127,6 +129,17 @@
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
         </service>
+
+        <!--
+            4daa0030: native 3-slot episode download queue + auto-retry keeps running while the
+            app is in the background / screen off (Android 14-17 Cached Apps Freezer + Doze).
+            Not exported; started only by the app itself while downloads are active or queued.
+        -->
+        <service
+            android:name=".EpisodeDownloadService"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false"
+            android:exported="false" />
 
         <!--
             bc737679: headset / Bluetooth / TWS Play after Android stopped PlaybackService (paused in

@@ -26,6 +26,7 @@ import {
   DetailDownloadStatus,
   DownloadPercentText,
   DownloadProgressRing,
+  DownloadWaitingText,
   ResumeDownloadChip,
   inlineRowActionProps,
 } from '../../components/DownloadControls';
@@ -36,7 +37,11 @@ import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
 import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
-import { downloadRatioToPercent } from '../../stores/view-cache';
+import {
+  clearDownloadStop,
+  downloadRatioToPercent,
+  endDownloadStop,
+} from '../../stores/view-cache';
 
 type InlineUndoState =
   | { readonly kind: 'play-next' }
@@ -112,7 +117,11 @@ export function EpisodeRow({
 
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
 
-  const { state: downloadState, ratio: downloadRatio } = useEpisodeDownloadStatus(
+  const {
+    state: downloadState,
+    ratio: downloadRatio,
+    markStopped: markDownloadStopped,
+  } = useEpisodeDownloadStatus(
     episode.episodeKey,
     episode.downloadState,
   );
@@ -124,26 +133,40 @@ export function EpisodeRow({
     !episode.enclosureUrl?.startsWith('content://');
   const isDownloading =
     canDownloadEpisode && (downloadState === 'RUNNING' || downloadState === 'QUEUED');
+  /** `QUEUED`: waiting for one of the host's 3 concurrent download slots. */
+  const isDownloadQueued = isDownloading && downloadState === 'QUEUED';
   const isDownloadFailed = canDownloadEpisode && downloadState === 'FAILED';
   const downloadPercent = downloadRatioToPercent(downloadRatio);
+  const stopGenerationRef = useRef(0);
 
   /** `继续下载`: resumes the failed `.part` (HTTP `Range`); a repeated failure shows `下载失败`. */
   const handleResumeDownload = async () => {
+    clearDownloadStop(host, episode.episodeKey);
+    const stopGeneration = stopGenerationRef.current;
     try {
       await host.episodes.download(episode.episodeKey);
     } catch {
+      // A download the user stopped meanwhile is not a failure.
+      if (stopGenerationRef.current !== stopGeneration) return;
       showSnackbar(t('queue.downloadFailed'));
     } finally {
       onChanged();
     }
   };
 
+  /**
+   * `停止下载` (also for a `QUEUED` download): flips the row to NONE at once and guards it against
+   * stale `download-updated` events / snapshots until the host processed the stop.
+   */
   const handleStopDownload = async () => {
+    stopGenerationRef.current += 1;
+    markDownloadStopped();
     try {
       await host.episodes.deleteDownload(episode.episodeKey);
     } catch {
       // ignore: the next revalidation shows the real state
     } finally {
+      endDownloadStop(host, episode.episodeKey);
       onChanged();
     }
   };
@@ -407,21 +430,36 @@ export function EpisodeRow({
                   {remStr && <span>{remStr}</span>}
                   {isDownloading && (
                     <span
-                      className="m-queue-cache-status is-downloading"
+                      className={cx(
+                        'm-queue-cache-status is-downloading',
+                        isDownloadQueued && 'is-queued',
+                      )}
                       role="button"
                       tabIndex={0}
                       aria-label={t('detail.stopDownload')}
-                      title={`${t('queue.cachingProgress', { percent: downloadPercent })} · ${t('detail.stopDownload')}`}
+                      title={`${isDownloadQueued ? t('queue.waiting') : t('queue.cachingProgress', { percent: downloadPercent })} · ${t('detail.stopDownload')}`}
                       data-testid={`ep-download-progress-${episode.episodeKey}`}
                       data-cache-state="downloading"
+                      data-download-phase={isDownloadQueued ? 'queued' : 'running'}
                       data-cache-progress={downloadPercent}
                       style={{ cursor: 'pointer' }}
                       {...inlineRowActionProps(() => {
                         void handleStopDownload();
                       })}
                     >
-                      <DownloadPercentText percent={downloadPercent} />
-                      <DownloadProgressRing ratio={downloadRatio ?? 0} withStop />
+                      {isDownloadQueued ? (
+                        <DownloadWaitingText
+                          label={t('queue.waiting')}
+                          testId={`ep-download-waiting-${episode.episodeKey}`}
+                        />
+                      ) : (
+                        <DownloadPercentText percent={downloadPercent} />
+                      )}
+                      <DownloadProgressRing
+                        ratio={downloadRatio ?? 0}
+                        withStop
+                        waiting={isDownloadQueued}
+                      />
                     </span>
                   )}
                   {isDownloadFailed && (
@@ -547,9 +585,18 @@ export function EpisodeRow({
                 </div>
               )}
               <DetailDownloadStatus
-                state={isDownloading ? 'downloading' : isDownloadFailed ? 'failed' : null}
+                state={
+                  isDownloadQueued
+                    ? 'queued'
+                    : isDownloading
+                      ? 'downloading'
+                      : isDownloadFailed
+                        ? 'failed'
+                        : null
+                }
                 ratio={downloadRatio ?? 0}
                 downloadingLabel={t('detail.downloadingProgress', { percent: downloadPercent })}
+                queuedLabel={t('detail.downloadWaiting')}
                 failedLabel={t('queue.downloadFailed')}
                 testId={`ep-detail-download-status-${episode.episodeKey}`}
               />

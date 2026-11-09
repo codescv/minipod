@@ -274,4 +274,57 @@ describe('IdbSyncStore & AndroidSecretsStore', () => {
     expect((await db.get('settings', 'app'))?.value.deleteDownloadWhenPlayed).toBe(false);
     db.close();
   });
+
+  it('failStaleInFlightDownloads keeps natively-active episodes; updateEpisodeDownloadStateIf only applies from the expected states (4daa0030)', async () => {
+    const db = await openMiniPodDb(new IDBFactory(), 'test-download-states');
+    const wall = 1_700_000_000_000;
+    const store = new IdbSyncStore({
+      db,
+      hlc: new HybridLogicalClock(0, () => wall),
+      appVersion: '0.1.0',
+      defaultDeviceName: 'Pixel 8',
+    });
+    await store.init();
+    await store.upsertParsedFeed({
+      feedKey: 'f_dl',
+      kind: 'RSS',
+      url: 'https://example.com/dl.xml',
+      subscribed: true,
+      parsed: {
+        type: 'rss20',
+        title: 'DL Show',
+        episodes: ['a', 'b', 'c'].map((id) => ({
+          identity: `ep-${id}`,
+          title: `Ep ${id}`,
+          mediaType: 'AUDIO' as const,
+          enclosureUrl: `https://example.com/${id}.mp3`,
+        })),
+      },
+      nowWallMs: wall,
+      markSyncDirty: false,
+    });
+    const keys = (await store.listEpisodes('f_dl', 'all')).items.map((r) => r.episode.episodeKey);
+    const [a, b, c] = keys as [string, string, string];
+    await store.setEpisodeDownloadState(a, 'RUNNING');
+    await store.setEpisodeDownloadState(b, 'QUEUED');
+    await store.setEpisodeDownloadState(c, 'QUEUED');
+
+    expect(await store.failStaleInFlightDownloads(new Set([a, b]))).toEqual([c]);
+    expect((await db.get('episodes', a))?.downloadState).toBe('RUNNING');
+    expect((await db.get('episodes', b))?.downloadState).toBe('QUEUED');
+    expect((await db.get('episodes', c))?.downloadState).toBe('FAILED');
+
+    expect(await store.updateEpisodeDownloadStateIf(a, ['QUEUED', 'RUNNING'], 'DONE', 'downloads/a.mp3')).toBe(
+      'RUNNING',
+    );
+    expect(await db.get('episodes', a)).toMatchObject({ downloadState: 'DONE', downloadPath: 'downloads/a.mp3' });
+    // A late RUNNING must never resurrect over DONE / a cancelled NONE.
+    expect(await store.updateEpisodeDownloadStateIf(a, ['QUEUED', 'RUNNING'], 'RUNNING')).toBeUndefined();
+    expect((await db.get('episodes', a))?.downloadState).toBe('DONE');
+    await store.setEpisodeDownloadState(b, 'NONE');
+    expect(await store.updateEpisodeDownloadStateIf(b, ['QUEUED', 'RUNNING'], 'RUNNING')).toBeUndefined();
+    expect((await db.get('episodes', b))?.downloadState).toBe('NONE');
+    expect(await store.updateEpisodeDownloadStateIf('missing', ['NONE'], 'RUNNING')).toBeUndefined();
+    db.close();
+  });
 });

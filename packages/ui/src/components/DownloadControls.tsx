@@ -48,25 +48,44 @@ export function inlineRowActionProps(action: () => void): {
   };
 }
 
-/** Dashed track + solid arc progress ring (14×14) with an optional centered stop square. */
+/**
+ * Dashed track + solid arc progress ring (14×14) with an optional centered stop square.
+ *
+ * `waiting` (`QUEUED`: the host caps downloads at 3 concurrent and holds the rest): the dashed
+ * track slowly spins (indeterminate) and the arc only shows a prior partial ratio (a resumed
+ * `.part`), dimmed, so a waiting download is distinguishable from a `RUNNING` one at a glance.
+ */
 export function DownloadProgressRing({
   ratio,
   withStop,
+  waiting = false,
 }: {
   readonly ratio: number;
   readonly withStop: boolean;
+  readonly waiting?: boolean | undefined;
 }) {
   const clamped = Math.max(0, Math.min(1, ratio));
+  const arcFraction = waiting ? clamped : Math.max(0.12, clamped);
   return (
-    <svg width={14} height={14} viewBox="0 0 14 14" fill="none" aria-hidden="true" focusable="false">
+    <svg
+      className={waiting ? 'm-download-ring is-waiting' : 'm-download-ring'}
+      width={14}
+      height={14}
+      viewBox="0 0 14 14"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+      data-ring-waiting={waiting ? 'true' : undefined}
+    >
       <circle
+        className="m-download-ring__track"
         cx="7"
         cy="7"
         r="5.25"
         stroke="currentColor"
         strokeWidth="1.5"
         strokeDasharray="2.1 2.1"
-        opacity="0.45"
+        opacity={waiting ? 0.7 : 0.45}
       />
       <circle
         cx="7"
@@ -76,11 +95,27 @@ export function DownloadProgressRing({
         strokeWidth="1.6"
         strokeLinecap="round"
         strokeDasharray={32.99}
-        strokeDashoffset={Number((32.99 * (1 - Math.max(0.12, clamped))).toFixed(2))}
+        strokeDashoffset={Number((32.99 * (1 - arcFraction)).toFixed(2))}
         transform="rotate(-90 7 7)"
+        opacity={waiting ? (arcFraction > 0 ? 0.55 : 0) : undefined}
       />
       {withStop && <rect x="5" y="5" width="4" height="4" rx="0.7" fill="currentColor" />}
     </svg>
+  );
+}
+
+/** Visible `等待中` / `Waiting` / `待機中` label shown instead of `{percent}%` while `QUEUED`. */
+export function DownloadWaitingText({
+  label,
+  testId,
+}: {
+  readonly label: string;
+  readonly testId?: string | undefined;
+}) {
+  return (
+    <span className="m-download-waiting" data-testid={testId}>
+      {label}
+    </span>
   );
 }
 
@@ -131,19 +166,21 @@ export function ResumeDownloadChip({
 }
 
 /**
- * `episode-detail-sheet` download status line: `下载中 42%` (with ring) while `QUEUED`/`RUNNING`,
- * `下载失败` while `FAILED`; renders nothing otherwise.
+ * `episode-detail-sheet` download status line: `下载中 42%` (with ring) while `RUNNING`,
+ * `等待下载` (waiting ring) while `QUEUED`, `下载失败` while `FAILED`; renders nothing otherwise.
  */
 export function DetailDownloadStatus({
   state,
   ratio,
   downloadingLabel,
+  queuedLabel,
   failedLabel,
   testId,
 }: {
-  readonly state: 'downloading' | 'failed' | null;
+  readonly state: 'downloading' | 'queued' | 'failed' | null;
   readonly ratio: number;
   readonly downloadingLabel: string;
+  readonly queuedLabel?: string | undefined;
   readonly failedLabel: string;
   readonly testId: string;
 }) {
@@ -156,12 +193,18 @@ export function DetailDownloadStatus({
       data-testid={testId}
       data-download-state={state}
     >
-      {state === 'downloading' ? (
-        <DownloadProgressRing ratio={ratio} withStop={false} />
-      ) : (
+      {state === 'failed' ? (
         <Icon name="close" size={14} />
+      ) : (
+        <DownloadProgressRing ratio={ratio} withStop={false} waiting={state === 'queued'} />
       )}
-      <span>{state === 'downloading' ? downloadingLabel : failedLabel}</span>
+      <span>
+        {state === 'downloading'
+          ? downloadingLabel
+          : state === 'queued'
+            ? (queuedLabel ?? downloadingLabel)
+            : failedLabel}
+      </span>
     </div>
   );
 }

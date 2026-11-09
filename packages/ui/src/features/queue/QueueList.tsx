@@ -38,13 +38,18 @@ import { usePlayer } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import {
   applyDownloadStateToViewCache,
+  beginDownloadStop,
+  clearDownloadStop,
   downloadRatioToPercent,
+  endDownloadStop,
   getHostViewCache,
+  guardStoppedDownloadState,
 } from '../../stores/view-cache';
 import {
   DetailDownloadStatus,
   DownloadPercentText,
   DownloadProgressRing,
+  DownloadWaitingText,
   ResumeDownloadChip,
   inlineRowActionProps,
 } from '../../components/DownloadControls';
@@ -119,6 +124,8 @@ export function QueueList() {
   const lastDownloadEventRef = useRef(
     new Map<EpisodeKey, { readonly seq: number; readonly state: DownloadState }>(),
   );
+  /** Per-episode count of user-requested stops (a stopped download rejecting is not a failure). */
+  const stopGenerationRef = useRef(new Map<EpisodeKey, number>());
 
   const clearUndoTimer = useCallback(() => {
     if (undoTimerRef.current !== null) {
@@ -134,15 +141,21 @@ export function QueueList() {
     try {
       const [fetched, fList] = await Promise.all([host.queue.list(), host.feeds.list()]);
       const newerEvents = [...lastDownloadEventRef.current].filter(([, e]) => e.seq > startSeq);
-      const q =
-        newerEvents.length === 0
-          ? fetched
-          : fetched.map((r) => {
-              const live = lastDownloadEventRef.current.get(r.episode.episodeKey);
-              return live && live.seq > startSeq && live.state !== r.episode.downloadState
-                ? { ...r, episode: { ...r.episode, downloadState: live.state } }
-                : r;
-            });
+      const now = Date.now();
+      const q = fetched.map((r) => {
+        const live =
+          newerEvents.length === 0
+            ? undefined
+            : lastDownloadEventRef.current.get(r.episode.episodeKey);
+        const snapshotState =
+          live && live.seq > startSeq ? live.state : r.episode.downloadState;
+        // A snapshot fetched while `停止下载` / `停止全部` is still in flight must not resurrect
+        // the stopped QUEUED / RUNNING download.
+        const state = guardStoppedDownloadState(host, r.episode.episodeKey, snapshotState, now);
+        return state !== r.episode.downloadState
+          ? { ...r, episode: { ...r.episode, downloadState: state } }
+          : r;
+      });
       const map = new Map<FeedKey, Feed>();
       for (const f of fList) {
         map.set(f.feedKey, f);
@@ -509,12 +522,18 @@ export function QueueList() {
       )
     : [];
 
+  /**
+   * `下载全部`: dispatches every NONE / FAILED downloadable row at once (never sequentially). The
+   * hosts run at most 3 transfers concurrently (`RUNNING`) and hold the rest as `QUEUED`, promoting
+   * them as slots free up; each `download()` promise settles when its own transfer ends.
+   */
   const handleDownloadAll = useCallback(async () => {
     if (!canDownload || downloadableRows.length === 0) return;
     const keys = downloadableRows.map((r) => r.episode.episodeKey);
+    for (const key of keys) clearDownloadStop(host, key);
     await Promise.allSettled(keys.map((key) => host.episodes.download(key)));
     await loadQueue().catch(() => undefined);
-  }, [canDownload, downloadableRows, host.episodes, loadQueue]);
+  }, [canDownload, downloadableRows, host, loadQueue]);
 
   const downloadingRows = canDownload
     ? rows.filter(
@@ -522,14 +541,19 @@ export function QueueList() {
       )
     : [];
 
-  /** Optimistically flips the given episodes to `downloadState: 'NONE'` and clears their progress. */
+  /**
+   * Optimistically flips the given episodes to `downloadState: 'NONE'`, clears their progress and
+   * starts a stop guard (`beginDownloadStop`; pair with `endDownloadStop`) so stale events /
+   * snapshots from before the host processed the stop cannot revert them.
+   */
   const markDownloadsStopped = useCallback(
     (keySet: ReadonlySet<EpisodeKey>) => {
       for (const key of keySet) {
         // Wins over any `loadQueue()` already in flight (it must not revert the row to RUNNING).
         downloadEventSeqRef.current += 1;
         lastDownloadEventRef.current.set(key, { seq: downloadEventSeqRef.current, state: 'NONE' });
-        applyDownloadStateToViewCache(host, key, 'NONE');
+        stopGenerationRef.current.set(key, (stopGenerationRef.current.get(key) ?? 0) + 1);
+        beginDownloadStop(host, key);
       }
       setDetailsSnapshot((prev) =>
         prev && keySet.has(prev.episode.episodeKey)
@@ -566,10 +590,11 @@ export function QueueList() {
       } catch {
         // ignore: the revalidation below shows the real state
       } finally {
+        endDownloadStop(host, epKey);
         await loadQueue().catch(() => undefined);
       }
     },
-    [host.episodes, loadQueue, markDownloadsStopped],
+    [host, loadQueue, markDownloadsStopped],
   );
 
   /**
@@ -579,25 +604,41 @@ export function QueueList() {
    */
   const handleResumeDownload = useCallback(
     async (epKey: EpisodeKey) => {
+      clearDownloadStop(host, epKey);
+      const stopGeneration = stopGenerationRef.current.get(epKey) ?? 0;
       try {
         await host.episodes.download(epKey);
       } catch {
+        // A download the user stopped meanwhile (`停止下载` / `停止全部`) is not a failure.
+        if ((stopGenerationRef.current.get(epKey) ?? 0) !== stopGeneration) return;
         showSnackbar(t('queue.downloadFailed'));
       } finally {
         await loadQueue().catch(() => undefined);
       }
     },
-    [host.episodes, loadQueue, t],
+    [host, loadQueue, t],
   );
 
+  /**
+   * `停止全部`: stops every `RUNNING` and `QUEUED` download at once. Rows flip to NONE immediately
+   * and stay there: guarded against late `download-updated` events (e.g. a QUEUED -> RUNNING
+   * promotion when a slot frees up, or an auto-retry) and stale `loadQueue()` snapshots until each
+   * `deleteDownload` settles and the host confirms.
+   */
   const handleStopAllDownloads = useCallback(async () => {
     if (!canDownload || downloadingRows.length === 0) return;
     const keys = downloadingRows.map((r) => r.episode.episodeKey);
     const keySet = new Set(keys);
     markDownloadsStopped(keySet);
-    await Promise.allSettled(keys.map((key) => host.episodes.deleteDownload(key)));
+    await Promise.allSettled(
+      keys.map((key) =>
+        host.episodes.deleteDownload(key).finally(() => {
+          endDownloadStop(host, key);
+        }),
+      ),
+    );
     await loadQueue().catch(() => undefined);
-  }, [canDownload, downloadingRows, host.episodes, loadQueue, markDownloadsStopped]);
+  }, [canDownload, downloadingRows, host, loadQueue, markDownloadsStopped]);
 
   const headerMenuItems: MenuEntry[] = [
     {
@@ -775,10 +816,12 @@ export function QueueList() {
     const isDownloading =
       canDownloadEpisode &&
       (episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED');
+    const isDownloadQueued = isDownloading && episode.downloadState === 'QUEUED';
     const isDownloadFailed = canDownloadEpisode && episode.downloadState === 'FAILED';
     const downloadRatio = downloadProgressByKey.get(epKey) ?? 0;
     return {
       isDownloading,
+      isDownloadQueued,
       isDownloadFailed,
       downloadRatio,
       downloadPercent: downloadRatioToPercent(downloadRatio),
@@ -921,6 +964,7 @@ export function QueueList() {
                   downloadProgress={rawProgress}
                   cachedLabel={t('queue.cached')}
                   cachingLabel={cachingLabel}
+                  waitingLabel={t('queue.waiting')}
                   stopDownloadLabel={t('detail.stopDownload')}
                   onStopDownload={() => {
                     void handleStopDownload(epKey);
@@ -1083,9 +1127,11 @@ export function QueueList() {
                 )}
                 <DetailDownloadStatus
                   state={
-                    detailsSheet.isDownloading
-                      ? 'downloading'
-                      : detailsSheet.isDownloadFailed
+                    detailsSheet.isDownloadQueued
+                      ? 'queued'
+                      : detailsSheet.isDownloading
+                        ? 'downloading'
+                        : detailsSheet.isDownloadFailed
                         ? 'failed'
                         : null
                   }
@@ -1093,6 +1139,7 @@ export function QueueList() {
                   downloadingLabel={t('detail.downloadingProgress', {
                     percent: detailsSheet.downloadPercent,
                   })}
+                  queuedLabel={t('detail.downloadWaiting')}
                   failedLabel={t('queue.downloadFailed')}
                   testId={`ep-detail-download-status-${detailsSheet.epKey}`}
                 />
@@ -1225,6 +1272,7 @@ function QueueRowItem({
   downloadProgress,
   cachedLabel,
   cachingLabel,
+  waitingLabel,
   stopDownloadLabel,
   onStopDownload,
   canResumeDownload,
@@ -1261,6 +1309,8 @@ function QueueRowItem({
   readonly downloadProgress?: number | undefined;
   readonly cachedLabel: string;
   readonly cachingLabel: string;
+  /** `等待中` label shown instead of `{percent}%` while `QUEUED` (waiting for a download slot). */
+  readonly waitingLabel: string;
   readonly stopDownloadLabel: string;
   readonly onStopDownload: () => void;
   readonly canResumeDownload: boolean;
@@ -1304,6 +1354,7 @@ function QueueRowItem({
   const dlState = row.episode.downloadState;
   const isCacheDone = dlState === 'DONE';
   const isCacheDownloading = dlState === 'RUNNING' || dlState === 'QUEUED';
+  const isCacheQueued = dlState === 'QUEUED';
   const isCacheFailed = dlState === 'FAILED' && canResumeDownload;
   const progressRatio = Math.max(0, Math.min(1, downloadProgress ?? 0));
   const progressPercent = downloadRatioToPercent(progressRatio);
@@ -1551,22 +1602,33 @@ function QueueRowItem({
               )}
               {isCacheDownloading && (
                 <span
-                  className="m-queue-cache-status is-downloading"
+                  className={cx(
+                    'm-queue-cache-status is-downloading',
+                    isCacheQueued && 'is-queued',
+                  )}
                   role="button"
                   tabIndex={0}
                   aria-label={stopDownloadLabel}
-                  title={`${cachingLabel} · ${stopDownloadLabel}`}
+                  title={`${isCacheQueued ? waitingLabel : cachingLabel} · ${stopDownloadLabel}`}
                   data-testid={`queue-cache-status-${epKey}`}
                   data-cache-state="downloading"
+                  data-download-phase={isCacheQueued ? 'queued' : 'running'}
                   data-cache-progress={progressPercent}
                   style={{ cursor: 'pointer' }}
                   {...inlineRowActionProps(onStopDownload)}
                 >
-                  <DownloadPercentText
-                    percent={progressPercent}
-                    testId={`queue-cache-percent-${epKey}`}
-                  />
-                  <DownloadProgressRing ratio={progressRatio} withStop />
+                  {isCacheQueued ? (
+                    <DownloadWaitingText
+                      label={waitingLabel}
+                      testId={`queue-cache-waiting-${epKey}`}
+                    />
+                  ) : (
+                    <DownloadPercentText
+                      percent={progressPercent}
+                      testId={`queue-cache-percent-${epKey}`}
+                    />
+                  )}
+                  <DownloadProgressRing ratio={progressRatio} withStop waiting={isCacheQueued} />
                 </span>
               )}
               {isCacheFailed && (
