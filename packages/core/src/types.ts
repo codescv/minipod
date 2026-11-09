@@ -814,6 +814,12 @@ export interface EpisodesApi {
   get(episodeKey: EpisodeKey): Promise<EpisodeRow>;
   download(episodeKey: EpisodeKey): Promise<void>;
   deleteDownload(episodeKey: EpisodeKey): Promise<void>;
+  /**
+   * Queue `停止全部`: atomically stops every QUEUED and RUNNING download (queued ones never start,
+   * none of the cancelled ones is promoted), deletes their `.part` files and settles them to `NONE`.
+   * Optional: callers fall back to `deleteDownload` per episode (QUEUED keys first).
+   */
+  cancelAllDownloads?(): Promise<void>;
   chapters(episodeKey: EpisodeKey, forceRefresh?: boolean): Promise<readonly Chapter[]>;
   /** Resolves `Chapter.embeddedImage` / `imageUrl` to something an `<img>` can load (desktop route URL, Android `data:` URL). */
   chapterImage(episodeKey: EpisodeKey, chapterIndex: number): Promise<string | undefined>;

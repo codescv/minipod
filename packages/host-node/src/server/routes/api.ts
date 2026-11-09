@@ -229,6 +229,14 @@ export function createApiRoutes(host: PlatformHost, mediaProxy: MediaProxy): Hon
     }),
   );
 
+  // Queue `停止全部`. Static path registered before the `/episodes/:episodeKey/...` routes.
+  api.post('/episodes/downloads/cancel-all', (c) =>
+    handleApi(c, async () => {
+      await host.episodes.cancelAllDownloads?.();
+      return null;
+    }),
+  );
+
   api.post('/episodes/:episodeKey/download', (c) =>
     handleApi(c, async () => {
       await host.episodes.download(c.req.param('episodeKey'));

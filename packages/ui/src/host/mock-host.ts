@@ -1169,6 +1169,24 @@ export class MockPlatformHost implements PlatformHost {
       this.emit({ type: 'episodes-changed', feedKey: ep.feedKey });
     },
 
+    cancelAllDownloads: async () => {
+      // Parity with the real hosts' atomic `停止全部`: every QUEUED (first) and RUNNING download
+      // settles to NONE at once, none is promoted.
+      const active = [...this.episodesMap.values()].filter(
+        (e) => e.downloadState === 'QUEUED' || e.downloadState === 'RUNNING',
+      );
+      active.sort((a, b) => Number(b.downloadState === 'QUEUED') - Number(a.downloadState === 'QUEUED'));
+      const feeds = new Set<FeedKey>();
+      for (const ep of active) {
+        const { downloadPath: _omit, ...rest } = ep;
+        void _omit;
+        this.episodesMap.set(ep.episodeKey, { ...rest, downloadState: 'NONE' });
+        this.emit({ type: 'download-updated', episodeKey: ep.episodeKey, state: 'NONE', progress: 0 });
+        feeds.add(ep.feedKey);
+      }
+      for (const feedKey of feeds) this.emit({ type: 'episodes-changed', feedKey });
+    },
+
     chapters: async (episodeKey) => this.chaptersMap.get(episodeKey) ?? [],
 
     chapterImage: async (episodeKey, chapterIndex) => {

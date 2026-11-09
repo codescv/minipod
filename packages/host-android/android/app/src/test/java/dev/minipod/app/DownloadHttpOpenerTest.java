@@ -116,4 +116,70 @@ public class DownloadHttpOpenerTest {
         }
         assertTrue(requests.isEmpty());
     }
+
+    @Test
+    public void basicAuth_isStrippedOnCrossOriginRedirect_afterChallenge() throws IOException {
+        // Feed host challenges, then redirects the authorized request to an S3 pre-signed URL.
+        OkHttpClient c = client(req -> {
+            if (req.url().host().equals("private.example.com")) {
+                return req.header("Authorization") == null
+                    ? new Response.Builder().code(401)
+                    : new Response.Builder().code(302).header(
+                        "Location", "https://bucket.s3.amazonaws.com/ep.mp3?X-Amz-Signature=abc");
+            }
+            // S3 rejects any extra Authorization header.
+            return new Response.Builder().code(req.header("Authorization") == null ? 206 : 400);
+        });
+        try (Response r = new DownloadHttpOpener(
+            c, "https://private.example.com/ep.mp3", null, "user", "pw", null
+        ).open(100L)) {
+            assertEquals(206, r.code());
+        }
+        assertEquals(3, requests.size());
+        assertNull(requests.get(0).header("Authorization"));
+        assertTrue(requests.get(1).header("Authorization").startsWith("Basic "));
+        assertEquals("bucket.s3.amazonaws.com", requests.get(2).url().host());
+        assertNull("credentials must not leak cross-origin", requests.get(2).header("Authorization"));
+        assertEquals("bytes=100-", requests.get(2).header("Range"));
+    }
+
+    @Test
+    public void basicAuth_keptOnSameOriginRedirect_andHttpsUpgrade() throws IOException {
+        OkHttpClient c = client(req -> {
+            if (req.header("Authorization") == null) return new Response.Builder().code(401);
+            if (req.url().encodedPath().equals("/ep.mp3")) {
+                return new Response.Builder().code(301).header("Location", "https://private.example.com/v2/ep.mp3");
+            }
+            return new Response.Builder().code(200);
+        });
+        try (Response r = new DownloadHttpOpener(
+            c, "http://private.example.com/ep.mp3", null, "user", "pw", null
+        ).open(0L)) {
+            assertEquals(200, r.code());
+        }
+        assertTrue(requests.get(requests.size() - 1).header("Authorization").startsWith("Basic "));
+    }
+
+    @Test
+    public void inlineCredentialsInRedirectTarget_applyToThatOriginOnly() throws IOException {
+        OkHttpClient c = client(req -> req.url().host().equals("feeds.example.com")
+            ? new Response.Builder().code(302).header("Location", "https://cdnuser:cdnpw@cdn.example.com/ep.mp3")
+            : new Response.Builder().code(200));
+        new DownloadHttpOpener(c, "https://feeds.example.com/ep.mp3", null, null, null, null).open(0L).close();
+        Request cdn = requests.get(1);
+        assertEquals("", cdn.url().username());
+        assertEquals(okhttp3.Credentials.basic("cdnuser", "cdnpw", java.nio.charset.StandardCharsets.UTF_8),
+            cdn.header("Authorization"));
+    }
+
+    @Test
+    public void sameOrigin_rules() {
+        okhttp3.HttpUrl a = okhttp3.HttpUrl.get("http://h.example.com/a");
+        assertTrue(DownloadHttpOpener.sameOrigin(a, okhttp3.HttpUrl.get("https://h.example.com/b")));
+        assertTrue(DownloadHttpOpener.sameOrigin(a, okhttp3.HttpUrl.get("http://H.example.com/c")));
+        assertTrue(!DownloadHttpOpener.sameOrigin(a, okhttp3.HttpUrl.get("http://cdn.example.com/a")));
+        assertTrue(!DownloadHttpOpener.sameOrigin(a, okhttp3.HttpUrl.get("http://h.example.com:8080/a")));
+        assertTrue(!DownloadHttpOpener.sameOrigin(okhttp3.HttpUrl.get("https://h.example.com/"),
+            okhttp3.HttpUrl.get("http://h.example.com/")));
+    }
 }

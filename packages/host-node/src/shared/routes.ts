@@ -118,6 +118,7 @@ export const ROUTES = {
     'DELETE',
     '/api/episodes/:episodeKey/download',
   ),
+  episodesCancelAllDownloads: route<void, null>('POST', '/api/episodes/downloads/cancel-all'),
   episodesChapters: route<
     { readonly episodeKey: EpisodeKey; readonly forceRefresh?: boolean },
     readonly Chapter[]

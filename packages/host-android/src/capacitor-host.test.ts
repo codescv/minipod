@@ -1386,6 +1386,119 @@ describe('CapacitorPlatformHost', () => {
       expect([...statesOf(k1), ...statesOf(k2)]).not.toContain('FAILED');
       await host.dispose();
     });
+
+    it('cancelAllDownloads (`停止全部`): one native cancelAll stops 3 RUNNING + 3 QUEUED, all NONE, no promotion or late resurrection', async () => {
+      const rss6 = SAMPLE_RSS_4.replace(
+        '</channel>',
+        [5, 6]
+          .map(
+            (n) => `<item>
+      <guid>ep-${n}</guid>
+      <title>Episode ${n}</title>
+      <enclosure url="https://pod.example.com/ep${n}.mp3" type="audio/mpeg" length="1000" />
+      <pubDate>Sun, 02 Nov 2026 1${n}:00:00 GMT</pubDate>
+    </item>`,
+          )
+          .join('\n') + '</channel>',
+      );
+      const harness = createTestPluginHarness();
+      const nq = withNativeDownloadQueue(harness, rss6);
+      // Native `cancelAllDownloads` drains queued first, then cancels running (rejecting `httpToFile`).
+      harness.plugin.cancelAllDownloads = vi.fn(async () => {
+        for (const [key, p] of [...nq.pending]) {
+          p.reject(Object.assign(new Error('Download cancelled'), { code: 'cancelled' }));
+          nq.pending.delete(key);
+        }
+      });
+      const bundle = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory: new IDBFactory(),
+        dbName: 'host-native-queue-cancel-all-test',
+        preferences: createMemoryPreferences(),
+      });
+      const { host, db } = bundle;
+      const { statesOf } = recordDownloadEvents(host);
+      const changedFeeds: string[] = [];
+      host.subscribe((ev) => {
+        if (ev.type === 'episodes-changed') changedFeeds.push(ev.feedKey);
+      });
+      const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+      const keys = [1, 2, 3, 4, 5, 6].map((n) => deriveEpisodeKey(feed.feedKey, `ep-${n}`));
+      const running = keys.slice(0, 3);
+      const queued = keys.slice(3);
+      const settled = keys.map((k) => host.episodes.download(k).then(() => 'ok', (e: { code?: string }) => e.code ?? 'error'));
+      await vi.waitFor(() => {
+        expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(6);
+      });
+      for (const k of running) harness.emitNative('download-state', { episodeKey: k, state: 'RUNNING' });
+      await vi.waitFor(async () => {
+        for (const k of running) expect((await db.get('episodes', k))?.downloadState).toBe('RUNNING');
+      });
+      for (const k of queued) expect((await db.get('episodes', k))?.downloadState).toBe('QUEUED');
+
+      await host.episodes.cancelAllDownloads?.();
+      expect(await Promise.all(settled)).toEqual(keys.map(() => 'ok'));
+      expect(harness.plugin.cancelAllDownloads).toHaveBeenCalledTimes(1);
+      expect(harness.plugin.cancelDownload).not.toHaveBeenCalled();
+      expect(harness.plugin.ackDownloadResults).toHaveBeenCalledWith({
+        episodeKeys: expect.arrayContaining(keys),
+      });
+      for (const k of keys) {
+        expect((await db.get('episodes', k))?.downloadState).toBe('NONE');
+        expect(statesOf(k).at(-1)).toBe('NONE');
+        expect(harness.deletedLocalFiles).toEqual(
+          expect.arrayContaining([`downloads/${k}.mp3`, `downloads/${k}.mp3.part`]),
+        );
+      }
+      expect(changedFeeds).toContain(feed.feedKey);
+
+      // Late native events (a promoted slot, a finished file) never resurrect a stopped episode.
+      for (const k of keys) harness.emitNative('download-state', { episodeKey: k, state: 'RUNNING' });
+      harness.emitNative('download-progress', { episodeKey: queued[0]!, bytesDownloaded: 10, totalBytes: 100 });
+      harness.emitNative('download-state', {
+        episodeKey: running[0]!,
+        state: 'DONE',
+        path: filePathFor(`downloads/${running[0]!}.mp3`),
+      });
+      await tick();
+      for (const k of keys) {
+        expect((await db.get('episodes', k))?.downloadState).toBe('NONE');
+        expect(statesOf(k).at(-1)).toBe('NONE');
+        expect(statesOf(k)).not.toContain('FAILED');
+      }
+      expect(harness.deletedLocalFiles).toContain(filePathFor(`downloads/${running[0]!}.mp3`));
+      expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(6);
+      await host.dispose();
+    });
+
+    it('cancelAllDownloads falls back to per-episode cancels (QUEUED before RUNNING) on an older APK', async () => {
+      const harness = createTestPluginHarness();
+      withNativeDownloadQueue(harness);
+      delete (harness.plugin as { cancelAllDownloads?: unknown }).cancelAllDownloads;
+      const { host, db } = await createCapacitorPlatformHost({
+        plugin: harness.plugin,
+        idbFactory: new IDBFactory(),
+        dbName: 'host-native-queue-cancel-all-fallback-test',
+        preferences: createMemoryPreferences(),
+      });
+      const feed = await host.feeds.subscribe('https://pod.example.com/rss.xml');
+      const keys = [1, 2, 3, 4].map((n) => deriveEpisodeKey(feed.feedKey, `ep-${n}`));
+      const settled = keys.map((k) => host.episodes.download(k).catch(() => undefined));
+      await vi.waitFor(() => {
+        expect(harness.plugin.httpToFile).toHaveBeenCalledTimes(4);
+      });
+      for (const k of keys.slice(0, 3)) harness.emitNative('download-state', { episodeKey: k, state: 'RUNNING' });
+      await vi.waitFor(async () => {
+        for (const k of keys.slice(0, 3)) expect((await db.get('episodes', k))?.downloadState).toBe('RUNNING');
+      });
+      await host.episodes.cancelAllDownloads?.();
+      await Promise.all(settled);
+      const order = vi.mocked(harness.plugin.cancelDownload).mock.calls.map(([o]) => o.episodeKey);
+      expect(order[0]).toBe(keys[3]);
+      expect([...order].sort()).toEqual([...keys].sort());
+      for (const k of keys) expect((await db.get('episodes', k))?.downloadState).toBe('NONE');
+      await host.dispose();
+    });
   });
 
   describe('Airplane Mode: downloaded audio -> background -> pause -> foreground -> Play (v0.1.21 bug)', () => {

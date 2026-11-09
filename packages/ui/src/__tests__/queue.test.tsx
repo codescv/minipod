@@ -492,6 +492,7 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
     const secondKey = q[1]!.episode.episodeKey;
     const thirdKey = q[2]!.episode.episodeKey;
     const deleteSpy = vi.spyOn(host.episodes, 'deleteDownload');
+    const cancelAllSpy = vi.spyOn(host.episodes, 'cancelAllDownloads');
 
     // Overflow menu has no `Stop all` without active downloads
     fireEvent.click(screen.getByTestId('queue-overflow-btn'));
@@ -516,11 +517,12 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
       expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
     });
-    expect(deleteSpy).toHaveBeenCalledWith(secondKey);
-    expect(deleteSpy).toHaveBeenCalledWith(thirdKey);
+    // One atomic host call (queued downloads never start), no per-episode deletes
+    expect(cancelAllSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).not.toHaveBeenCalled();
 
     // 2) Overflow menu item `queue-stop-all`
-    deleteSpy.mockClear();
+    cancelAllSpy.mockClear();
     startBoth();
     fireEvent.click(screen.getByTestId('queue-overflow-btn'));
     const stopAllItem = screen.getByTestId('queue-stop-all');
@@ -531,7 +533,8 @@ describe('Unified Queue Gesture Rows, Working Pointer Drag Reorder, Swipe-Left R
       expect(screen.queryByTestId(`queue-cache-status-${thirdKey}`)).not.toBeInTheDocument();
       expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
     });
-    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(cancelAllSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).not.toHaveBeenCalled();
     expect((await host.queue.list()).find((r) => r.episode.episodeKey === secondKey)?.episode.downloadState).toBe('NONE');
     expect((await host.queue.list()).find((r) => r.episode.episodeKey === thirdKey)?.episode.downloadState).toBe('NONE');
   });

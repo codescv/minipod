@@ -283,20 +283,22 @@ export async function createCapacitorPlatformHost(
    */
   const terminalWaiters = new Map<EpisodeKey, (result: NativeDownloadTerminal) => void>();
 
-  /**
-   * Thoroughly removes an episode's download: cancels any in-flight/queued transfer, deletes the
-   * stored file (+ `.part`) and the deterministic `downloads/<episodeKey>.<ext>` target (+ `.part`),
-   * resets the IDB record to `NONE`, and emits `download-updated` + `episodes-changed`.
-   * Shared by `episodes.deleteDownload` and played auto-delete (`handleEpisodeCompletedSideEffects`).
-   */
-  const purgeEpisodeDownload = async (ep: {
+  interface PurgeableEpisode {
     readonly episodeKey: EpisodeKey;
     readonly feedKey: FeedKey;
     readonly downloadState: string;
     readonly downloadPath?: string | null | undefined;
     readonly enclosureUrl?: string | null | undefined;
     readonly enclosureMime?: string | null | undefined;
-  }): Promise<void> => {
+  }
+
+  /**
+   * Thoroughly removes an episode's download: cancels any in-flight/queued transfer, deletes the
+   * stored file (+ `.part`) and the deterministic `downloads/<episodeKey>.<ext>` target (+ `.part`),
+   * resets the IDB record to `NONE`, and emits `download-updated` + `episodes-changed`.
+   * Shared by `episodes.deleteDownload` and played auto-delete (`handleEpisodeCompletedSideEffects`).
+   */
+  const purgeEpisodeDownload = async (ep: PurgeableEpisode): Promise<void> => {
     const episodeKey = ep.episodeKey;
     // Mark first so a racing `httpToFile` resolution/rejection settles to `NONE` (never `FAILED`).
     cancelledDownloads.add(episodeKey);
@@ -306,6 +308,15 @@ export async function createCapacitorPlatformHost(
     // Drop any native terminal result (e.g. DONE right as the user stopped it) so a later
     // snapshot reconcile never resurrects it.
     await ackNativeDownloadResults([episodeKey]);
+    await removeDownloadArtifacts(ep);
+  };
+
+  /**
+   * Deletes an (already cancelled) episode's stored file + `.part` and deterministic target +
+   * `.part`, resets IDB to `NONE` and emits `download-updated` + `episodes-changed`.
+   */
+  const removeDownloadArtifacts = async (ep: PurgeableEpisode): Promise<void> => {
+    const episodeKey = ep.episodeKey;
     if (ep.downloadPath) {
       await plugin.deleteLocalFile({ path: ep.downloadPath }).catch(() => undefined);
       await plugin.deleteLocalFile({ path: `${ep.downloadPath}.part` }).catch(() => undefined);
@@ -1976,6 +1987,59 @@ export async function createCapacitorPlatformHost(
         const ep = await syncStore.getEpisodeRecord(episodeKey);
         if (!ep) return;
         await purgeEpisodeDownload(ep);
+        await syncNativeQueue();
+      },
+
+      async cancelAllDownloads(): Promise<void> {
+        // Queue `停止全部`: mark EVERY queued/running episode (and in-flight JS transfer) cancelled
+        // before touching native, so no late `RUNNING`/`DONE` event or `httpToFile` result can
+        // resurrect one, then stop the whole native queue at once (queued drained first, so none
+        // is promoted into a freed slot).
+        const records = await syncStore.listInFlightDownloadRecords();
+        const queued: EpisodeKey[] = [];
+        const running: EpisodeKey[] = [];
+        for (const rec of records) {
+          (rec.downloadState === 'QUEUED' ? queued : running).push(rec.episodeKey);
+        }
+        for (const key of inFlightDownloads.keys()) {
+          if (!queued.includes(key) && !running.includes(key)) running.push(key);
+        }
+        const keys = [...queued, ...running];
+        for (const key of keys) cancelledDownloads.add(key);
+
+        let cancelledNatively = false;
+        if (plugin.cancelAllDownloads) {
+          try {
+            await plugin.cancelAllDownloads();
+            cancelledNatively = true;
+          } catch {
+            // Fall back to per-episode cancels below.
+          }
+        }
+        if (!cancelledNatively) {
+          // QUEUED before RUNNING: a freed running slot never promotes a still-queued item.
+          for (const episodeKey of keys) {
+            await Promise.resolve()
+              .then(() => plugin.cancelDownload({ episodeKey }))
+              .catch(() => undefined);
+          }
+        }
+        await ackNativeDownloadResults(keys);
+
+        const listed = new Set(records.map((r) => r.episodeKey));
+        for (const episodeKey of keys) {
+          try {
+            const rec = await syncStore.getEpisodeRecord(episodeKey);
+            if (!rec) continue;
+            // An in-flight-only key that already settled (DONE/NONE) before the stop is left alone.
+            if (!listed.has(episodeKey) && rec.downloadState !== 'QUEUED' && rec.downloadState !== 'RUNNING') {
+              continue;
+            }
+            await removeDownloadArtifacts(rec);
+          } catch {
+            // One bad record never blocks stopping the rest.
+          }
+        }
         await syncNativeQueue();
       },
 

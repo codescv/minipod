@@ -9,6 +9,8 @@ final class DownloadForegroundPolicy {
 
     /** Upper bound of a single wake-lock acquisition; renewed while downloads stay active. */
     static final long WAKE_LOCK_TIMEOUT_MS = 60L * 60L * 1000L;
+    /** Re-acquire (extend) the bounded wake lock this often while downloads stay active. */
+    static final long WAKE_LOCK_RENEW_MS = 10L * 60L * 1000L;
     /** Min interval between notification progress refreshes (count changes are immediate). */
     static final long NOTIFICATION_THROTTLE_MS = 1_000L;
 
@@ -48,7 +50,15 @@ final class DownloadForegroundPolicy {
         return (int) Math.max(0L, Math.min(100L, (sumDone * 100L) / sumTotal));
     }
 
-    /** Foreground-service lifecycle state of one service instance. Not thread-safe (main thread). */
+    /**
+     * Foreground-service lifecycle state of one service instance. Not thread-safe (main thread).
+     *
+     * <p>Every `onStartCommand` answers its `startForegroundService` with `startForeground`
+     * <b>unconditionally</b> (idempotent when already foreground): Android records `fgRequired` per
+     * start request, so skipping it for a second coalesced / late request crashes the app with
+     * `ForegroundServiceDidNotStartInTimeException`. Only afterwards does the service decide to
+     * stop ({@link #shouldStopAfterStart}).
+     */
     static final class ServiceState {
         private boolean foreground;
         private boolean promotionDenied;
@@ -57,17 +67,25 @@ final class DownloadForegroundPolicy {
         private int lastRunning = -1;
         private int lastQueued = -1;
 
-        /**
-         * Every `onStartCommand` must answer a `startForegroundService` with `startForeground`
-         * (even when the queue already drained) or Android crashes the app.
-         */
-        boolean shouldPromoteOnStart() {
-            return !foreground && !timedOut;
+        /** A new start request arrived: a fresh promotion cycle begins. */
+        void onStartCommand() {
+            timedOut = false;
+            lastNotifyMs = Long.MIN_VALUE;
+            lastRunning = -1;
+            lastQueued = -1;
         }
 
         void onPromotionResult(boolean success) {
             foreground = success;
             promotionDenied = !success;
+        }
+
+        /**
+         * After the mandatory promotion: stop right away when nothing is active, or when Android
+         * 15+ already timed the `dataSync` FGS out (downloads continue best-effort in-process).
+         */
+        static boolean shouldStopAfterStart(int running, int queued, boolean managerTimedOut) {
+            return !isActive(running, queued) || managerTimedOut;
         }
 
         boolean isForeground() {
@@ -113,6 +131,31 @@ final class DownloadForegroundPolicy {
         }
     }
 
+    /**
+     * Coalesces `startForegroundService` requests while one is already pending (main thread).
+     * Without it every queued episode (`下载全部` x N) would issue its own start before the service
+     * instance exists.
+     */
+    static final class StartGate {
+        private boolean pending;
+
+        /** Returns true when the caller should issue a new `startForegroundService` now. */
+        boolean tryBegin(boolean serviceAlive, boolean timedOut, int running, int queued) {
+            if (pending || !shouldRequestStart(serviceAlive, timedOut, running, queued)) return false;
+            pending = true;
+            return true;
+        }
+
+        /** `onStartCommand` arrived, the service was destroyed, or the start call threw. */
+        void clear() {
+            pending = false;
+        }
+
+        boolean isPending() {
+            return pending;
+        }
+    }
+
     /** One lock (wake lock / Wi-Fi lock) abstraction. */
     interface Lock {
         void acquire(long timeoutMs);
@@ -130,16 +173,32 @@ final class DownloadForegroundPolicy {
         private final Lock wakeLock;
         private final Lock wifiLock;
         private boolean held;
+        private long lastWakeAcquireMs = Long.MIN_VALUE;
 
         Locks(Lock wakeLock, Lock wifiLock) {
             this.wakeLock = wakeLock;
             this.wifiLock = wifiLock;
         }
 
+        /** Same as {@link #update(boolean, long)} with a forced wake-lock renewal. */
         synchronized void update(boolean active) {
+            if (active) lastWakeAcquireMs = Long.MIN_VALUE;
+            update(active, 0L);
+        }
+
+        /**
+         * Acquires both locks while {@code active}; the bounded wake lock is re-acquired (extended)
+         * when not held or every {@link #WAKE_LOCK_RENEW_MS}, so a long download never outlives
+         * {@link #WAKE_LOCK_TIMEOUT_MS}. Releases both when idle.
+         */
+        synchronized void update(boolean active, long nowMs) {
             if (active) {
-                safeAcquire(wakeLock, WAKE_LOCK_TIMEOUT_MS);
-                if (wifiLock != null && !wifiLock.isHeld()) safeAcquire(wifiLock, 0L);
+                boolean wakeHeld = wakeLock != null && safeIsHeld(wakeLock);
+                if (wakeLock != null && (!wakeHeld || lastWakeAcquireMs == Long.MIN_VALUE
+                    || nowMs - lastWakeAcquireMs >= WAKE_LOCK_RENEW_MS)) {
+                    if (safeAcquire(wakeLock, WAKE_LOCK_TIMEOUT_MS)) lastWakeAcquireMs = nowMs;
+                }
+                if (wifiLock != null && !safeIsHeld(wifiLock)) safeAcquire(wifiLock, 0L);
                 held = true;
             } else {
                 releaseAll();
@@ -150,18 +209,29 @@ final class DownloadForegroundPolicy {
             safeRelease(wakeLock);
             safeRelease(wifiLock);
             held = false;
+            lastWakeAcquireMs = Long.MIN_VALUE;
         }
 
         synchronized boolean isHeld() {
             return held;
         }
 
-        private static void safeAcquire(Lock lock, long timeoutMs) {
-            if (lock == null) return;
+        private static boolean safeIsHeld(Lock lock) {
+            try {
+                return lock.isHeld();
+            } catch (RuntimeException e) {
+                return false;
+            }
+        }
+
+        private static boolean safeAcquire(Lock lock, long timeoutMs) {
+            if (lock == null) return false;
             try {
                 lock.acquire(timeoutMs);
+                return true;
             } catch (RuntimeException ignored) {
                 // missing permission / OEM quirk: downloads still run
+                return false;
             }
         }
 

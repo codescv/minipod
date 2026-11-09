@@ -42,6 +42,8 @@ public class EpisodeDownloadService extends Service {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     @Nullable private static volatile EpisodeDownloadService instance;
     @Nullable private static DownloadForegroundPolicy.Locks locks;
+    /** Main-thread only: coalesces `startForegroundService` while a start is in flight. */
+    private static final DownloadForegroundPolicy.StartGate START_GATE = new DownloadForegroundPolicy.StartGate();
 
     private final DownloadForegroundPolicy.ServiceState state = new DownloadForegroundPolicy.ServiceState();
     private final Runnable refreshRunnable = this::refreshNow;
@@ -57,13 +59,19 @@ public class EpisodeDownloadService extends Service {
         MAIN.post(() -> syncOnMain(app, allowStart));
     }
 
-    /** Progress tick: only refreshes an already running service's notification (throttled). */
-    static void refreshIfRunning() {
-        EpisodeDownloadService svc = instance;
-        if (svc != null) {
-            MAIN.removeCallbacks(svc.refreshRunnable);
-            MAIN.post(svc.refreshRunnable);
-        }
+    /**
+     * Progress tick (any thread): renews the bounded wake lock periodically and refreshes an
+     * already running service's notification (throttled). Never starts the service.
+     */
+    static void refreshIfRunning(Context context) {
+        Context app = context.getApplicationContext();
+        MAIN.post(() -> {
+            EpisodeDownloadManager manager = EpisodeDownloadManager.peek();
+            boolean active = manager != null && !manager.isIdle();
+            locksFor(app).update(active, SystemClock.elapsedRealtime());
+            EpisodeDownloadService svc = instance;
+            if (svc != null) svc.refreshNow();
+        });
     }
 
     private static void syncOnMain(Context app, boolean allowStart) {
@@ -71,7 +79,7 @@ public class EpisodeDownloadService extends Service {
         int running = manager != null ? manager.runningCount() : 0;
         int queued = manager != null ? manager.queuedCount() : 0;
         boolean active = DownloadForegroundPolicy.isActive(running, queued);
-        locksFor(app).update(active);
+        locksFor(app).update(active, SystemClock.elapsedRealtime());
 
         EpisodeDownloadService svc = instance;
         if (svc != null) {
@@ -79,10 +87,13 @@ public class EpisodeDownloadService extends Service {
             return;
         }
         boolean timedOut = manager != null && manager.isForegroundTimedOut();
-        if (allowStart && DownloadForegroundPolicy.shouldRequestStart(false, timedOut, running, queued)) {
+        // One `startForegroundService` per start cycle: N queued episodes post N syncs before the
+        // instance exists; every extra start would require its own `startForeground`.
+        if (allowStart && START_GATE.tryBegin(false, timedOut, running, queued)) {
             try {
                 ContextCompat.startForegroundService(app, new Intent(app, EpisodeDownloadService.class));
             } catch (RuntimeException ignored) {
+                START_GATE.clear();
                 // `ForegroundServiceStartNotAllowedException` (app in background) /
                 // `SecurityException` / `IllegalStateException`: downloads still run best-effort
                 // in-process under the wake / Wi-Fi locks.
@@ -176,12 +187,23 @@ public class EpisodeDownloadService extends Service {
 
     @Override
     public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
-        // Always answer `startForegroundService` with `startForeground` first (Android 12+
-        // `ForegroundServiceDidNotStartInTimeException`), even if the queue already drained.
-        if (state.shouldPromoteOnStart()) {
-            state.onPromotionResult(promoteToForeground());
+        // Android may reuse this instance (restart requested before `onDestroy`): re-register.
+        instance = this;
+        START_GATE.clear();
+        state.onStartCommand();
+        // ALWAYS answer `startForegroundService` with `startForeground` (idempotent when already
+        // foreground): AMS tracks `fgRequired` per start request, and skipping it crashes the app
+        // with `ForegroundServiceDidNotStartInTimeException` (Android 12+).
+        state.onPromotionResult(promoteToForeground());
+        EpisodeDownloadManager manager = EpisodeDownloadManager.peek();
+        int running = manager != null ? manager.runningCount() : 0;
+        int queued = manager != null ? manager.queuedCount() : 0;
+        boolean timedOut = manager != null && manager.isForegroundTimedOut();
+        if (DownloadForegroundPolicy.ServiceState.shouldStopAfterStart(running, queued, timedOut)) {
+            stopEverything(startId);
+        } else {
+            refreshNow();
         }
-        refreshNow();
         // Downloads are in-memory: a restarted (killed) process has nothing to resume here.
         return START_NOT_STICKY;
     }
@@ -201,6 +223,7 @@ public class EpisodeDownloadService extends Service {
     }
 
     private void refreshNow() {
+        if (instance != this) return; // stopping: a new start cycle owns the notification
         EpisodeDownloadManager manager = EpisodeDownloadManager.peek();
         int running = manager != null ? manager.runningCount() : 0;
         int queued = manager != null ? manager.queuedCount() : 0;
@@ -227,6 +250,9 @@ public class EpisodeDownloadService extends Service {
 
     private void stopEverything(int startId) {
         MAIN.removeCallbacks(refreshRunnable);
+        // Clear right away (not only in the async `onDestroy`) so a download enqueued while this
+        // instance is dying requests a fresh start instead of talking to a stopping service.
+        if (instance == this) instance = null;
         try {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
         } catch (RuntimeException ignored) {
@@ -236,8 +262,9 @@ public class EpisodeDownloadService extends Service {
         releaseLocksIfIdle(getApplicationContext());
         if (startId >= 0) {
             stopSelf(startId);
+        } else {
+            stopSelf();
         }
-        stopSelf();
     }
 
     /** Android 15+ (API 35) foreground-service timeout for `dataSync`. */
@@ -259,12 +286,12 @@ public class EpisodeDownloadService extends Service {
         // Ongoing transfers keep running in-process (locks stay held while active);
         // interrupted ones leave a resumable `.part`.
         MAIN.removeCallbacks(refreshRunnable);
+        if (instance == this) instance = null;
         try {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
         } catch (RuntimeException ignored) {
             // ignore
         }
-        stopSelf(startId);
         stopSelf();
     }
 
@@ -281,6 +308,7 @@ public class EpisodeDownloadService extends Service {
         if (instance == this) {
             instance = null;
         }
+        START_GATE.clear();
         releaseLocksIfIdle(getApplicationContext());
         super.onDestroy();
     }

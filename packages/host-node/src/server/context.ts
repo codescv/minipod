@@ -499,7 +499,9 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
 
     if (settingsStore.get().deleteDownloadWhenPlayed && !feedKey.startsWith('l_')) {
       const epRaw = episodesRepo.getRawByKey(episodeKey);
-      if (epRaw && epRaw.download_state === 'DONE') {
+      // Not only DONE: a QUEUED / RUNNING download must be cancelled (or it lands on disk later)
+      // and a FAILED one leaves a `.part` behind (matches `capacitor-host.ts`).
+      if (epRaw && (epRaw.download_state !== 'NONE' || Boolean(epRaw.download_path))) {
         await downloader.deleteDownload(episodeKey);
       }
     }
@@ -725,6 +727,11 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
 
       async deleteDownload(episodeKey: EpisodeKey): Promise<void> {
         await downloader.deleteDownload(episodeKey);
+      },
+
+      async cancelAllDownloads(): Promise<void> {
+        // Emits `download-updated(NONE)` per episode + `episodes-changed` per affected feed.
+        await downloader.cancelAll();
       },
 
       async chapters(episodeKey: EpisodeKey, forceRefresh?: boolean): Promise<readonly Chapter[]> {

@@ -764,6 +764,138 @@ describe('EpisodeDownloader automatic retry', () => {
     downloader.dispose();
     env.db.close();
   });
+
+  it('a body that ends cleanly before Content-Length is a retryable premature EOF: keeps .part, resumes via Range, never DONE truncated', async () => {
+    const env = makeEnv(1);
+    const ranges: (string | undefined)[] = [];
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      ranges.push(rangeOf(init));
+      if (ranges.length === 1) {
+        // 200 promising 360 bytes; the stream closes (no error) after 151.
+        return new Response(PAYLOAD.slice(0, FIRST_CHUNK), {
+          status: 200,
+          headers: { 'content-length': String(PAYLOAD.byteLength) },
+        });
+      }
+      if (ranges.length === 2) {
+        // 206 append whose `Content-Range` total (360) is not reached either.
+        return new Response(PAYLOAD.slice(FIRST_CHUNK, 200), {
+          status: 206,
+          headers: { 'content-range': `bytes ${FIRST_CHUNK}-${PAYLOAD.byteLength - 1}/${PAYLOAD.byteLength}` },
+        });
+      }
+      return payloadResponse(init);
+    });
+    // The approximate RSS `length` (here wildly larger) is never the completeness check.
+    env.db.prepare('UPDATE episodes SET enclosure_size = 999999').run();
+    const downloader = env.create(fetchImpl);
+    await downloader.download(env.keys[0]!);
+    expect(ranges).toEqual([undefined, `bytes=${FIRST_CHUNK}-`, 'bytes=200-']);
+    expect(env.sleep.mock.calls.map((c) => c[0])).toEqual([1500, 4000]);
+    expect(env.stateOf(0)).toBe('DONE');
+    expect(new Uint8Array(readFileSync(env.finalPath(0)))).toEqual(PAYLOAD);
+    expect(env.dlEvents().map((e) => e.state)).not.toContain('FAILED');
+    downloader.dispose();
+    env.db.close();
+  });
+
+  it('a premature EOF with retries exhausted is FAILED (not DONE) and keeps the truncated .part', async () => {
+    const env = makeEnv(1);
+    const fetchImpl = vi.fn(async () =>
+      new Response(PAYLOAD.slice(0, 10), { status: 200, headers: { 'content-length': String(PAYLOAD.byteLength) } }),
+    );
+    const downloader = env.create(fetchImpl, { retry: { maxRetries: 0 } });
+    await expect(downloader.download(env.keys[0]!)).rejects.toMatchObject({
+      code: 'network',
+      message: expect.stringContaining('Premature end of stream'),
+    });
+    expect(env.stateOf(0)).toBe('FAILED');
+    expect(existsSync(env.finalPath(0))).toBe(false);
+    expect(statSync(env.partPath(0)).size).toBe(10);
+    downloader.dispose();
+    env.db.close();
+  });
+
+  it('`Retry-After: 0` / a past HTTP-date never shortens the backoff (no 0ms retry spin)', async () => {
+    const env = makeEnv(1);
+    let call = 0;
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      call += 1;
+      if (call === 1) return new Response('busy', { status: 503, headers: { 'retry-after': '0' } });
+      if (call === 2) {
+        return new Response('slow down', {
+          status: 429,
+          headers: { 'retry-after': new Date(Date.now() - 60_000).toUTCString() },
+        });
+      }
+      return payloadResponse(init);
+    });
+    const downloader = env.create(fetchImpl);
+    await downloader.download(env.keys[0]!);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(env.sleep.mock.calls.map((c) => c[0])).toEqual([1500, 4000]);
+    expect(env.stateOf(0)).toBe('DONE');
+    downloader.dispose();
+    env.db.close();
+  });
+
+  it('strips Authorization when a redirect crosses scheme://host:port (401 → Basic retry → 302 to a pre-signed CDN URL)', async () => {
+    const env = makeEnv(1);
+    const creds = { username: 'user', password: 'secret' };
+    const seen: Array<{ url: string; auth: string | undefined }> = [];
+    const signed = 'https://cdn.other.example/ep1.mp3?X-Amz-Signature=abc';
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      const auth = ((init?.headers ?? {}) as Record<string, string>)['Authorization'];
+      seen.push({ url, auth });
+      if (url === env.urls[0]) {
+        if (!auth) return new Response('auth', { status: 401 });
+        // Same-origin hop keeps the credentials…
+        return new Response(null, { status: 302, headers: { location: '/media/ep1.mp3' } });
+      }
+      if (url === 'https://pod.example.com/media/ep1.mp3') {
+        if (!auth) return new Response('auth', { status: 401 });
+        // …the cross-origin hop must not carry them.
+        return new Response(null, { status: 302, headers: { location: signed } });
+      }
+      if (url === signed) {
+        return auth ? new Response('InvalidArgument', { status: 400 }) : payloadResponse(init);
+      }
+      return new Response('nope', { status: 404 });
+    });
+    const downloader = env.create(fetchImpl, { getCredentials: () => creds });
+    await downloader.download(env.keys[0]!);
+    const basic = encodeBasicAuthHeaders(creds)[0];
+    expect(seen).toEqual([
+      { url: env.urls[0], auth: undefined },
+      { url: env.urls[0], auth: basic },
+      { url: 'https://pod.example.com/media/ep1.mp3', auth: basic },
+      { url: signed, auth: undefined },
+    ]);
+    expect(env.stateOf(0)).toBe('DONE');
+    expect(new Uint8Array(readFileSync(env.finalPath(0)))).toEqual(PAYLOAD);
+
+    // A cross-origin redirect URL carrying inline credentials uses those instead.
+    seen.length = 0;
+    env.episodes.setDownloadState(env.keys[0]!, 'NONE', null);
+    rmSync(env.finalPath(0), { force: true });
+    const inline = vi.fn(async (url: string, init?: RequestInit) => {
+      const auth = ((init?.headers ?? {}) as Record<string, string>)['Authorization'];
+      seen.push({ url, auth });
+      if (url === env.urls[0]) {
+        return new Response(null, { status: 302, headers: { location: 'https://cdn:pw@cdn.other.example/x.mp3' } });
+      }
+      return payloadResponse(init);
+    });
+    const d2 = env.create(inline, { getCredentials: () => creds });
+    await d2.download(env.keys[0]!);
+    expect(seen[1]).toEqual({
+      url: 'https://cdn.other.example/x.mp3',
+      auth: encodeBasicAuthHeaders({ username: 'cdn', password: 'pw' })[0],
+    });
+    downloader.dispose();
+    d2.dispose();
+    env.db.close();
+  });
 });
 
 describe('retry-policy', () => {

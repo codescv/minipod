@@ -62,12 +62,12 @@ public class DownloadForegroundPolicyTest {
     }
 
     @Test
-    public void serviceState_promotesOnStart_updatesThrottled_stopsWhenDrained() {
+    public void serviceState_promotedEveryStart_updatesThrottled_stopsWhenDrained() {
         DownloadForegroundPolicy.ServiceState s = new DownloadForegroundPolicy.ServiceState();
-        assertTrue(s.shouldPromoteOnStart());
+        s.onStartCommand();
         s.onPromotionResult(true);
         assertTrue(s.isForeground());
-        assertFalse(s.shouldPromoteOnStart());
+        assertFalse(DownloadForegroundPolicy.ServiceState.shouldStopAfterStart(3, 5, false));
 
         assertEquals(DownloadForegroundPolicy.Action.UPDATE_NOTIFICATION, s.onUpdate(3, 5, 1_000L));
         // Same counts within 1 s: throttled.
@@ -75,14 +75,50 @@ public class DownloadForegroundPolicyTest {
         // Counts changed (promotion): immediate.
         assertEquals(DownloadForegroundPolicy.Action.UPDATE_NOTIFICATION, s.onUpdate(3, 4, 1_600L));
         assertEquals(DownloadForegroundPolicy.Action.UPDATE_NOTIFICATION, s.onUpdate(3, 4, 2_700L));
-        assertEquals(DownloadForegroundPolicy.Action.STOP, s.onUpdate(0, 0, 2_800L));
+
+        // A second (coalesced / late) start request on the live instance starts a fresh cycle and
+        // is promoted again: the service never skips `startForeground` for a start request.
+        s.onStartCommand();
+        s.onPromotionResult(true);
+        assertEquals(DownloadForegroundPolicy.Action.UPDATE_NOTIFICATION, s.onUpdate(3, 4, 2_800L));
+
+        assertEquals(DownloadForegroundPolicy.Action.STOP, s.onUpdate(0, 0, 2_900L));
         s.onStopped();
         assertFalse(s.isForeground());
     }
 
     @Test
+    public void shouldStopAfterStart_whenDrainedOrTimedOut() {
+        // Late start request after the queue already drained: promote (mandatory), then stop.
+        assertTrue(DownloadForegroundPolicy.ServiceState.shouldStopAfterStart(0, 0, false));
+        // Start request landing after Android 15 `onTimeout`: stop right away.
+        assertTrue(DownloadForegroundPolicy.ServiceState.shouldStopAfterStart(2, 3, true));
+        assertFalse(DownloadForegroundPolicy.ServiceState.shouldStopAfterStart(0, 1, false));
+    }
+
+    @Test
+    public void startGate_coalescesStartsForAWholeBatch() {
+        DownloadForegroundPolicy.StartGate gate = new DownloadForegroundPolicy.StartGate();
+        // `下载全部` x 10: ten syncs before the service instance exists -> exactly one start.
+        int starts = 0;
+        for (int i = 1; i <= 10; i++) {
+            if (gate.tryBegin(false, false, Math.min(i, 3), Math.max(0, i - 3))) starts++;
+        }
+        assertEquals(1, starts);
+        assertTrue(gate.isPending());
+        gate.clear(); // onStartCommand
+        assertFalse(gate.tryBegin(true, false, 3, 7));
+        assertFalse(gate.tryBegin(false, true, 3, 7));
+        assertFalse(gate.tryBegin(false, false, 0, 0));
+        assertTrue(gate.tryBegin(false, false, 1, 0));
+        gate.clear(); // start threw
+        assertTrue(gate.tryBegin(false, false, 1, 0));
+    }
+
+    @Test
     public void serviceState_refusedPromotion_neverCrashes_runsBestEffort_stillStops() {
         DownloadForegroundPolicy.ServiceState s = new DownloadForegroundPolicy.ServiceState();
+        s.onStartCommand();
         s.onPromotionResult(false);
         assertTrue(s.wasPromotionDenied());
         assertFalse(s.isForeground());
@@ -91,14 +127,40 @@ public class DownloadForegroundPolicyTest {
     }
 
     @Test
-    public void serviceState_onTimeout_stopsAndNeverRepromotes() {
+    public void serviceState_onTimeout_stopsForeground_andStopsService() {
         DownloadForegroundPolicy.ServiceState s = new DownloadForegroundPolicy.ServiceState();
+        s.onStartCommand();
         s.onPromotionResult(true);
         assertEquals(DownloadForegroundPolicy.Action.STOP, s.onTimeout());
         assertTrue(s.isTimedOut());
         assertFalse(s.isForeground());
-        assertFalse("a timed-out dataSync FGS must not call startForeground again", s.shouldPromoteOnStart());
         assertEquals(DownloadForegroundPolicy.Action.NONE, s.onUpdate(1, 0, 0L));
+        // A new start cycle (user back in the app) begins clean.
+        s.onStartCommand();
+        assertFalse(s.isTimedOut());
+    }
+
+    @Test
+    public void locks_boundedWakeLockIsRenewedDuringLongDownloads() {
+        FakeLock wake = new FakeLock();
+        FakeLock wifi = new FakeLock();
+        DownloadForegroundPolicy.Locks locks = new DownloadForegroundPolicy.Locks(wake, wifi);
+        long t0 = 1_000_000L;
+        locks.update(true, t0);
+        assertEquals(1, wake.acquires);
+        locks.update(true, t0 + 60_000L);
+        assertEquals("progress ticks do not hammer acquire()", 1, wake.acquires);
+        locks.update(true, t0 + DownloadForegroundPolicy.WAKE_LOCK_RENEW_MS);
+        assertEquals(2, wake.acquires);
+        assertTrue(DownloadForegroundPolicy.WAKE_LOCK_RENEW_MS < DownloadForegroundPolicy.WAKE_LOCK_TIMEOUT_MS);
+        // The OS released it (timeout elapsed): re-acquired on the next tick.
+        wake.held = false;
+        locks.update(true, t0 + DownloadForegroundPolicy.WAKE_LOCK_RENEW_MS + 1_000L);
+        assertEquals(3, wake.acquires);
+        assertEquals(1, wifi.acquires);
+        locks.update(false, t0 + 2 * DownloadForegroundPolicy.WAKE_LOCK_RENEW_MS);
+        assertFalse(wake.held);
+        assertFalse(wifi.held);
     }
 
     @Test

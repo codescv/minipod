@@ -1,10 +1,10 @@
 import { SYNC_FILE_NAME, type HostEvent } from '@minipod/core';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { connectRestPlatformHost } from '../client/rest-host';
 import { startServer, type RunningServer } from './start';
 
@@ -277,5 +277,130 @@ describe('MiniPod Hono server + REST client integration', () => {
       `${srv.url}/api/image-proxy?url=${encodeURIComponent(htmlErrUrl)}`,
     );
     expect(htmlRes.status).toBe(502);
+  });
+
+  /**
+   * Upstream with an `n`-episode feed whose enclosures send a few bytes and then stall until the
+   * client disconnects. Counts the enclosure requests per path.
+   */
+  async function startStallingPodcast(n: number) {
+    const hits = new Map<string, number>();
+    const upstream = createServer((req, res) => {
+      const port = (upstream.address() as AddressInfo).port;
+      if (req.url === '/show.xml') {
+        const items = Array.from(
+          { length: n },
+          (_v, i) => `<item><guid>item-${i + 1}</guid><title>Episode ${i + 1}</title>
+            <enclosure url="http://127.0.0.1:${port}/ep${i + 1}.mp3" type="audio/mpeg" length="100000" /></item>`,
+        ).join('\n');
+        res.writeHead(200, { 'Content-Type': 'application/rss+xml; charset=utf-8' });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>
+          <title>Stalling Podcast</title><link>https://podcast.example</link>
+          <description>stalls</description>${items}</channel></rss>`);
+        return;
+      }
+      const m = /^\/ep(\d+)\.mp3$/.exec(req.url ?? '');
+      if (m) {
+        hits.set(req.url!, (hits.get(req.url!) ?? 0) + 1);
+        res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': '100000' });
+        res.write('PARTIAL_AUDIO_BYTES');
+        return; // never ends: stalls until the downloader aborts
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    upstreamServers.push(upstream);
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()));
+    const port = (upstream.address() as AddressInfo).port;
+
+    const dataDir = mkdtempSync(join(tmpdir(), 'minipod-srv-dl-'));
+    tempDirs.push(dataDir);
+    const srv = await startServer({ dataDir });
+    runningServers.push(srv);
+    const clientHost = await connectRestPlatformHost({ baseUrl: srv.url });
+    const resolved = await clientHost.feeds.preview(`http://127.0.0.1:${port}/show.xml`);
+    if (resolved.kind !== 'feed') throw new Error('expected feed');
+    const feed = await clientHost.feeds.subscribe(resolved.preview.previewId);
+    const page = await clientHost.episodes.list(feed.feedKey, 'all');
+    const keys = Array.from(
+      { length: n },
+      (_v, i) => page.items.find((r) => r.episode.identity === `item-${i + 1}`)!.episode.episodeKey,
+    );
+    const hitsOf = (i: number): number => hits.get(`/ep${i + 1}.mp3`) ?? 0;
+    const stateOf = async (i: number) => (await clientHost.episodes.get(keys[i]!)).episode.downloadState;
+    const partPath = (i: number) => join(dataDir, 'downloads', `${keys[i]}.mp3.part`);
+    const shutdown = async () => {
+      await clientHost.dispose();
+      upstream.closeAllConnections();
+    };
+    return { srv, clientHost, feed, keys, hitsOf, stateOf, partPath, shutdown };
+  }
+
+  it('POST /api/episodes/downloads/cancel-all stops 6 downloads: QUEUED 4..6 are never fetched, all settle NONE', async () => {
+    const env = await startStallingPodcast(6);
+    const events: HostEvent[] = [];
+    const unsub = env.clientHost.subscribe((ev) => events.push(ev));
+    await new Promise((r) => setTimeout(r, 60));
+
+    const downloads = env.keys.map((k) => env.clientHost.episodes.download(k));
+    await vi.waitFor(async () => {
+      expect([0, 1, 2].map(env.hitsOf)).toEqual([1, 1, 1]);
+      expect(existsSync(env.partPath(2)) && statSync(env.partPath(2)).size > 0).toBe(true);
+      expect(await env.stateOf(5)).toBe('QUEUED');
+    });
+    for (const i of [3, 4, 5]) expect(await env.stateOf(i)).toBe('QUEUED');
+
+    expect(env.clientHost.episodes.cancelAllDownloads).toBeTypeOf('function');
+    await env.clientHost.episodes.cancelAllDownloads!();
+    await Promise.all(downloads);
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect([3, 4, 5].map(env.hitsOf)).toEqual([0, 0, 0]);
+    for (let i = 0; i < 6; i++) {
+      expect(await env.stateOf(i)).toBe('NONE');
+      expect(existsSync(env.partPath(i))).toBe(false);
+    }
+    expect(events.some((e) => e.type === 'episodes-changed' && e.feedKey === env.feed.feedKey)).toBe(true);
+    for (const k of env.keys) {
+      const last = events.filter((e) => e.type === 'download-updated' && e.episodeKey === k).at(-1);
+      expect(last).toMatchObject({ state: 'NONE' });
+    }
+    unsub();
+    await env.shutdown();
+  });
+
+  it('deleteDownloadWhenPlayed purges QUEUED / RUNNING / FAILED downloads, not only DONE', async () => {
+    const env = await startStallingPodcast(5);
+    await env.clientHost.settings.update({ deleteDownloadWhenPlayed: true });
+    const downloads = env.keys.slice(0, 4).map((k) => env.clientHost.episodes.download(k));
+    await vi.waitFor(async () => {
+      expect([0, 1, 2].map(env.hitsOf)).toEqual([1, 1, 1]);
+      expect(existsSync(env.partPath(0)) && statSync(env.partPath(0)).size > 0).toBe(true);
+      expect(await env.stateOf(3)).toBe('QUEUED');
+    });
+
+    // QUEUED → cancelled with zero fetches.
+    await env.clientHost.progress.markPlayed(env.keys[3]!, true);
+    expect(await env.stateOf(3)).toBe('NONE');
+    // RUNNING → aborted, `.part` removed (nothing left in the queue to promote).
+    await env.clientHost.progress.markPlayed(env.keys[0]!, true);
+    expect(await env.stateOf(0)).toBe('NONE');
+    expect(existsSync(env.partPath(0))).toBe(false);
+    await Promise.all([downloads[0], downloads[3]]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(env.hitsOf(3)).toBe(0);
+
+    // FAILED with a kept `.part` → cleaned up.
+    writeFileSync(env.partPath(4), 'LEFTOVER');
+    env.srv.bundle.db
+      .prepare("UPDATE episodes SET download_state = 'FAILED', download_path = NULL WHERE episode_key = ?")
+      .run(env.keys[4]!);
+    await env.clientHost.progress.markPlayed(env.keys[4]!, true);
+    expect(await env.stateOf(4)).toBe('NONE');
+    expect(existsSync(env.partPath(4))).toBe(false);
+
+    await env.clientHost.episodes.cancelAllDownloads!();
+    await Promise.all(downloads);
+    await env.shutdown();
   });
 });

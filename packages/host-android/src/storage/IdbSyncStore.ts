@@ -1601,6 +1601,18 @@ export class IdbSyncStore implements SyncStore {
     return affected;
   }
 
+  /** Every episode record whose download is `QUEUED` or `RUNNING` (queue `停止全部`). */
+  async listInFlightDownloadRecords(): Promise<IdbEpisodeRecord[]> {
+    const out: IdbEpisodeRecord[] = [];
+    let cursor = await this.db.transaction(['episodes'], 'readonly').objectStore('episodes').openCursor();
+    while (cursor) {
+      const ep = cursor.value;
+      if (ep.downloadState === 'QUEUED' || ep.downloadState === 'RUNNING') out.push(ep);
+      cursor = await cursor.continue();
+    }
+    return out;
+  }
+
   async listAllQueueEntries(): Promise<QueueEntry[]> {
     const rows = await this.db.getAll('queue');
     return rows.map(idbRecordToQueueEntry);

@@ -109,6 +109,15 @@ final class DownloadHttpOpener implements DownloadTransfer.StreamOpener {
                     HttpUrl next = cur.resolve(loc.trim());
                     resp.close();
                     if (next == null) throw new IOException("Invalid redirect Location: " + loc);
+                    if (!next.username().isEmpty()) {
+                        // Credentials embedded in the redirect target apply to that origin only.
+                        authHeader = Credentials.basic(next.username(), next.password(), StandardCharsets.UTF_8);
+                        next = next.newBuilder().username("").password("").build();
+                    } else if (!sameOrigin(cur, next)) {
+                        // Never leak Basic Auth to another origin (CDN / S3 / GCS pre-signed URLs
+                        // would also reject it with HTTP 400).
+                        authHeader = null;
+                    }
                     cur = next;
                     continue;
                 }
@@ -124,5 +133,18 @@ final class DownloadHttpOpener implements DownloadTransfer.StreamOpener {
             throw new IOException("Download failed with no response");
         }
         return lastResp;
+    }
+
+    /**
+     * Same origin for credential forwarding (mirrors `MiniPodPlugin.sameOriginHostPort`): same host
+     * and port + scheme, also allowing the same-host `http:80` -> `https:443` upgrade.
+     */
+    static boolean sameOrigin(HttpUrl a, HttpUrl b) {
+        if (!a.host().equalsIgnoreCase(b.host())) return false;
+        if (a.port() != b.port()) {
+            return "http".equals(a.scheme()) && a.port() == 80
+                && "https".equals(b.scheme()) && b.port() == 443;
+        }
+        return a.scheme().equals(b.scheme()) || ("http".equals(a.scheme()) && "https".equals(b.scheme()));
     }
 }

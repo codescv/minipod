@@ -622,21 +622,36 @@ export function QueueList() {
   /**
    * `停止全部`: stops every `RUNNING` and `QUEUED` download at once. Rows flip to NONE immediately
    * and stay there: guarded against late `download-updated` events (e.g. a QUEUED -> RUNNING
-   * promotion when a slot frees up, or an auto-retry) and stale `loadQueue()` snapshots until each
-   * `deleteDownload` settles and the host confirms.
+   * promotion when a slot frees up, or an auto-retry) and stale `loadQueue()` snapshots until the
+   * host confirms. Uses the host's atomic `cancelAllDownloads` (queued items never start) when
+   * available; otherwise cancels every QUEUED download BEFORE any RUNNING one, so a freed running
+   * slot never promotes (and opens a connection for) an item that is about to be stopped.
    */
   const handleStopAllDownloads = useCallback(async () => {
     if (!canDownload || downloadingRows.length === 0) return;
-    const keys = downloadingRows.map((r) => r.episode.episodeKey);
-    const keySet = new Set(keys);
+    const queuedKeys: EpisodeKey[] = [];
+    const runningKeys: EpisodeKey[] = [];
+    for (const r of downloadingRows) {
+      (r.episode.downloadState === 'QUEUED' ? queuedKeys : runningKeys).push(r.episode.episodeKey);
+    }
+    const keySet = new Set([...queuedKeys, ...runningKeys]);
     markDownloadsStopped(keySet);
-    await Promise.allSettled(
-      keys.map((key) =>
-        host.episodes.deleteDownload(key).finally(() => {
-          endDownloadStop(host, key);
-        }),
-      ),
-    );
+    let stopped = false;
+    if (host.episodes.cancelAllDownloads) {
+      try {
+        await host.episodes.cancelAllDownloads();
+        stopped = true;
+      } catch {
+        // Older host (e.g. desktop server without the route): per-episode fallback below.
+      }
+    }
+    if (!stopped) {
+      const deleteAll = (keys: readonly EpisodeKey[]) =>
+        Promise.allSettled(keys.map((key) => host.episodes.deleteDownload(key)));
+      await deleteAll(queuedKeys);
+      await deleteAll(runningKeys);
+    }
+    for (const key of keySet) endDownloadStop(host, key);
     await loadQueue().catch(() => undefined);
   }, [canDownload, downloadingRows, host, loadQueue, markDownloadsStopped]);
 

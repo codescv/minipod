@@ -18,10 +18,19 @@ import { renderMiniPod } from './test-helpers';
 
 const MAX_CONCURRENT = 3;
 
-/** Fake host download scheduler: at most `cap` RUNNING, the rest QUEUED (FIFO promotion). */
-function installCappedDownloads(host: MockPlatformHost, cap = MAX_CONCURRENT) {
+/**
+ * Fake host download scheduler: at most `cap` RUNNING, the rest QUEUED (FIFO promotion).
+ * `atomicCancelAll: false` simulates a host without `episodes.cancelAllDownloads` (fallback path:
+ * per-episode `deleteDownload`, where cancelling a RUNNING one promotes the next QUEUED one).
+ */
+function installCappedDownloads(
+  host: MockPlatformHost,
+  { cap = MAX_CONCURRENT, atomicCancelAll = true }: { cap?: number; atomicCancelAll?: boolean } = {},
+) {
   const running: EpisodeKey[] = [];
   const waiting: EpisodeKey[] = [];
+  /** Every slot start (initial or promotion), in order. */
+  const started: EpisodeKey[] = [];
   const inflight = new Map<EpisodeKey, { resolve: () => void; reject: (e: Error) => void }>();
   let deleteGate: Promise<void> | null = null;
 
@@ -33,6 +42,7 @@ function installCappedDownloads(host: MockPlatformHost, cap = MAX_CONCURRENT) {
   };
   const start = (key: EpisodeKey) => {
     running.push(key);
+    started.push(key);
     host.setEpisodeDownloadState(key, 'RUNNING');
   };
   const promote = () => {
@@ -62,10 +72,29 @@ function installCappedDownloads(host: MockPlatformHost, cap = MAX_CONCURRENT) {
       inflight.delete(key);
       if (wasRunning) promote();
     });
+  const cancel = (key: EpisodeKey) => {
+    host.setEpisodeDownloadState(key, 'NONE', 0);
+    inflight.get(key)?.reject(new Error('cancelled'));
+    inflight.delete(key);
+  };
+  let cancelAll: ReturnType<typeof vi.fn<() => Promise<void>>> | undefined;
+  if (atomicCancelAll) {
+    // Atomic: drain the QUEUED ones first, then cancel the RUNNING ones; nothing is promoted.
+    cancelAll = vi.fn<() => Promise<void>>(async () => {
+      if (deleteGate) await deleteGate;
+      for (const key of waiting.splice(0)) cancel(key);
+      for (const key of running.splice(0)) cancel(key);
+    });
+    host.episodes.cancelAllDownloads = cancelAll;
+  } else {
+    delete (host.episodes as { cancelAllDownloads?: unknown }).cancelAllDownloads;
+  }
 
   return {
     download,
     deleteDownload,
+    cancelAll,
+    started: () => [...started],
     running: () => [...running],
     waiting: () => [...waiting],
     progress: (key: EpisodeKey, ratio: number) => host.setEpisodeDownloadState(key, 'RUNNING', ratio),
@@ -137,7 +166,7 @@ describe('Download queue capped at 3 concurrent (QUEUED waiting state)', () => {
     await waitFor(async () => {
       expect(screen.getAllByTestId(/^queue-row-\d+$/).length).toBe((await host.queue.list()).length);
     });
-    const capped = installCappedDownloads(host);
+    const capped = installCappedDownloads(host, { atomicCancelAll: false });
 
     // `下载全部` dispatches every downloadable row concurrently (not one after another)
     fireEvent.click(screen.getByTestId('queue-overflow-btn'));
@@ -204,15 +233,17 @@ describe('Download queue capped at 3 concurrent (QUEUED waiting state)', () => {
     expect((await host.episodes.get(keys[5]!)).episode.downloadState).toBe('NONE');
     capped.deleteDownload.mockClear();
 
-    // `停止全部` while the host is slow to process the cancellations
+    // `停止全部` while the host is slow to process the cancellations (host without
+    // `cancelAllDownloads`: per-episode fallback, every QUEUED one cancelled BEFORE any RUNNING one)
     const stopped = [keys[1]!, keys[2]!, keys[3]!, keys[4]!];
+    const startedBeforeStop = capped.started().length;
     const releaseDeletes = capped.holdDeletes();
     fireEvent.click(screen.getByTestId('queue-stop-all-btn'));
     // Optimistic: every RUNNING + QUEUED row is back to NONE at once
     for (const key of stopped) expect(badgeOf(key)).not.toBeInTheDocument();
     expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
-    expect(capped.deleteDownload).toHaveBeenCalledTimes(stopped.length);
-    for (const key of stopped) expect(capped.deleteDownload).toHaveBeenCalledWith(key);
+    // Only the QUEUED keys[4] is being cancelled until it settles; RUNNING ones wait for it
+    expect(capped.deleteDownload.mock.calls.map(([k]) => k)).toEqual([keys[4]]);
 
     // Stale events from before the host processed the stop (progress tick, auto-retry, QUEUED ->
     // RUNNING promotion) and a stale `loadQueue()` snapshot (host still RUNNING / QUEUED) never
@@ -235,8 +266,8 @@ describe('Download queue capped at 3 concurrent (QUEUED waiting state)', () => {
     expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
     expect(screen.queryByTestId(`queue-resume-download-${keys[3]}`)).not.toBeInTheDocument();
 
-    // The host processes the cancellations (deleting a RUNNING one promotes the still-QUEUED
-    // keys[4] -> RUNNING before its own cancellation lands: ignored too)
+    // The host processes the cancellations: QUEUED keys[4] first, then the RUNNING ones, so a
+    // freed slot never promotes (starts) a download that is being stopped
     await act(async () => {
       releaseDeletes();
       await Promise.resolve();
@@ -247,6 +278,8 @@ describe('Download queue capped at 3 concurrent (QUEUED waiting state)', () => {
       }
     });
     await flush();
+    expect(capped.deleteDownload.mock.calls.map(([k]) => k)).toEqual([keys[4], keys[1], keys[2], keys[3]]);
+    expect(capped.started().length).toBe(startedBeforeStop);
     expect(capped.running()).toEqual([]);
     expect(capped.waiting()).toEqual([]);
     for (const key of [...stopped, keys[5]!]) {
@@ -271,6 +304,52 @@ describe('Download queue capped at 3 concurrent (QUEUED waiting state)', () => {
     });
     expect(keys.slice(1).filter((k) => badgeOf(k)?.dataset.downloadPhase === 'running')).toHaveLength(3);
     expect(keys.slice(1).filter((k) => badgeOf(k)?.dataset.downloadPhase === 'queued')).toHaveLength(2);
+  });
+
+  it('`停止全部` uses the host\'s atomic `cancelAllDownloads` when available: one call, no per-episode deletes, nothing promoted', async () => {
+    const { host } = renderMiniPod({ width: 1024 });
+    await screen.findByText('Syntax & Signal');
+    const keys = await fillQueueWithDownloadable(host, 6);
+    fireEvent.click(screen.getByTestId('nav-rail-queue'));
+    await waitFor(async () => {
+      expect(screen.getAllByTestId(/^queue-row-\d+$/).length).toBe((await host.queue.list()).length);
+    });
+    const capped = installCappedDownloads(host);
+    fireEvent.click(screen.getByTestId('queue-overflow-btn'));
+    fireEvent.click(screen.getByTestId('queue-download-all'));
+    expect(capped.running()).toEqual(keys.slice(0, 3));
+    expect(capped.waiting()).toEqual(keys.slice(3));
+    await waitFor(() => {
+      expect(screen.getByTestId('queue-stop-all-btn')).toBeInTheDocument();
+    });
+
+    const releaseDeletes = capped.holdDeletes();
+    fireEvent.click(screen.getByTestId('queue-stop-all-btn'));
+    for (const key of keys) expect(badgeOf(key)).not.toBeInTheDocument();
+    expect(capped.cancelAll).toHaveBeenCalledTimes(1);
+    // Stale promotion while the host processes the stop: still guarded
+    act(() => {
+      host.emit({ type: 'download-updated', episodeKey: keys[3]!, state: 'RUNNING', progress: 0 });
+    });
+    expect(badgeOf(keys[3]!)).not.toBeInTheDocument();
+    await act(async () => {
+      releaseDeletes();
+      await Promise.resolve();
+    });
+    await waitFor(async () => {
+      for (const key of keys) {
+        expect((await host.episodes.get(key)).episode.downloadState).toBe('NONE');
+      }
+    });
+    await flush();
+    expect(capped.cancelAll).toHaveBeenCalledTimes(1);
+    expect(capped.deleteDownload).not.toHaveBeenCalled();
+    expect(capped.started()).toEqual(keys.slice(0, 3));
+    expect(capped.running()).toEqual([]);
+    expect(capped.waiting()).toEqual([]);
+    for (const key of keys) expect(badgeOf(key)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('queue-stop-all-btn')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('snackbar')).not.toBeInTheDocument();
   });
 
   it('Podcast detail EpisodeRow shows a cancellable `等待中` badge (and `等待下载` in the detail sheet) while QUEUED; stopping it is not reverted by a stale promotion', async () => {

@@ -334,7 +334,7 @@ final class EpisodeDownloadManager {
                     prog.put("bytesDownloaded", done);
                     if (total > 0L) prog.put("totalBytes", total);
                     emit("download-progress", prog);
-                    EpisodeDownloadService.refreshIfRunning();
+                    EpisodeDownloadService.refreshIfRunning(appContext);
                 },
                 PROGRESS_THROTTLE_MS,
                 System::currentTimeMillis,

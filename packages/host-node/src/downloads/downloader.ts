@@ -96,6 +96,16 @@ function parseContentRangeStart(header: string | null): number | undefined {
 
 const noop = (): undefined => undefined;
 
+/** Same `scheme://host:port` (default ports normalised), like `MiniPodPlugin.sameOriginHostPort`. */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    const origin = new URL(a).origin;
+    return origin !== 'null' && origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 /** Abort reason used when an attempt receives no bytes for `stallTimeoutMs`. */
 class StallTimeoutError extends Error {
   constructor(ms: number) {
@@ -182,10 +192,11 @@ export class EpisodeDownloader {
   }
 
   /**
-   * Stops every QUEUED and RUNNING download (no promotion of the cancelled ones), removes their
-   * `.part` files and settles each to `NONE`.
+   * Queue `停止全部`: stops every QUEUED and RUNNING download (QUEUED ones are dropped first so
+   * none of them is ever promoted / fetched), removes their `.part` files, settles each to `NONE`
+   * and emits `episodes-changed` once per affected feed. Returns the affected episode keys.
    */
-  async cancelAll(): Promise<void> {
+  async cancelAll(): Promise<EpisodeKey[]> {
     const queued = this.waiting.splice(0);
     for (const task of queued) {
       this.cancelQueuedTask(task);
@@ -199,6 +210,11 @@ export class EpisodeDownloader {
     for (const task of running) {
       rmSync(task.partPath, { force: true });
     }
+    const affected = [...queued, ...running];
+    for (const feedKey of new Set(affected.map((t) => t.feedKey))) {
+      this.deps.emit({ type: 'episodes-changed', feedKey });
+    }
+    return affected.map((t) => t.episodeKey);
   }
 
   /** Current in-memory queue (for diagnostics / tests). */
@@ -395,10 +411,13 @@ export class EpisodeDownloader {
             throw err;
           }
           const retryAfterMs = err instanceof DownloadAttemptError ? err.retryAfterMs : undefined;
+          const backoffMs = backoffDelayMs(consecutiveFailures, this.retry);
+          // `Retry-After` never shortens the backoff (`Retry-After: 0` / a past HTTP-date must not
+          // spin at 0ms) and is capped (matches `DownloadRetryPolicy.java`).
           const delayMs =
             retryAfterMs !== undefined
-              ? Math.min(retryAfterMs, this.retry.retryAfterCapMs)
-              : backoffDelayMs(consecutiveFailures, this.retry);
+              ? Math.min(Math.max(retryAfterMs, backoffMs), this.retry.retryAfterCapMs)
+              : backoffMs;
           await raceAbort(this.retry.sleep(delayMs, signal), signal);
         }
       }
@@ -516,9 +535,18 @@ export class EpisodeDownloader {
 
     const contentLenHeader = resp.headers.get('content-length');
     const contentLen = contentLenHeader ? Number.parseInt(contentLenHeader, 10) : Number.NaN;
-    const rangeTotal = appending ? parseContentRangeTotal(resp.headers.get('content-range')) : undefined;
-    const totalExpected =
-      rangeTotal ?? (Number.isFinite(contentLen) && contentLen > 0 ? resumeBytes + contentLen : task.declaredSize);
+    const rangeTotal =
+      resp.status === 206 && (appending || rangeStart === 0)
+        ? parseContentRangeTotal(resp.headers.get('content-range'))
+        : undefined;
+    // Exact size promised by the HTTP response itself (never the approximate RSS `length`). A
+    // `Content-Encoding` makes `Content-Length` describe the encoded bytes, so skip it then.
+    const encoding = resp.headers.get('content-encoding')?.trim().toLowerCase();
+    const httpExpectedTotal =
+      encoding && encoding !== 'identity'
+        ? undefined
+        : (rangeTotal ?? (Number.isFinite(contentLen) && contentLen > 0 ? resumeBytes + contentLen : undefined));
+    const totalExpected = httpExpectedTotal ?? task.declaredSize;
 
     const ws = createWriteStream(task.partPath, { flags: appending ? 'a' : 'w' });
     let wsError: Error | undefined;
@@ -580,6 +608,16 @@ export class EpisodeDownloader {
       ws.destroy();
       throw streamErr;
     }
+
+    // The body ended before the size the server promised (`Content-Range` total or
+    // `Content-Length`): never rename a truncated `.part` to DONE. Keep it and retry, resuming via
+    // `Range` (matches `DownloadTransfer.java`).
+    if (httpExpectedTotal !== undefined && written < httpExpectedTotal) {
+      throw new DownloadAttemptError(
+        `Premature end of stream (${written} of ${httpExpectedTotal} bytes)`,
+        { retryable: true },
+      );
+    }
   }
 
   private async fetchWithRedirectsAndAuth(
@@ -617,7 +655,9 @@ export class EpisodeDownloader {
         const extracted = extractUrlCredentials(new URL(loc, currentUrl).toString());
         if (extracted.credentials) {
           currentAuth = encodeBasicAuthHeaders(extracted.credentials)[0];
-        } else if (!authHeader) {
+        } else if (!authHeader || !sameOrigin(currentUrl, extracted.cleanUrl)) {
+          // Never forward `Authorization` to another scheme://host:port (CDN / S3 pre-signed URL):
+          // it leaks the feed credentials and breaks signed URLs (`HTTP 400 InvalidArgument`).
           currentAuth = undefined;
         }
         currentUrl = extracted.cleanUrl;

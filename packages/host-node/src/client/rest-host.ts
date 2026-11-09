@@ -249,6 +249,12 @@ export function createRestPlatformHost(options?: CreateRestPlatformHostOptions):
         );
       },
 
+      async cancelAllDownloads(): Promise<void> {
+        await client.request(ROUTES.episodesCancelAllDownloads.method, ROUTES.episodesCancelAllDownloads.path, {
+          body: {},
+        });
+      },
+
       chapters(episodeKey: EpisodeKey, forceRefresh?: boolean): Promise<readonly Chapter[]> {
         return client.request(
           ROUTES.episodesChapters.method,
