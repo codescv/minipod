@@ -177,7 +177,7 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     const settingsScreen = await screen.findByTestId('settings-screen');
     expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(8);
     expect(settingsScreen.querySelectorAll('.m-settings-row')).toHaveLength(8);
-    expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.30');
+    expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.31');
 
     const feedbackBtn = screen.getByTestId('settings-feedback-btn');
     expect(feedbackBtn).toHaveTextContent('反馈给 Agent');
@@ -187,7 +187,7 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     expect(screen.queryByTestId('settings-about-dialog')).not.toBeInTheDocument();
     expect(await screen.findByTestId('settings-feedback-dialog')).toBeInTheDocument();
     expect(screen.getByTestId('settings-feedback-subject-preview')).toHaveTextContent(
-      'minipod: [v0.1.30]',
+      'minipod: [v0.1.31]',
     );
 
     const emailInput = screen.getByTestId('settings-feedback-email-input') as HTMLInputElement;
@@ -249,12 +249,12 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
     expect(launchedUrl.startsWith('mailto:agent@example.com?subject=')).toBe(true);
     const parsed = new URL(launchedUrl);
     expect(parsed.searchParams.get('subject')).toBe(
-      'minipod: [v0.1.30] Support chapter artwork zoom',
+      'minipod: [v0.1.31] Support chapter artwork zoom',
     );
     expect(parsed.searchParams.get('body')).toContain(
       'Support chapter artwork zoom\nTap cover inside chapter list',
     );
-    expect(parsed.searchParams.get('body')).toContain('App: Podcasts (minipod) v0.1.30');
+    expect(parsed.searchParams.get('body')).toContain('App: Podcasts (minipod) v0.1.31');
     expect(parsed.searchParams.get('body')).not.toContain('Attachment:');
     expect(host.sentFeedbackEmails).toHaveLength(0);
     await waitFor(() => {
@@ -327,9 +327,9 @@ describe('Agent Feedback Email & One-Click Mailto Builder (v0.1.20)', () => {
 
     const sent = host.sentFeedbackEmails[0]!;
     expect(sent.to).toBe('agent@example.com');
-    expect(sent.subject).toBe('minipod: [v0.1.30] 播放页进度条拖动卡顿');
+    expect(sent.subject).toBe('minipod: [v0.1.31] 播放页进度条拖动卡顿');
     expect(sent.body).toContain('复现步骤：\n1. 打开展开播放器\n2. 快速拖动进度条');
-    expect(sent.body).toContain('App: Podcasts (minipod) v0.1.30');
+    expect(sent.body).toContain('App: Podcasts (minipod) v0.1.31');
     expect(sent.body).toContain('Attachment: seek-bar.png');
     expect(sent.attachment).toEqual({ name: 'seek-bar.png', mimeType: 'image/png', base64: PNG_BASE64 });
     const fallback = new URL(sent.mailtoUrl);
