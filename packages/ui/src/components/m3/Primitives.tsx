@@ -766,10 +766,11 @@ export function ArtworkImage({
       data-artwork-cached={cached ? 'true' : 'false'}
       onClick={onClick}
       onLoad={(e) => {
-        // Pin the already-decoded `<img>` itself (no duplicate `new Image()` fetch).
+        const wasCached = loadedSrc === activeSrc || isArtworkLoaded(activeSrc);
+        // Pin a detached clone of the already-decoded `<img>` (no duplicate `new Image()` fetch).
         pinLoadedArtwork(activeSrc, e.currentTarget);
         rememberResolvedCandidate(candidatesKey, activeIdx);
-        if (loadedSrc !== activeSrc) setLoadedSrc(activeSrc);
+        if (!wasCached) setLoadedSrc(activeSrc);
       }}
       onError={() => {
         setErrorState((prev) => {

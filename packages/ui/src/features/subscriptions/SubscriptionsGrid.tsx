@@ -40,6 +40,7 @@ import { usePlayerState } from '../../player/usePlayer';
 import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar } from '../../stores/snackbar';
 import {
+  applyDownloadProgressToViewCache,
   applyDownloadStateToViewCache,
   DEFAULT_TIMELINE_LIMIT,
   getHostViewCache,
@@ -437,7 +438,13 @@ export function SubscriptionsGrid() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+      if (shouldReloadList(ev)) {
+        applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+        void loadFeedsAndTimeline();
+      } else {
+        applyDownloadProgressToViewCache(host, ev.episodeKey, ev.state, ev.progress);
+      }
+      return;
     }
     if (ev.type === 'queue-changed') {
       void host.queue
@@ -453,11 +460,9 @@ export function SubscriptionsGrid() {
       ev.type === 'feeds-changed' ||
       ev.type === 'episodes-changed' ||
       ev.type === 'progress-changed' ||
-      ev.type === 'queue-changed' ||
-      ev.type === 'download-updated'
+      ev.type === 'queue-changed'
     ) {
-      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints (rows update
-      // themselves); real transitions / user actions still re-query.
+      // Skip the playing episode's 5 s checkpoints (deferred until playback pauses).
       if (shouldReloadList(ev)) void loadFeedsAndTimeline();
     } else if (ev.type === 'feed-refreshed') {
       if (ev.error?.code === 'auth-required') {
@@ -782,14 +787,16 @@ export function SubscriptionsGrid() {
         </>
       )}
 
-      <ContextMenu
-        open={contextMenu !== null}
-        x={contextMenu?.x ?? 0}
-        y={contextMenu?.y ?? 0}
-        onClose={() => setContextMenu(null)}
-        items={contextMenu ? feedMenuItems(contextMenu.feed) : []}
-        testId="subs-context-menu"
-      />
+      {contextMenu !== null && (
+        <ContextMenu
+          open
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          items={feedMenuItems(contextMenu.feed)}
+          testId="subs-context-menu"
+        />
+      )}
 
       {!isDesktop && (
         <FAB

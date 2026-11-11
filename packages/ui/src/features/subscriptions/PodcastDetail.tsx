@@ -38,6 +38,7 @@ import { usePlayerState } from '../../player/usePlayer';
 import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar } from '../../stores/snackbar';
 import {
+  applyDownloadProgressToViewCache,
   applyDownloadStateToViewCache,
   filterCachedEpisodeRows,
   getHostViewCache,
@@ -215,19 +216,23 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      // Patch every cached slice first so `recomputeHostTimelineAndDownloads` (which walks all
-      // cached feeds) never re-adds a deleted download from another feed's stale rows.
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+      // Progress-only samples (`RUNNING -> RUNNING`) update `downloadProgressByKey` in O(1);
+      // real transitions patch every cached slice and re-query IndexedDB.
+      if (shouldReloadList(ev)) {
+        applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+        void reload();
+      } else {
+        applyDownloadProgressToViewCache(host, ev.episodeKey, ev.state, ev.progress);
+      }
+      return;
     }
     if (
       ev.type === 'feeds-changed' ||
       (ev.type === 'episodes-changed' && ev.feedKey === feedKey) ||
       ev.type === 'progress-changed' ||
-      ev.type === 'queue-changed' ||
-      ev.type === 'download-updated'
+      ev.type === 'queue-changed'
     ) {
-      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints (rows update
-      // themselves); real transitions / user actions still re-query.
+      // Skip the playing episode's 5 s checkpoints (deferred until playback pauses).
       if (shouldReloadList(ev)) void reload();
     }
   });
@@ -277,7 +282,11 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     hasMore: hasMoreRows,
     sentinelRef,
     loadMore: loadMoreRows,
-  } = useProgressiveLimit(DETAIL_PAGE_SIZE, `${feedKey}|${filter}`, visibleRows.length);
+  } = useProgressiveLimit(
+    DETAIL_PAGE_SIZE,
+    `${feedKey}|${filter}|${sortOrder}`,
+    visibleRows.length,
+  );
 
   // Stable row callbacks so memoized `EpisodeRow`s skip re-rendering unchanged rows.
   const reloadRef = useRef(reload);

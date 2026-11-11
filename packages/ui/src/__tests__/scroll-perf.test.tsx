@@ -12,6 +12,7 @@ import type { EpisodeRow as EpisodeRowModel, EpisodeKey } from '@minipod/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PointerEvent as ReactPointerEvent, TouchEvent as ReactTouchEvent } from 'react';
 import { formatClock } from '../lib/format';
+import { clearArtworkCacheForTests, getPinnedArtworkCount, pinLoadedArtwork } from '../lib/artwork-cache';
 import { renderMiniPod } from './test-helpers';
 
 /** Every row component (`EpisodeRow`, `QueueRowItem`, `PreviewEpisodeRow`) calls `useRowGestures` once per render. */
@@ -64,24 +65,32 @@ describe('scroll performance', () => {
     });
 
     const addSpy = vi.spyOn(window, 'addEventListener');
+    // Settle onto a known intra-minute position first (e.g. 5 s into a minute), then tick 6 s:
+    // the minute-quantized remaining bucket stays identical, so 0 rows re-render on position ticks!
+    const baseMs = Math.floor(mini.engine.getSnapshot().positionMs / 60_000) * 60_000 + 5_000;
+    act(() => {
+      mini.engine.emitPosition(baseMs);
+    });
     const before = rowRenders.count;
     const TICKS = 6;
-    // Advance 1 s at a time from the resume position (same chapter: a chapter change is a
-    // legitimate low-frequency update).
-    const startMs = mini.engine.getSnapshot().positionMs;
     for (let i = 1; i <= TICKS; i++) {
       act(() => {
-        mini.engine.emitPosition(startMs + i * 1_000);
+        mini.engine.emitPosition(baseMs + i * 1_000);
       });
     }
-    // Only the current episode's row follows the live position (<= 1 render per tick);
-    // the other rows (and list screens) stay untouched.
-    expect(rowRenders.count - before).toBeLessThanOrEqual(TICKS);
+    expect(rowRenders.count - before).toBe(0);
     expect(addSpy.mock.calls.filter(([type]) => type === 'keydown')).toHaveLength(0);
     // Player chrome still follows the live position.
     expect(
       screen.getByTestId('mini-player').querySelector('.m-mini-player__time')!.textContent,
-    ).toContain(formatClock(startMs + TICKS * 1_000));
+    ).toContain(formatClock(baseMs + TICKS * 1_000));
+
+    // Crossing a minute boundary updates the playing row's "time left" label once.
+    const beforeRollover = rowRenders.count;
+    act(() => {
+      mini.engine.emitPosition(baseMs + 60_000);
+    });
+    expect(rowRenders.count - beforeRollover).toBe(1);
   });
 
   it('ignores download-updated RUNNING progress samples at list level: no list re-query, only the downloading row updates', async () => {
@@ -198,13 +207,21 @@ describe('scroll performance', () => {
   });
 
   it('renders PodcastDetail progressively: 60 episodes on frame 0, more when the sentinel intersects', async () => {
-    const observers: Array<{ cb: IntersectionObserverCallback; el: Element | null }> = [];
+    const observers: Array<{
+      cb: IntersectionObserverCallback;
+      el: Element | null;
+      options: IntersectionObserverInit | undefined;
+    }> = [];
     vi.stubGlobal(
       'IntersectionObserver',
       class {
-        private readonly rec: { cb: IntersectionObserverCallback; el: Element | null };
-        constructor(cb: IntersectionObserverCallback) {
-          this.rec = { cb, el: null };
+        private readonly rec: {
+          cb: IntersectionObserverCallback;
+          el: Element | null;
+          options: IntersectionObserverInit | undefined;
+        };
+        constructor(cb: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+          this.rec = { cb, el: null, options };
           observers.push(this.rec);
         }
         observe(el: Element) {
@@ -252,6 +269,8 @@ describe('scroll performance', () => {
 
     const active = observers.find((o) => o.el === sentinel)!;
     expect(active).toBeDefined();
+    expect(active.options?.rootMargin).toBe('800px 0px');
+    expect(active.options?.root).toBe(document.querySelector('.m-shell__stage'));
     act(() => {
       active.cb(
         [{ isIntersecting: true, target: sentinel } as unknown as IntersectionObserverEntry],
@@ -264,6 +283,31 @@ describe('scroll performance', () => {
     expect(countRows()).toBe(150);
     expect(screen.queryByTestId('detail-list-sentinel')).not.toBeInTheDocument();
     expect(screen.queryByTestId('detail-load-more')).not.toBeInTheDocument();
+  });
+
+  it('pins detached image clones in artwork-cache (bounded at 120, never retaining DOM subtrees) and keeps QueueList idle of window pointermove listeners', async () => {
+    clearArtworkCacheForTests();
+    const hostDiv = document.createElement('div');
+    const liveImg = document.createElement('img');
+    liveImg.src = 'https://example.com/cover.jpg';
+    hostDiv.appendChild(liveImg);
+    const cloneSpy = vi.spyOn(liveImg, 'cloneNode');
+    pinLoadedArtwork('https://example.com/cover.jpg', liveImg);
+    expect(cloneSpy).toHaveBeenCalledWith(false);
+    const cloned = cloneSpy.mock.results[0]?.value as HTMLImageElement;
+    expect(cloned.parentNode).toBeNull();
+
+    for (let i = 0; i < 150; i++) {
+      pinLoadedArtwork(`https://example.com/art-${i}.jpg`, liveImg);
+    }
+    expect(getPinnedArtworkCount()).toBe(120);
+
+    const addSpy = vi.spyOn(window, 'addEventListener');
+    renderMiniPod({ width: 390 });
+    await screen.findByText('Syntax & Signal');
+    fireEvent.click(screen.getByTestId('nav-bar-queue'));
+    await screen.findByTestId('queue-screen');
+    expect(addSpy.mock.calls.filter(([type]) => type === 'pointermove')).toHaveLength(0);
   });
 });
 

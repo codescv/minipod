@@ -32,8 +32,9 @@ function touchPinnedImage(url: string, img: HTMLImageElement): void {
 
 /**
  * Marks `url` as loaded and pins a decoded image for it. Pass the caller's already-loaded
- * `<img>` as `existingImg` to pin it directly instead of creating (and fetching) a duplicate
- * `new Image()`.
+ * `<img>` as `existingImg` to pin a lightweight detached clone (`cloneNode(false)`) that shares
+ * Blink / WebKit's decoded `ImageResource` in `MemoryCache` without a duplicate `new Image()`
+ * fetch AND without retaining the live DOM node's `parentNode` subtree or React Fiber expandos.
  */
 export function pinLoadedArtwork(
   url: string | null | undefined,
@@ -50,7 +51,11 @@ export function pinLoadedArtwork(
   }
 
   if (existingImg) {
-    touchPinnedImage(clean, existingImg);
+    const detached =
+      typeof existingImg.cloneNode === 'function'
+        ? (existingImg.cloneNode(false) as HTMLImageElement)
+        : existingImg;
+    touchPinnedImage(clean, detached);
     return;
   }
 

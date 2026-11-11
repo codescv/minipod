@@ -60,6 +60,7 @@ export {
   usePlayer,
   usePlayerState,
   usePlayerLivePositionMs,
+  usePlayerLiveRemainingBucket,
   type PlayerStateValue,
   type PlayerContextValue,
   type PlayEpisodeOptions,

@@ -395,13 +395,18 @@ export function applyDownloadStateToViewCache(
   };
 
   const patchList = <T>(list: readonly T[], patch: (item: T) => T): readonly T[] => {
-    let changed = false;
-    const next = list.map((item) => {
+    let next: T[] | null = null;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i]!;
       const patched = patch(item);
-      if (patched !== item) changed = true;
-      return patched;
-    });
-    return changed ? next : list;
+      if (patched !== item) {
+        if (next === null) next = list.slice(0, i);
+        next.push(patched);
+      } else if (next !== null) {
+        next.push(item);
+      }
+    }
+    return next ?? list;
   };
 
   for (const [feedKey, rows] of viewCache.episodesByFeed) {
@@ -418,8 +423,8 @@ export function applyDownloadStateToViewCache(
 
   if (state !== 'DONE') {
     const before = viewCache.downloadedItems;
-    const after = before.filter((item) => item.row.episode.episodeKey !== episodeKey);
-    if (after.length !== before.length) {
+    if (before.some((item) => item.row.episode.episodeKey === episodeKey)) {
+      const after = before.filter((item) => item.row.episode.episodeKey !== episodeKey);
       viewCache.downloadedItems = after;
       viewCache.downloadedCount = after.length;
     }

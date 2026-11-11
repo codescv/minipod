@@ -1140,18 +1140,76 @@ const NO_POSITION = () => undefined;
 
 /**
  * Live playback `positionMs` while `enabled` (pass `isCurrent` for the row showing the current
- * episode), otherwise `undefined`. Only enabled subscribers re-render on position ticks; every
- * other row's selected value stays `undefined`, so React bails out of re-rendering it.
+ * episode), otherwise `undefined`. When `episodeKey` is given, ignores snapshots belonging to a
+ * different episode (e.g. while `engine.load()` is still switching tracks).
  */
-export function usePlayerLivePositionMs(enabled: boolean): number | undefined {
+export function usePlayerLivePositionMs(
+  enabled: boolean,
+  episodeKey?: string,
+): number | undefined {
   const store = useContext(PlayerSnapshotStoreContext);
-  const getSnapshot = useCallback(
-    () => (store && enabled ? store.get().positionMs : undefined),
-    [store, enabled],
-  );
+  const getSnapshot = useCallback(() => {
+    if (!store || !enabled) return undefined;
+    const snap = store.get();
+    if (episodeKey !== undefined && snap.episodeKey !== episodeKey) return undefined;
+    return snap.positionMs;
+  }, [store, enabled, episodeKey]);
   return useSyncExternalStore(
     store && enabled ? store.subscribe : NO_POSITION_SUBSCRIBE,
     store && enabled ? getSnapshot : NO_POSITION,
     store && enabled ? getSnapshot : NO_POSITION,
+  );
+}
+
+function encodeRemainingBucket(
+  positionMs: number,
+  durationMs: number | undefined,
+  isPlayed: boolean,
+): number {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs <= 0) return 0;
+  if (!isPlayed && positionMs > 0 && durationMs > positionMs) {
+    return Math.max(1, Math.round((durationMs - positionMs) / 60_000));
+  }
+  return -Math.max(1, Math.round(durationMs / 60_000));
+}
+
+/**
+ * Minute-quantized remaining-time bucket for list/queue rows (`0` = unknown duration,
+ * `< 0` = full `-minutes`, `> 0` = `+minutes` left). Because `useSyncExternalStore` compares
+ * primitive numbers with `Object.is`, **even the currently playing row skips re-rendering** on
+ * intra-minute 250 ms / 1 s position ticks while updating immediately on start, seek, or minute
+ * rollover.
+ */
+export function usePlayerLiveRemainingBucket(
+  enabled: boolean,
+  episodeKey: string,
+  fallbackDurationMs: number | undefined,
+  savedPositionMs: number,
+  isPlayed = false,
+): number {
+  const store = useContext(PlayerSnapshotStoreContext);
+  const getDisabled = useCallback(
+    () => encodeRemainingBucket(savedPositionMs, fallbackDurationMs, isPlayed),
+    [savedPositionMs, fallbackDurationMs, isPlayed],
+  );
+  const getSnapshot = useCallback(() => {
+    if (!store || !enabled) {
+      return encodeRemainingBucket(savedPositionMs, fallbackDurationMs, isPlayed);
+    }
+    const snap = store.get();
+    if (snap.episodeKey !== episodeKey) {
+      return encodeRemainingBucket(savedPositionMs, fallbackDurationMs, isPlayed);
+    }
+    return encodeRemainingBucket(
+      snap.positionMs,
+      snap.durationMs ?? fallbackDurationMs,
+      isPlayed,
+    );
+  }, [store, enabled, episodeKey, fallbackDurationMs, savedPositionMs, isPlayed]);
+
+  return useSyncExternalStore(
+    store && enabled ? store.subscribe : NO_POSITION_SUBSCRIBE,
+    store && enabled ? getSnapshot : getDisabled,
+    store && enabled ? getSnapshot : getDisabled,
   );
 }

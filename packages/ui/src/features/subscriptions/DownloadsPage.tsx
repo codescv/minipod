@@ -6,6 +6,7 @@
  *   `ep-delete-download-*`, which replaces the queue toggle here, or swipe-left) and `Delete all`.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { EpisodeKey, FeedKey } from '@minipod/core';
 import { dispatchBackNavigation } from '../../app/back';
 import { useRouteStore } from '../../app/routes';
 import { Button, Icon, IconButton } from '../../components/m3';
@@ -14,6 +15,7 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { useT } from '../../i18n';
 import {
+  applyDownloadProgressToViewCache,
   applyDownloadStateToViewCache,
   getHostViewCache,
   type DownloadedEpisodeItem,
@@ -100,7 +102,6 @@ export function DownloadsPage() {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
       if (ev.state !== 'DONE') {
         // Drop a deleted/cancelled download from the list immediately (before revalidation).
         setItems((prev) => {
@@ -108,18 +109,53 @@ export function DownloadsPage() {
           return next.length === prev.length ? prev : next;
         });
       }
+      if (shouldReloadList(ev)) {
+        applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+        void loadDownloads();
+      } else {
+        applyDownloadProgressToViewCache(host, ev.episodeKey, ev.state, ev.progress);
+      }
+      return;
     }
     if (
-      ev.type === 'download-updated' ||
       ev.type === 'episodes-changed' ||
       ev.type === 'feeds-changed' ||
       ev.type === 'progress-changed' ||
       ev.type === 'queue-changed'
     ) {
-      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints.
+      // Skip the playing episode's 5 s checkpoints.
       if (shouldReloadList(ev)) void loadDownloads();
     }
   });
+
+  // Stable row callbacks so memoized `EpisodeRow`s skip re-rendering unchanged items.
+  const openPodcastCallbacksRef = useRef(new Map<FeedKey, () => void>());
+  const getOpenPodcastCallback = (feedKey: FeedKey): (() => void) => {
+    const cache = openPodcastCallbacksRef.current;
+    let cb = cache.get(feedKey);
+    if (!cb) {
+      cb = () => openPodcastDetail(feedKey);
+      cache.set(feedKey, cb);
+    }
+    return cb;
+  };
+  const deleteCallbacksRef = useRef(new Map<EpisodeKey, () => void>());
+  const loadDownloadsRef = useRef(loadDownloads);
+  loadDownloadsRef.current = loadDownloads;
+  const getDeleteCallback = (episodeKey: EpisodeKey): (() => void) => {
+    const cache = deleteCallbacksRef.current;
+    let cb = cache.get(episodeKey);
+    if (!cb) {
+      cb = () => {
+        void host.episodes.deleteDownload(episodeKey).then(() => loadDownloadsRef.current());
+      };
+      cache.set(episodeKey, cb);
+    }
+    return cb;
+  };
+  const handleRowChanged = useCallback(() => {
+    void loadDownloadsRef.current();
+  }, []);
 
   const handleDeleteAll = async () => {
     if (items.length === 0 || deletingAll) return;
@@ -180,23 +216,13 @@ export function DownloadsPage() {
               feedTitle={item.feed.title ?? item.feed.url}
               feedImageUrl={item.feed.imageUrl}
               allowDownloads
-              onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
+              onOpenPodcast={getOpenPodcastCallback(item.feed.feedKey)}
               swipeLeftHintLabel={t('detail.deleteDownload')}
               swipeLeftHintIcon="delete"
               swipeLeftHintTone="danger"
-              onSwipeLeftOverride={() => {
-                void host.episodes
-                  .deleteDownload(item.row.episode.episodeKey)
-                  .then(() => loadDownloads());
-              }}
-              onDeleteDownload={() => {
-                void host.episodes
-                  .deleteDownload(item.row.episode.episodeKey)
-                  .then(() => loadDownloads());
-              }}
-              onChanged={() => {
-                void loadDownloads();
-              }}
+              onSwipeLeftOverride={getDeleteCallback(item.row.episode.episodeKey)}
+              onDeleteDownload={getDeleteCallback(item.row.episode.episodeKey)}
+              onChanged={handleRowChanged}
             />
           ))}
         </div>

@@ -1,7 +1,7 @@
 /**
  * Full-height Expanded Player sheet on mobile (`DESIGN.md` §4.6).
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useRouteStore } from '../../app/routes';
 import { ArtworkImage, BottomSheet, Button, Icon, IconButton, shouldUseImageProxy } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
@@ -11,16 +11,41 @@ import { usePlayer } from '../../player/usePlayer';
 import { ChaptersList, ShownotesView } from './ChaptersPanel';
 
 export function ExpandedPlayer() {
+  const open = useRouteStore((s) => s.expandedPlayerOpen);
+  const [chaptersOpen, setChaptersOpen] = useState(true);
+  const [notesOpen, setNotesOpen] = useState(false);
+
+  // Never subscribe to high-frequency `usePlayer()` position ticks while the sheet is closed.
+  if (!open) return null;
+
+  return (
+    <ExpandedPlayerContent
+      chaptersOpen={chaptersOpen}
+      setChaptersOpen={setChaptersOpen}
+      notesOpen={notesOpen}
+      setNotesOpen={setNotesOpen}
+    />
+  );
+}
+
+function ExpandedPlayerContent({
+  chaptersOpen,
+  setChaptersOpen,
+  notesOpen,
+  setNotesOpen,
+}: {
+  readonly chaptersOpen: boolean;
+  readonly setChaptersOpen: Dispatch<SetStateAction<boolean>>;
+  readonly notesOpen: boolean;
+  readonly setNotesOpen: Dispatch<SetStateAction<boolean>>;
+}) {
   const host = useHost();
   const t = useT();
   const player = usePlayer();
 
-  const open = useRouteStore((s) => s.expandedPlayerOpen);
   const setOpen = useRouteStore((s) => s.setExpandedPlayerOpen);
   const setSleepTimerSheetOpen = useRouteStore((s) => s.setSleepTimerSheetOpen);
 
-  const [chaptersOpen, setChaptersOpen] = useState(true);
-  const [notesOpen, setNotesOpen] = useState(false);
   const [scrubPositionMs, setScrubPositionMs] = useState<number | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
   const isScrubbingRef = useRef(false);
@@ -82,7 +107,7 @@ export function ExpandedPlayer() {
 
   return (
     <BottomSheet
-      open={open && Boolean(episode)}
+      open={Boolean(episode)}
       onClose={() => setOpen(false)}
       title={episode?.title ?? t('app.name')}
       fullHeight

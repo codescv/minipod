@@ -6,7 +6,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
 import { useListReloadFilter } from './useListReloadFilter';
-import { applyDownloadStateToViewCache, getHostViewCache } from '../stores/view-cache';
+import {
+  applyDownloadProgressToViewCache,
+  applyDownloadStateToViewCache,
+  getHostViewCache,
+} from '../stores/view-cache';
 
 export function useDownloadedCount(): number {
   const host = useHost();
@@ -65,13 +69,18 @@ export function useDownloadedCount(): number {
 
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
-      if (ev.state !== 'DONE') {
-        setCount(getHostViewCache(host).downloadedCount);
+      if (shouldRefresh(ev)) {
+        applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+        if (ev.state !== 'DONE') {
+          setCount(getHostViewCache(host).downloadedCount);
+        }
+        void refresh();
+      } else {
+        applyDownloadProgressToViewCache(host, ev.episodeKey, ev.state, ev.progress);
       }
+      return;
     }
     if (
-      ev.type === 'download-updated' ||
       ev.type === 'episodes-changed' ||
       ev.type === 'feeds-changed' ||
       ev.type === 'progress-changed'

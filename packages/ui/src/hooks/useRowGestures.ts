@@ -213,13 +213,14 @@ export function useRowGestures({
         longPressedRef.current = true;
         pointerStartRef.current = null;
         touchStartRef.current = null;
+        detachWindowListeners();
         resetSwipeVisual();
         // v0.1.25: drop any Android WebView long-press selection before the menu portals in.
         clearTextSelection();
         callbacksRef.current.onContext(x, y);
       }, ROW_LONG_PRESS_DELAY_MS);
     },
-    [clearTimer, resetSwipeVisual],
+    [clearTimer, detachWindowListeners, resetSwipeVisual],
   );
 
   /** Returns `true` (and locks the gesture out) once it is a vertical scroll. */
@@ -320,8 +321,11 @@ export function useRowGestures({
     },
 
     onTouchEnd: (e) => {
-      // Still tracked by the pointer stream (its `pointerup` finishes the gesture).
-      if (pointerStartRef.current !== null) return;
+      // Still tracked by the pointer stream (its `pointerup` finishes the gesture), or the pointer
+      // stream already finished a non-long-press gesture before `touchend` arrived.
+      if (pointerStartRef.current !== null || (!touchActiveRef.current && !longPressedRef.current)) {
+        return;
+      }
       clearTimer();
       const start = touchStartRef.current;
       touchStartRef.current = null;
@@ -370,6 +374,7 @@ export function useRowGestures({
 
     onTouchCancel: () => {
       clearTimer();
+      detachWindowListeners();
       touchStartRef.current = null;
       pointerStartRef.current = null;
       touchActiveRef.current = false;
@@ -392,6 +397,7 @@ export function useRowGestures({
       e.preventDefault();
       e.stopPropagation();
       clearTimer();
+      detachWindowListeners();
       touchStartRef.current = null;
       pointerStartRef.current = null;
       resetSwipeVisual();

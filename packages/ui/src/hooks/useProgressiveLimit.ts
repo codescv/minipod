@@ -44,13 +44,17 @@ export function useProgressiveLimit(
 
   useEffect(() => {
     if (!sentinel || !hasMore || typeof IntersectionObserver === 'undefined') return;
+    // Use `.m-shell__stage` (`overflow-y: auto`) as the observer root when present so
+    // `rootMargin: '800px 0px'` expands the actual scrollport on iOS WKWebView + Android WebView.
+    const scrollRoot =
+      typeof sentinel.closest === 'function' ? sentinel.closest('.m-shell__stage') : null;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
           loadMore();
         }
       },
-      { rootMargin: PROGRESSIVE_ROOT_MARGIN },
+      { root: scrollRoot, rootMargin: PROGRESSIVE_ROOT_MARGIN },
     );
     observer.observe(sentinel);
     return () => observer.disconnect();

@@ -35,7 +35,7 @@ import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
-import { usePlayerLivePositionMs, usePlayerState } from '../../player/usePlayer';
+import { usePlayerLiveRemainingBucket, usePlayerState } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import {
   clearDownloadStop,
@@ -113,10 +113,17 @@ export const EpisodeRow = memo(function EpisodeRow({
   const isCurrent = player.episode?.episodeKey === episode.episodeKey;
   const isPlaying = isCurrent && player.playing;
   const isPlayed = progress?.state === 'PLAYED';
-  const livePositionMs = usePlayerLivePositionMs(isCurrent);
-  const positionMs = isCurrent ? (livePositionMs ?? 0) : (progress?.positionMs ?? 0);
-  const durationMs =
-    (isCurrent ? player.durationMs : undefined) ?? progress?.durationMs ?? episode.durationMs;
+  const fallbackDurationMs =
+    (isCurrent && player.episodeKey === episode.episodeKey ? player.durationMs : undefined) ??
+    progress?.durationMs ??
+    episode.durationMs;
+  const remBucket = usePlayerLiveRemainingBucket(
+    isCurrent,
+    episode.episodeKey,
+    fallbackDurationMs,
+    progress?.positionMs ?? 0,
+    isPlayed,
+  );
 
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
 
@@ -332,10 +339,10 @@ export const EpisodeRow = memo(function EpisodeRow({
 
   const dateStr = formatShortDate(episode.pubDate, locale);
   const remStr =
-    !isPlayed && durationMs && positionMs > 0 && durationMs > positionMs
-      ? t('detail.timeLeft', { time: formatHumanDuration(durationMs - positionMs) })
-      : durationMs
-        ? formatHumanDuration(durationMs)
+    remBucket > 0
+      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000) })
+      : remBucket < 0
+        ? formatHumanDuration(-remBucket * 60_000)
         : '';
   const shownotesHtml = detailsOpen ? sanitizeShownotesHtml(episode.description) : '';
 

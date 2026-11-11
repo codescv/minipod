@@ -595,10 +595,12 @@ textarea,
   transition: background-color var(--md-sys-motion-duration-short), color var(--md-sys-motion-duration-short);
 }
 
-.m-subs-expand-btn:hover {
-  background: var(--md-sys-color-secondary-container);
-  color: var(--md-sys-color-on-secondary-container);
-  border-color: transparent;
+@media (hover: hover) and (pointer: fine) {
+  .m-subs-expand-btn:hover {
+    background: var(--md-sys-color-secondary-container);
+    color: var(--md-sys-color-on-secondary-container);
+    border-color: transparent;
+  }
 }
 
 .m-timeline-section {
@@ -1073,8 +1075,10 @@ textarea,
   inset: -8px -4px;
 }
 
-.m-resume-download-chip:hover {
-  filter: brightness(0.97);
+@media (hover: hover) and (pointer: fine) {
+  .m-resume-download-chip:hover {
+    filter: brightness(0.97);
+  }
 }
 
 .m-resume-download-chip:active {
@@ -1114,12 +1118,14 @@ textarea,
   flex: none;
 }
 
-.m-queue-row__handle:hover,
-.m-queue-row__handle:active {
-  opacity: 0.9;
+@media (hover: hover) and (pointer: fine) {
+  .m-queue-row__handle:hover {
+    opacity: 0.9;
+  }
 }
 
 .m-queue-row__handle:active {
+  opacity: 0.9;
   cursor: grabbing;
 }
 
@@ -1390,8 +1396,10 @@ textarea,
   cursor: pointer;
 }
 
-.m-settings-row--clickable:hover {
-  background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+@media (hover: hover) and (pointer: fine) {
+  .m-settings-row--clickable:hover {
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+  }
 }
 
 /* ---- In-App Auto-Updater Banner & Settings Inline Controls --------------- */
@@ -1729,8 +1737,10 @@ textarea,
   white-space: nowrap;
 }
 
-.m-menu__item:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+@media (hover: hover) and (pointer: fine) {
+  .m-menu__item:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+  }
 }
 
 .m-snackbar {

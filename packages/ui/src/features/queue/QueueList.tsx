@@ -43,11 +43,15 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
-import { usePlayerLivePositionMs, usePlayerState } from '../../player/usePlayer';
+import {
+  usePlayerLiveRemainingBucket,
+  usePlayerState,
+} from '../../player/usePlayer';
 import { useEpisodeDownloadStatus } from '../../hooks/useEpisodeDownloadStatus';
 import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import {
+  applyDownloadProgressToViewCache,
   applyDownloadStateToViewCache,
   beginDownloadStop,
   clearDownloadStop,
@@ -205,12 +209,13 @@ export function QueueList() {
         seq: downloadEventSeqRef.current,
         state: ev.state,
       });
-      // Keep the unmounted screens' SWR slices (Manage Downloads, timeline, per-feed rows) in sync.
-      // Also records the progress sample in the shared `downloadProgressByKey` (kept on FAILED,
-      // cleared on DONE/NONE) so a remount mid-download never flashes back to `0%`.
-      applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
-      // Progress-only samples are rendered by the downloading row itself
-      // (`useEpisodeDownloadStatus`); the list only changes on real state transitions.
+      // Progress-only samples (`RUNNING -> RUNNING`) update `downloadProgressByKey` in O(1);
+      // real transitions patch all cached slices so unmounted screens stay in sync.
+      if (shouldReloadQueue(ev)) {
+        applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
+      } else {
+        applyDownloadProgressToViewCache(host, ev.episodeKey, ev.state, ev.progress);
+      }
       // Keep an open `episode-detail-sheet` live even after its episode left the queue.
       setDetailsSnapshot((prev) =>
         prev && prev.episode.episodeKey === ev.episodeKey && prev.episode.downloadState !== ev.state
@@ -382,6 +387,7 @@ export function QueueList() {
         maxDeltaY,
         slots,
       };
+      attachDragWindowListenersRef.current();
       setDraggingIdx(idx);
       setDropTargetIdx(idx);
       setDragDeltaY(0);
@@ -412,12 +418,23 @@ export function QueueList() {
     [computeTargetIdx],
   );
 
+  const detachDragWindowListenersRef = useRef<(() => void) | null>(null);
+  const detachDragWindowListeners = useCallback(() => {
+    const detach = detachDragWindowListenersRef.current;
+    detachDragWindowListenersRef.current = null;
+    detach?.();
+  }, []);
+
   const finishHandleDrag = useCallback(
     (pointerId: number | null, clientY: number | undefined, cancelled: boolean) => {
       const st = dragStateRef.current;
-      if (!st) return;
+      if (!st) {
+        detachDragWindowListeners();
+        return;
+      }
       if (st.pointerId !== null && pointerId !== null && st.pointerId !== pointerId) return;
       dragStateRef.current = null;
+      detachDragWindowListeners();
 
       const finalTarget =
         !cancelled && clientY !== undefined && Number.isFinite(clientY)
@@ -432,10 +449,11 @@ export function QueueList() {
         void moveIndexToRef.current(st.fromIdx, finalTarget);
       }
     },
-    [computeTargetIdx],
+    [computeTargetIdx, detachDragWindowListeners],
   );
 
-  useEffect(() => {
+  const attachDragWindowListeners = useCallback(() => {
+    if (detachDragWindowListenersRef.current !== null || typeof window === 'undefined') return;
     const onWinPointerMove = (ev: PointerEvent) => {
       if (!dragStateRef.current) return;
       updateHandleDrag(ev.pointerId, ev.clientY);
@@ -452,12 +470,17 @@ export function QueueList() {
     window.addEventListener('pointermove', onWinPointerMove);
     window.addEventListener('pointerup', onWinPointerUp);
     window.addEventListener('pointercancel', onWinPointerCancel);
-    return () => {
+    detachDragWindowListenersRef.current = () => {
       window.removeEventListener('pointermove', onWinPointerMove);
       window.removeEventListener('pointerup', onWinPointerUp);
       window.removeEventListener('pointercancel', onWinPointerCancel);
     };
   }, [finishHandleDrag, updateHandleDrag]);
+
+  const attachDragWindowListenersRef = useRef(attachDragWindowListeners);
+  attachDragWindowListenersRef.current = attachDragWindowListeners;
+
+  useEffect(() => detachDragWindowListeners, [detachDragWindowListeners]);
 
   const handleRemoveWithUndo = useCallback(
     async (idx: number) => {
@@ -809,11 +832,27 @@ export function QueueList() {
       : undefined);
   const detailsIsCurrent =
     detailsRow !== undefined && player.episode?.episodeKey === detailsRow.episode.episodeKey;
-  // Only while the details sheet shows the current episode does the queue follow live position.
-  const detailsLivePositionMs = usePlayerLivePositionMs(detailsIsCurrent);
+  const detailsEpisodeId = detailsRow?.episode.episodeKey ?? NO_EPISODE_KEY;
+  const detailsFallbackDur = detailsRow
+    ? ((detailsIsCurrent && player.episodeKey === detailsEpisodeId
+        ? player.durationMs
+        : undefined) ??
+      detailsRow.progress?.durationMs ??
+      detailsRow.episode.durationMs ??
+      detailsRow.entry.stub?.durationMs)
+    : undefined;
+  const detailsSavedPos =
+    detailsRow?.progress?.state === 'IN_PROGRESS' ? detailsRow.progress.positionMs : 0;
+  // Only while the details sheet shows the current episode does the queue follow live remaining minutes.
+  const detailsRemBucket = usePlayerLiveRemainingBucket(
+    detailsIsCurrent,
+    detailsEpisodeId,
+    detailsFallbackDur,
+    detailsSavedPos,
+  );
   // Live download ratio for the open sheet (the list itself no longer re-renders on progress ticks).
   const { ratio: detailsDownloadRatio } = useEpisodeDownloadStatus(
-    detailsRow?.episode.episodeKey ?? NO_EPISODE_KEY,
+    detailsEpisodeId,
     detailsRow?.episode.downloadState ?? 'NONE',
   );
   const detailsSheet = (() => {
@@ -828,22 +867,12 @@ export function QueueList() {
     const feedCoverUrl = nonEmptyUrl(feed?.imageUrl) ?? nonEmptyUrl(detailsRow.entry.stub?.imageUrl);
     const isCurrent = detailsIsCurrent;
     const isPlaying = isCurrent && player.playing;
-    const dur =
-      (isCurrent ? player.durationMs : undefined) ??
-      detailsRow.progress?.durationMs ??
-      episode.durationMs ??
-      detailsRow.entry.stub?.durationMs;
-    const pos = isCurrent
-      ? (detailsLivePositionMs ?? 0)
-      : detailsRow.progress?.state === 'IN_PROGRESS'
-        ? detailsRow.progress.positionMs
-        : 0;
     const dateStr = formatShortDate(episode.pubDate ?? detailsRow.entry.stub?.pubDate, locale);
     const remStr =
-      dur && pos > 0 && dur > pos
-        ? t('detail.timeLeft', { time: formatHumanDuration(dur - pos) })
-        : dur
-          ? formatHumanDuration(dur)
+      detailsRemBucket > 0
+        ? t('detail.timeLeft', { time: formatHumanDuration(detailsRemBucket * 60_000) })
+        : detailsRemBucket < 0
+          ? formatHumanDuration(-detailsRemBucket * 60_000)
           : '';
     const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
     const shownotesHtml = sanitizeShownotesHtml(episode.description);
@@ -988,7 +1017,7 @@ export function QueueList() {
             const isCurrent = player.episode?.episodeKey === epKey;
             const isPlaying = isCurrent && player.playing;
             const dur =
-              (isCurrent ? player.durationMs : undefined) ??
+              (isCurrent && player.episodeKey === epKey ? player.durationMs : undefined) ??
               r.progress?.durationMs ??
               r.episode.durationMs ??
               r.entry.stub?.durationMs;
@@ -1092,22 +1121,25 @@ export function QueueList() {
         </div>
       ) : null}
 
-      <ContextMenu
-        open={activeContextMenu !== null && contextMenuItems.length > 0}
-        x={activeContextMenu?.x ?? 0}
-        y={activeContextMenu?.y ?? 0}
-        onClose={() => setActiveContextMenu(null)}
-        items={contextMenuItems}
-        testId="queue-context-menu"
-      />
+      {activeContextMenu !== null && contextMenuItems.length > 0 && (
+        <ContextMenu
+          open
+          x={activeContextMenu.x}
+          y={activeContextMenu.y}
+          onClose={() => setActiveContextMenu(null)}
+          items={contextMenuItems}
+          testId="queue-context-menu"
+        />
+      )}
 
-      <BottomSheet
-        open={detailsEpisodeKey !== null}
-        onClose={closeDetails}
-        title={t('detail.viewDetails')}
-        testId="episode-detail-sheet"
-      >
-        {detailsSheet && (
+      {detailsEpisodeKey !== null && (
+        <BottomSheet
+          open
+          onClose={closeDetails}
+          title={t('detail.viewDetails')}
+          testId="episode-detail-sheet"
+        >
+          {detailsSheet && (
           <div
             style={{
               padding: '16px 20px calc(24px + var(--m-safe-bottom))',
@@ -1306,9 +1338,10 @@ export function QueueList() {
                 </div>
               )}
             </div>
-          </div>
-        )}
-      </BottomSheet>
+            </div>
+          )}
+        </BottomSheet>
+      )}
     </div>
   );
 }
@@ -1415,15 +1448,13 @@ const QueueRowItem = memo(function QueueRowItem({
   });
   // Only this (downloading) row re-renders on `download-updated` progress samples.
   const { ratio: downloadProgress } = useEpisodeDownloadStatus(epKey, row.episode.downloadState);
-  // Only the current episode's row follows the live playback position.
-  const livePositionMs = usePlayerLivePositionMs(isCurrent);
-  const pos = isCurrent ? (livePositionMs ?? 0) : savedPositionMs;
-  const dur = durationMs;
+  // Minute-quantized remaining bucket: 0 row re-renders on intra-minute playback position ticks.
+  const remBucket = usePlayerLiveRemainingBucket(isCurrent, epKey, durationMs, savedPositionMs);
   const remStr =
-    dur && pos > 0 && dur > pos
-      ? t('detail.timeLeft', { time: formatHumanDuration(dur - pos) })
-      : dur
-        ? formatHumanDuration(dur)
+    remBucket > 0
+      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000) })
+      : remBucket < 0
+        ? formatHumanDuration(-remBucket * 60_000)
         : '';
 
   const isDragging = draggingIdx === idx;

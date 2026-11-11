@@ -16,10 +16,16 @@ const MINUTE_PRESETS = [
 ];
 
 export function SleepTimerSheet() {
+  const open = useRouteStore((s) => s.sleepTimerSheetOpen);
+  // Avoid subscribing to `usePlayer()` ticks while the sleep timer sheet is closed.
+  if (!open) return null;
+  return <SleepTimerSheetContent />;
+}
+
+function SleepTimerSheetContent() {
   const t = useT();
   const player = usePlayer();
 
-  const open = useRouteStore((s) => s.sleepTimerSheetOpen);
   const setOpen = useRouteStore((s) => s.setSleepTimerSheetOpen);
 
   const active = player.sleepTimer.timer;
@@ -28,7 +34,7 @@ export function SleepTimerSheet() {
 
   return (
     <BottomSheet
-      open={open}
+      open
       onClose={() => setOpen(false)}
       title={t('sleep.title')}
       testId="sleep-timer-sheet"

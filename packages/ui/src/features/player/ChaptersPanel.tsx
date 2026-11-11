@@ -1,17 +1,18 @@
 /**
  * Merged Chapters list & sanitized Shownotes panel (`DESIGN.md` §4.6).
  */
+import { useMemo } from 'react';
 import { cx, Icon, IconButton } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { formatClock, sanitizeShownotesHtml } from '../../lib/format';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerState } from '../../player/usePlayer';
 import type { SidePanelTab } from '../../app/routes';
 
 export function ChaptersList() {
   const host = useHost();
   const t = useT();
-  const player = usePlayer();
+  const player = usePlayerState();
   const { chapters, activeChapterIndex } = player;
 
   if (chapters.length === 0) {
@@ -68,9 +69,10 @@ export function ChaptersList() {
 export function ShownotesView() {
   const host = useHost();
   const t = useT();
-  const player = usePlayer();
+  const player = usePlayerState();
+  const description = player.episode?.description;
 
-  const html = sanitizeShownotesHtml(player.episode?.description);
+  const html = useMemo(() => sanitizeShownotesHtml(description), [description]);
   if (!html) {
     return (
       <div className="m-empty" style={{ padding: '24px 12px' }} data-testid="shownotes-empty">
@@ -100,7 +102,7 @@ export function ShownotesView() {
 }
 
 export function ChaptersPanel({ tab }: { readonly tab: SidePanelTab }) {
-  const player = usePlayer();
+  const player = usePlayerState();
   const t = useT();
 
   if (!player.episode) {
