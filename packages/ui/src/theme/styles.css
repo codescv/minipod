@@ -1,7 +1,8 @@
 /*
  * MiniPod Material Design 3 Minimalist Stylesheet.
  * Colour tokens (--md-sys-color-*) are populated dynamically by m3-theme.ts;
- * safe-area variables (--m-safe-*) are populated on Android by MainActivity.java
+ * safe-area variables (--m-safe-*) are populated on Android by MainActivity.java and on
+ * iOS by MiniPodWebViewController.swift (Capacitor 8 WKWebView host),
  * with CSS env(safe-area-inset-*) fallback.
  */
 :root {
@@ -46,7 +47,7 @@
   --md-sys-color-scrim: #000000;
   --md-sys-color-surface-tint: #206487;
 
-  /* Safe-area insets (Android MainActivity injects --m-safe-*) */
+  /* Safe-area insets (Android MainActivity / iOS MiniPodWebViewController inject --m-safe-*) */
   --m-safe-top: env(safe-area-inset-top, 0px);
   --m-safe-right: env(safe-area-inset-right, 0px);
   --m-safe-bottom: env(safe-area-inset-bottom, 0px);

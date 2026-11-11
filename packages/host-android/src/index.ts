@@ -11,3 +11,4 @@ export * from './sync/drive-auth';
 export * from './feeds/local-folder';
 export * from './default-deps';
 export * from './capacitor-host';
+export * from './platform';

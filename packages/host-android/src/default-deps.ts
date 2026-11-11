@@ -8,6 +8,7 @@ import { App } from '@capacitor/app';
 import { Capacitor } from '@capacitor/core';
 import type { PodcastIndexKeys, SyncSchedulerHost, Unsubscribe } from '@minipod/core';
 import { createDefaultMiniPodPlugin, type DeepLinkPayload, type MiniPodPlugin } from './plugin-types';
+import { androidOsLabel, iosOsLabel, isIosRuntime } from './platform';
 import {
   createCapacitorPreferences,
   createMemoryPreferences,
@@ -16,7 +17,7 @@ import {
 } from './storage/idb';
 
 /** Bumped automatically by `scripts/bump-version.mjs` when packaging APKs. */
-export const version = '0.1.31';
+export const version = '0.1.32';
 
 export interface CapacitorHostDeps {
   readonly plugin: MiniPodPlugin;
@@ -26,6 +27,8 @@ export interface CapacitorHostDeps {
   readonly appVersion: string;
   readonly osLabel: string;
   readonly defaultDeviceName: string;
+  /** Native shell flavour (`ios` = `//experimental/users/chii/ios/minipod` WKWebView host). */
+  readonly runtime?: 'android' | 'ios';
   readonly podcastIndexKeys?: PodcastIndexKeys;
   readonly schedulerHost: SyncSchedulerHost;
   readonly onAppLifecycle?: (handlers: {
@@ -103,13 +106,19 @@ export async function resolveCapacitorHostDeps(
     }
   }
 
-  const osLabel =
-    overrides?.osLabel ??
-    (typeof navigator !== 'undefined' && navigator.userAgent
-      ? /Android\s+([0-9.]+)/i.exec(navigator.userAgent)?.[0] ?? 'Android'
-      : 'Android');
+  // The same bundle runs in the Android WebView and the iOS Capacitor `WKWebView` host.
+  const userAgent = typeof navigator !== 'undefined' ? (navigator.userAgent ?? '') : '';
+  let capPlatform: string | undefined;
+  try {
+    capPlatform = Capacitor.getPlatform();
+  } catch {
+    capPlatform = undefined;
+  }
+  const ios = isIosRuntime(capPlatform, userAgent);
 
-  const defaultDeviceName = overrides?.defaultDeviceName ?? 'Android';
+  const osLabel = overrides?.osLabel ?? (ios ? iosOsLabel(userAgent) : androidOsLabel(userAgent));
+
+  const defaultDeviceName = overrides?.defaultDeviceName ?? (ios ? 'iOS' : 'Android');
   const schedulerHost = overrides?.schedulerHost ?? createBrowserSyncSchedulerHost();
 
   const onAppLifecycle: CapacitorHostDeps['onAppLifecycle'] =
@@ -168,6 +177,7 @@ export async function resolveCapacitorHostDeps(
     appVersion,
     osLabel,
     defaultDeviceName,
+    runtime: overrides?.runtime ?? (ios ? 'ios' : 'android'),
     schedulerHost,
     onAppLifecycle,
     ...(overrides?.podcastIndexKeys !== undefined

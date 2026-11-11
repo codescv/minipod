@@ -84,6 +84,7 @@ import {
   type Unsubscribe,
 } from '@minipod/core';
 import { resolveCapacitorHostDeps, type CapacitorHostDeps } from './default-deps';
+import { isDocumentUri } from './platform';
 import { scanSafLocalFolder, type ExistingSafEpisodeHint } from './feeds/local-folder';
 import { createPluginHttpClient } from './net/plugin-http';
 import { NativeAudioEngine } from './player/NativeAudioEngine';
@@ -103,7 +104,7 @@ import { IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.31';
+export const CAPACITOR_HOST_VERSION = '0.1.32';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -324,7 +325,7 @@ export async function createCapacitorPlatformHost(
     if (
       ep.enclosureUrl &&
       !ep.feedKey.startsWith('l_') &&
-      !ep.enclosureUrl.startsWith('content://')
+      !isDocumentUri(ep.enclosureUrl)
     ) {
       // In-flight downloads have no `downloadPath` yet: remove the deterministic target + `.part`.
       const { cleanUrl } = extractUrlCredentials(ep.enclosureUrl);
@@ -896,7 +897,7 @@ export async function createCapacitorPlatformHost(
         ...(ep.enclosureMime !== undefined ? { mime: ep.enclosureMime } : {}),
       };
     }
-    if ((ep.feedKey.startsWith('l_') || ep.enclosureUrl?.startsWith('content://')) && ep.enclosureUrl) {
+    if ((ep.feedKey.startsWith('l_') || isDocumentUri(ep.enclosureUrl)) && ep.enclosureUrl) {
       return {
         kind: 'file',
         path: ep.enclosureUrl,
@@ -1384,7 +1385,7 @@ export async function createCapacitorPlatformHost(
     if (!ep) {
       throw new MiniPodError('not-found', `Episode not found: ${episodeKey}`);
     }
-    if (ep.feedKey.startsWith('l_') || ep.enclosureUrl?.startsWith('content://')) {
+    if (ep.feedKey.startsWith('l_') || isDocumentUri(ep.enclosureUrl)) {
       return;
     }
     if (!ep.enclosureUrl) {
@@ -1580,7 +1581,7 @@ export async function createCapacitorPlatformHost(
     const length =
       endInclusive !== undefined ? Math.max(0, endInclusive - start + 1) : 256 * 1024;
     if (length === 0) return new Uint8Array(0);
-    if (pathOrUri.startsWith('content://')) {
+    if (isDocumentUri(pathOrUri)) {
       const res = await plugin.saf.readRange({ uri: pathOrUri, start, length });
       return decodeBase64(res.base64);
     }
@@ -1601,7 +1602,7 @@ export async function createCapacitorPlatformHost(
       return chRec.mergedChapters;
     }
 
-    const isLocal = ep.feedKey.startsWith('l_') || Boolean(ep.enclosureUrl?.startsWith('content://'));
+    const isLocal = ep.feedKey.startsWith('l_') || isDocumentUri(ep.enclosureUrl);
     const localPath =
       ep.downloadState === 'DONE' && ep.downloadPath
         ? ep.downloadPath
@@ -1658,11 +1659,11 @@ export async function createCapacitorPlatformHost(
       const uri = payload.uri.trim();
       const mime = (payload.mimeType ?? '').toLowerCase();
       const looksLikeOpml =
-        uri.startsWith('content://') ||
+        isDocumentUri(uri) ||
         mime.includes('opml') ||
         /\.opml(?:\?|$)/i.test(uri);
 
-      if (uri.startsWith('content://') && looksLikeOpml) {
+      if (isDocumentUri(uri) && looksLikeOpml) {
         try {
           const raw = await plugin.saf.read({ uri });
           const xml = UTF8_DECODER.decode(decodeBase64(raw.base64));
@@ -2061,7 +2062,7 @@ export async function createCapacitorPlatformHost(
           if (length <= 0) return ch.imageUrl;
 
           const isLocal =
-            ep.feedKey.startsWith('l_') || Boolean(ep.enclosureUrl?.startsWith('content://'));
+            ep.feedKey.startsWith('l_') || isDocumentUri(ep.enclosureUrl);
           const localPath =
             ep.downloadState === 'DONE' && ep.downloadPath
               ? ep.downloadPath
@@ -2616,7 +2617,8 @@ export async function createCapacitorPlatformHost(
             message: `MiniPod v${deps.appVersion} is already up to date.`,
           };
         }
-        if (deps.plugin.downloadAndInstallApk && release.apkUrl) {
+        // iOS cannot sideload APKs: the iOS host opens the release page instead.
+        if (deps.runtime !== 'ios' && deps.plugin.downloadAndInstallApk && release.apkUrl) {
           const res = await deps.plugin.downloadAndInstallApk({
             url: release.apkUrl,
             version: release.version,
@@ -2633,7 +2635,9 @@ export async function createCapacitorPlatformHost(
               : `Launching Android package installer for v${release.version}.`,
           };
         }
-        await deps.plugin.openExternal({ url: release.apkUrl ?? release.htmlUrl });
+        await deps.plugin.openExternal({
+          url: deps.runtime === 'ios' ? release.htmlUrl : (release.apkUrl ?? release.htmlUrl),
+        });
         return {
           ok: true,
           method: 'external',

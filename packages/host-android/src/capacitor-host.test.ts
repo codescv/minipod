@@ -538,6 +538,124 @@ describe('CapacitorPlatformHost', () => {
     await host.dispose();
   });
 
+  it('iOS host: scans minipod-saf:// document folders like SAF trees and plays them as local files', async () => {
+    const harness = createTestPluginHarness();
+    const folder = 'minipod-saf://0123abcd/My%20Audiobooks';
+    harness.safFiles.set(`${folder}/folder.jpg`, {
+      bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      mtimeMs: 1_700_000_000_000,
+    });
+    harness.safFiles.set(`${folder}/01-intro.mp3`, {
+      bytes: new Uint8Array(16),
+      mtimeMs: 1_700_000_005_000,
+    });
+    vi.mocked(harness.plugin.saf.listTree).mockImplementation(async () => ({
+      entries: [
+        {
+          uri: `${folder}/folder.jpg`,
+          name: 'folder.jpg',
+          mime: 'image/jpeg',
+          size: 4,
+          mtimeMs: 1_700_000_000_000,
+          isDirectory: false,
+        },
+        {
+          uri: `${folder}/01-intro.mp3`,
+          name: '01-intro.mp3',
+          mime: 'audio/mpeg',
+          size: 16,
+          mtimeMs: 1_700_000_005_000,
+          isDirectory: false,
+        },
+      ],
+    }));
+
+    const { host, syncStore } = await createCapacitorPlatformHost({
+      plugin: harness.plugin,
+      idbFactory: new IDBFactory(),
+      dbName: 'host-ios-document-folder-test',
+      preferences: createMemoryPreferences(),
+      runtime: 'ios',
+      osLabel: 'iOS 18.0',
+      defaultDeviceName: 'iOS',
+    });
+    expect(host.info.os).toBe('iOS 18.0');
+
+    const localFeed = await host.feeds.addLocalFolder({ ref: folder, displayName: 'My Audiobooks' });
+    expect(localFeed.kind).toBe('LOCAL');
+    expect(localFeed.imageUrl).toMatch(/^data:image\/jpeg;base64,/);
+    const eps = await host.episodes.list(localFeed.feedKey, 'all');
+    expect(eps.items).toHaveLength(1);
+    const epKey = eps.items[0]!.episode.episodeKey;
+
+    // Embedded chapter art is sliced through `saf.readRange`, never `readLocalFileRange`.
+    await syncStore.saveMergedChapters(epKey, [
+      { startMs: 0, title: 'Intro', source: 'ID3', embeddedImage: { offset: 2, length: 4, mime: 'image/png' } },
+    ]);
+    vi.mocked(harness.plugin.readLocalFileRange).mockClear();
+    expect(await host.episodes.chapterImage(epKey, 0)).toMatch(/^data:image\/png;base64,/);
+    expect(harness.plugin.saf.readRange).toHaveBeenCalledWith(
+      expect.objectContaining({ uri: `${folder}/01-intro.mp3` }),
+    );
+    expect(harness.plugin.readLocalFileRange).not.toHaveBeenCalled();
+
+    // Document episodes are never downloaded (they already are local).
+    vi.mocked(harness.plugin.httpToFile).mockClear();
+    await host.episodes.download(epKey);
+    expect(harness.plugin.httpToFile).not.toHaveBeenCalled();
+
+    await host.dispose();
+  });
+
+  it('iOS host: updater.apply opens the GitHub release page instead of sideloading the APK', async () => {
+    const harness = createTestPluginHarness();
+    const downloadSpy = vi.fn(async () => ({ filePath: '/x.apk', installerLaunched: true }));
+    const pluginWithUpdater: MiniPodPlugin = {
+      ...harness.plugin,
+      http: vi.fn(async (req) => ({
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        finalUrl: req.url,
+        chain: [],
+        bodyBase64: encodeBase64(
+          new TextEncoder().encode(
+            JSON.stringify({
+              tag_name: 'v0.1.40',
+              name: 'MiniPod v0.1.40',
+              body: 'notes',
+              published_at: '2026-11-30T15:00:00Z',
+              html_url: 'https://github.com/codescv/minipod/releases/tag/v0.1.40',
+              assets: [
+                {
+                  name: 'minipod-v0.1.40.apk',
+                  browser_download_url:
+                    'https://github.com/codescv/minipod/releases/download/v0.1.40/minipod-v0.1.40.apk',
+                  size: 4_123_456,
+                },
+              ],
+            }),
+          ),
+        ),
+      })),
+      downloadAndInstallApk: downloadSpy,
+    };
+    const { host } = await createCapacitorPlatformHost({
+      plugin: pluginWithUpdater,
+      appVersion: '0.1.32',
+      idbFactory: new IDBFactory(),
+      dbName: 'host-ios-updater-test',
+      preferences: createMemoryPreferences(),
+      runtime: 'ios',
+    });
+    const applyRes = await host.updater!.apply();
+    expect(applyRes.method).toBe('external');
+    expect(downloadSpy).not.toHaveBeenCalled();
+    expect(pluginWithUpdater.openExternal).toHaveBeenCalledWith({
+      url: 'https://github.com/codescv/minipod/releases/tag/v0.1.40',
+    });
+    await host.dispose();
+  });
+
   it('normalizes blank episode imageUrl to feed imageUrl in native marathon queue sources', async () => {
     const rssWithFeedCover = `<?xml version="1.0" encoding="UTF-8"?>
       <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">

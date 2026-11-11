@@ -9,6 +9,7 @@ import { Button, Icon, IconButton } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useT } from '../../i18n';
 import { formatBytes } from '../../lib/format';
+import { isIosCapacitorRuntime } from '../../lib/platform-runtime';
 import { useUpdateStore } from './updater';
 
 function summarizeNotes(notes: string): string {
@@ -52,7 +53,10 @@ export function UpdateBanner() {
 
   const summary = summarizeNotes(release.notes);
   const sizeBadge =
-    host.info.platform === 'android' && release.apkSizeBytes && release.apkSizeBytes > 0
+    host.info.platform === 'android' &&
+    !isIosCapacitorRuntime() &&
+    release.apkSizeBytes &&
+    release.apkSizeBytes > 0
       ? ` · ${formatBytes(release.apkSizeBytes)}`
       : '';
   const pct = progressPercent >= 0 ? Math.min(100, Math.round(progressPercent)) : -1;
