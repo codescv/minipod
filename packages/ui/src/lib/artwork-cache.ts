@@ -1,6 +1,7 @@
 /**
  * UI Layer-1 Artwork Cache (`v0.1.6`):
- * - Retains live `HTMLImageElement` instances in an in-memory LRU pool (`MAX_PINNED_IMAGES = 400`)
+ * - Retains live `HTMLImageElement` instances in an in-memory LRU pool (`MAX_PINNED_IMAGES = 120`,
+ *   bounded so iOS WKWebView / Android WebView never pin hundreds of decoded bitmaps in RAM)
  *   so Blink / Android WebView's decoded bitmap cache (`MemoryCache`) never evicts podcast or
  *   episode covers when React unmounts a screen during navigation.
  * - Remembers the resolved candidate index per `candidatesKey` so `<ArtworkImage>` immediately
@@ -9,7 +10,7 @@
  * - Provides background `preloadArtworkUrls` so channel & episode covers are warmed ahead of scroll.
  */
 
-const MAX_PINNED_IMAGES = 400;
+const MAX_PINNED_IMAGES = 120;
 const MAX_RESOLVED_CANDIDATES = 1000;
 
 const loadedArtworkUrls = new Set<string>();
@@ -29,7 +30,15 @@ function touchPinnedImage(url: string, img: HTMLImageElement): void {
   }
 }
 
-export function pinLoadedArtwork(url: string | null | undefined): void {
+/**
+ * Marks `url` as loaded and pins a decoded image for it. Pass the caller's already-loaded
+ * `<img>` as `existingImg` to pin it directly instead of creating (and fetching) a duplicate
+ * `new Image()`.
+ */
+export function pinLoadedArtwork(
+  url: string | null | undefined,
+  existingImg?: HTMLImageElement | null,
+): void {
   const clean = url?.trim();
   if (!clean) return;
   loadedArtworkUrls.add(clean);
@@ -37,6 +46,11 @@ export function pinLoadedArtwork(url: string | null | undefined): void {
   const existing = pinnedImagePool.get(clean);
   if (existing) {
     touchPinnedImage(clean, existing);
+    return;
+  }
+
+  if (existingImg) {
+    touchPinnedImage(clean, existingImg);
     return;
   }
 

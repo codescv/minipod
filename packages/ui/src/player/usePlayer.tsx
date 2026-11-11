@@ -9,9 +9,11 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from 'react';
 import {
@@ -84,7 +86,51 @@ export interface PlayerContextValue {
   attachVideoSurface(el: HTMLElement | null): void;
 }
 
+/**
+ * Low-frequency slice of {@link PlayerContextValue}: everything list screens and rows need
+ * (current episode identity, play/pause/buffering, speed, duration, mute, sleep-timer mode,
+ * chapters, actions) but **never** the live `positionMs` / sleep-timer `remainingMs`, which tick
+ * every ~250–1000 ms during playback. Consumers of {@link usePlayerState} therefore don't
+ * re-render on playback position ticks (smooth scrolling on long lists on iOS + Android).
+ */
+export interface PlayerStateValue
+  extends Omit<PlayerContextValue, 'snapshot' | 'sleepTimer'> {
+  readonly episodeKey: string | undefined;
+  readonly playing: boolean;
+  readonly buffering: boolean;
+  readonly speed: number;
+  readonly durationMs: number | undefined;
+  readonly sleepTimerMode: SleepTimer['mode'];
+}
+
+interface PlayerSnapshotStore {
+  get(): PlayerSnapshot;
+  set(next: PlayerSnapshot): void;
+  subscribe(listener: () => void): () => void;
+}
+
+function createSnapshotStore(initial: PlayerSnapshot): PlayerSnapshotStore {
+  let current = initial;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => current,
+    set(next) {
+      if (next === current) return;
+      current = next;
+      for (const l of [...listeners]) l();
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
 const PlayerContext = createContext<PlayerContextValue | null>(null);
+const PlayerStateContext = createContext<PlayerStateValue | null>(null);
+const PlayerSnapshotStoreContext = createContext<PlayerSnapshotStore | null>(null);
 
 export function PlayerProvider({
   engine,
@@ -108,6 +154,7 @@ export function PlayerProvider({
   const [feedImageUrl, setFeedImageUrl] = useState<string | undefined>(undefined);
   const [chapterArtworkUrl, setChapterArtworkUrl] = useState<string | undefined>(undefined);
   const [snapshot, setSnapshot] = useState<PlayerSnapshot>(() => engine.getSnapshot());
+  const [snapshotStore] = useState(() => createSnapshotStore(snapshot));
   const [sleepTimer, setSleepTimerState] = useState<SleepTimerState>({ timer: { mode: 'off' } });
   const [muted, setMuted] = useState(false);
   const [chapters, setChapters] = useState<readonly Chapter[]>([]);
@@ -979,7 +1026,88 @@ export function PlayerProvider({
     ],
   );
 
-  return <PlayerContext.Provider value={value}>{children}</PlayerContext.Provider>;
+  const stateValue = useMemo<PlayerStateValue>(
+    () => ({
+      engine,
+      episode,
+      feedTitle,
+      artworkUrl: primaryArtworkUrl,
+      episodeArtworkUrl: resolvedEpisodeArtworkUrl,
+      fallbackArtworkUrl: resolvedFallbackArtworkUrl,
+      episodeKey: snapshot.episodeKey,
+      playing: snapshot.playing,
+      buffering: snapshot.buffering,
+      speed: snapshot.speed,
+      durationMs: snapshot.durationMs,
+      sleepTimerMode: sleepTimer.timer.mode,
+      muted,
+      chapters,
+      activeChapterIndex,
+      playEpisode,
+      playPreviewEpisode,
+      togglePlayPause,
+      play,
+      pause,
+      seekTo,
+      skipBack,
+      skipForward,
+      cycleSpeed,
+      setSpeed,
+      setSleepTimer,
+      setSleepTimerEndOfChapter,
+      toggleMute,
+      prevChapter,
+      nextChapter,
+      attachVideoSurface,
+    }),
+    [
+      engine,
+      episode,
+      feedTitle,
+      primaryArtworkUrl,
+      resolvedEpisodeArtworkUrl,
+      resolvedFallbackArtworkUrl,
+      snapshot.episodeKey,
+      snapshot.playing,
+      snapshot.buffering,
+      snapshot.speed,
+      snapshot.durationMs,
+      sleepTimer.timer.mode,
+      muted,
+      chapters,
+      activeChapterIndex,
+      playEpisode,
+      playPreviewEpisode,
+      togglePlayPause,
+      play,
+      pause,
+      seekTo,
+      skipBack,
+      skipForward,
+      cycleSpeed,
+      setSpeed,
+      setSleepTimer,
+      setSleepTimerEndOfChapter,
+      toggleMute,
+      prevChapter,
+      nextChapter,
+      attachVideoSurface,
+    ],
+  );
+
+  // Publish the live snapshot to the external store after commit so position-only subscribers
+  // (`usePlayerLivePositionMs`) re-render without re-rendering every `usePlayerState()` consumer.
+  useLayoutEffect(() => {
+    snapshotStore.set(snapshot);
+  }, [snapshot, snapshotStore]);
+
+  return (
+    <PlayerSnapshotStoreContext.Provider value={snapshotStore}>
+      <PlayerStateContext.Provider value={stateValue}>
+        <PlayerContext.Provider value={value}>{children}</PlayerContext.Provider>
+      </PlayerStateContext.Provider>
+    </PlayerSnapshotStoreContext.Provider>
+  );
 }
 
 export function usePlayer(): PlayerContextValue {
@@ -988,4 +1116,42 @@ export function usePlayer(): PlayerContextValue {
     throw new Error('usePlayer() called outside <PlayerProvider>');
   }
   return ctx;
+}
+
+/**
+ * Low-frequency player state + actions. Does NOT update on playback `positionMs` ticks — use it
+ * in screens, lists and rows. Player chrome that renders the live position uses {@link usePlayer}.
+ */
+export function usePlayerState(): PlayerStateValue {
+  const ctx = useContext(PlayerStateContext);
+  if (!ctx) {
+    throw new Error('usePlayerState() called outside <PlayerProvider>');
+  }
+  return ctx;
+}
+
+/** Like {@link usePlayerState}, but `null` outside `<PlayerProvider>` (shared hooks). */
+export function useOptionalPlayerState(): PlayerStateValue | null {
+  return useContext(PlayerStateContext);
+}
+
+const NO_POSITION_SUBSCRIBE = () => () => undefined;
+const NO_POSITION = () => undefined;
+
+/**
+ * Live playback `positionMs` while `enabled` (pass `isCurrent` for the row showing the current
+ * episode), otherwise `undefined`. Only enabled subscribers re-render on position ticks; every
+ * other row's selected value stays `undefined`, so React bails out of re-rendering it.
+ */
+export function usePlayerLivePositionMs(enabled: boolean): number | undefined {
+  const store = useContext(PlayerSnapshotStoreContext);
+  const getSnapshot = useCallback(
+    () => (store && enabled ? store.get().positionMs : undefined),
+    [store, enabled],
+  );
+  return useSyncExternalStore(
+    store && enabled ? store.subscribe : NO_POSITION_SUBSCRIBE,
+    store && enabled ? getSnapshot : NO_POSITION,
+    store && enabled ? getSnapshot : NO_POSITION,
+  );
 }

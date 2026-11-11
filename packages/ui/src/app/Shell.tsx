@@ -6,7 +6,7 @@
  *   (Subscriptions, Queue) + full-height `ExpandedPlayer` `BottomSheet`.
  * - Global keyboard shortcuts (`Space`, `J`/`L`, `←`/`→`, `Shift+←/→`, `[`/`]`, `Q`, `M`, `/`).
  */
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useRouteStore, type RootTab } from './routes';
 import { Chip, cx, FAB, Icon, SideSheet } from '../components/m3';
 import { AddSearch } from '../features/add/AddSearch';
@@ -28,7 +28,7 @@ import { UpdateBanner } from '../features/updater/UpdateBanner';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useT } from '../i18n';
 import { nextSpeedPreset, prevSpeedPreset } from '../player/PlayerEngine';
-import { usePlayer } from '../player/usePlayer';
+import { usePlayerState } from '../player/usePlayer';
 
 function isEditableElement(target: EventTarget | null): boolean {
   if (!target || !(target instanceof HTMLElement)) return false;
@@ -40,7 +40,10 @@ function isEditableElement(target: EventTarget | null): boolean {
 export function Shell() {
   const isDesktop = useIsDesktop();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: Shell must never re-render on playback position ticks.
+  const player = usePlayerState();
+  const playerRef = useRef(player);
+  playerRef.current = player;
 
   const tab = useRouteStore((s) => s.tab);
   const screen = useRouteStore((s) => s.screen);
@@ -53,6 +56,8 @@ export function Shell() {
   // Global keyboard shortcuts (DESIGN.md §4.6 & §5)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Read the latest player via a ref so the listener is bound once, not on every update.
+      const player = playerRef.current;
       if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
       if (isEditableElement(e.target)) return;
 
@@ -96,11 +101,11 @@ export function Shell() {
           break;
         case '[':
           e.preventDefault();
-          player.setSpeed(prevSpeedPreset(player.snapshot.speed));
+          player.setSpeed(prevSpeedPreset(player.speed));
           break;
         case ']':
           e.preventDefault();
-          player.setSpeed(nextSpeedPreset(player.snapshot.speed));
+          player.setSpeed(nextSpeedPreset(player.speed));
           break;
         case 'q':
         case 'Q':
@@ -121,7 +126,7 @@ export function Shell() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [openAdd, player, setTab]);
+  }, [openAdd, setTab]);
 
   const renderMainStage = () => {
     switch (screen.kind) {

@@ -4,7 +4,7 @@
  * 2. Multi-feed HTML `<link rel="alternate">` radio selector (`choices`).
  * 3. Full feed preview with `[ Subscribe ]` AND direct tap-to-play episode streaming + long-press / swipe-left queue gestures.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type {
   DiscoveredFeedLink,
   EpisodeKey,
@@ -29,7 +29,8 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, stripHtmlToText } from '../../lib/format';
 import { deriveEpisodeKey } from '../../lib/identity';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerState } from '../../player/usePlayer';
+import { useProgressiveLimit } from '../../hooks/useProgressiveLimit';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 
 export interface FeedPreviewScreenProps {
@@ -39,11 +40,13 @@ export interface FeedPreviewScreenProps {
   readonly choices?: { readonly pageUrl: string; readonly items: readonly DiscoveredFeedLink[] } | undefined;
 }
 
+/** Preview episodes mounted on frame 0; the IntersectionObserver sentinel adds this many per step. */
+export const PREVIEW_PAGE_SIZE = 60;
+
 export function FeedPreview({ url, preview, authChallenge, choices }: FeedPreviewScreenProps) {
   const host = useHost();
   const locale = useLocale();
   const t = useT();
-  const player = usePlayer();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
@@ -56,6 +59,13 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
   const [busy, setBusy] = useState(false);
   const [descExpanded, setDescExpanded] = useState(false);
   const [queuedKeys, setQueuedKeys] = useState<ReadonlySet<EpisodeKey>>(() => new Set());
+  const previewEpisodeCount = preview?.parsed.episodes.length ?? 0;
+  const {
+    limit: displayLimit,
+    hasMore: hasMoreEpisodes,
+    sentinelRef,
+    loadMore: loadMoreEpisodes,
+  } = useProgressiveLimit(PREVIEW_PAGE_SIZE, preview?.feedKey ?? url, previewEpisodeCount);
 
   const loadQueuedKeys = useCallback(async () => {
     try {
@@ -384,7 +394,7 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
           )}
 
           <div className="m-episode-list" data-testid="preview-episode-list">
-            {preview.parsed.episodes.map((ep, idx) => {
+            {preview.parsed.episodes.slice(0, displayLimit).map((ep, idx) => {
               const epKey = deriveEpisodeKey(preview.feedKey, ep.identity);
               return (
                 <PreviewEpisodeRow
@@ -400,7 +410,22 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
                 />
               );
             })}
+            {hasMoreEpisodes && (
+              <div
+                ref={sentinelRef}
+                aria-hidden="true"
+                className="m-list-sentinel"
+                data-testid="preview-list-sentinel"
+              />
+            )}
           </div>
+          {hasMoreEpisodes && (
+            <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 10 }}>
+              <Button variant="tonal" data-testid="preview-load-more" onClick={loadMoreEpisodes}>
+                {t('subs.loadMoreTimeline')}
+              </Button>
+            </div>
+          )}
         </>
       )}
 
@@ -411,7 +436,7 @@ export function FeedPreview({ url, preview, authChallenge, choices }: FeedPrevie
   );
 }
 
-function PreviewEpisodeRow({
+const PreviewEpisodeRow = memo(function PreviewEpisodeRow({
   idx,
   preview,
   ep,
@@ -432,7 +457,8 @@ function PreviewEpisodeRow({
 }) {
   const host = useHost();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: never re-render on playback position ticks.
+  const player = usePlayerState();
   const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
   const [inlineUndo, setInlineUndo] = useState(false);
   const inlineUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -447,7 +473,7 @@ function PreviewEpisodeRow({
   useEffect(() => clearInlineUndoTimer, [clearInlineUndoTimer]);
 
   const isCurrent = player.episode?.episodeKey === epKey;
-  const isPlaying = isCurrent && player.snapshot.playing;
+  const isPlaying = isCurrent && player.playing;
   const dateStr = formatShortDate(ep.pubDate, locale);
   const durStr = formatHumanDuration(ep.durationMs);
 
@@ -528,7 +554,8 @@ function PreviewEpisodeRow({
     },
   });
 
-  const menuItems: MenuEntry[] = [
+  // Only built while the context menu is open.
+  const buildMenuItems = (): MenuEntry[] => [
     {
       key: 'play-next',
       label: t('detail.playNext'),
@@ -626,14 +653,16 @@ function PreviewEpisodeRow({
         )}
       </div>
 
-      <ContextMenu
-        open={ctxPos !== null}
-        x={ctxPos?.x ?? 0}
-        y={ctxPos?.y ?? 0}
-        onClose={() => setCtxPos(null)}
-        items={menuItems}
-        testId="preview-ep-context-menu"
-      />
+      {ctxPos !== null && (
+        <ContextMenu
+          open
+          x={ctxPos.x}
+          y={ctxPos.y}
+          onClose={() => setCtxPos(null)}
+          items={buildMenuItems()}
+          testId="preview-ep-context-menu"
+        />
+      )}
     </>
   );
-}
+});

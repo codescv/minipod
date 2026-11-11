@@ -735,7 +735,11 @@ export function ArtworkImage({
     key: candidatesKey,
     index: defaultIdx,
   });
-  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
+  // Already-cached artwork starts as loaded, so its `onLoad` never triggers an extra re-render.
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(() => {
+    const initialSrc = candidates[defaultIdx];
+    return initialSrc && isArtworkLoaded(initialSrc) ? initialSrc : null;
+  });
 
   const activeIdx = errorState.key === candidatesKey ? errorState.index : defaultIdx;
   const activeSrc = candidates[activeIdx];
@@ -755,15 +759,17 @@ export function ArtworkImage({
       style={style}
       title={title}
       loading={cached ? 'eager' : loading}
-      decoding={cached ? 'sync' : 'async'}
+      // Always async: image decoding must never block the main thread during scroll rasterization.
+      decoding="async"
       draggable={draggable}
       data-testid={testId}
       data-artwork-cached={cached ? 'true' : 'false'}
       onClick={onClick}
-      onLoad={() => {
-        pinLoadedArtwork(activeSrc);
+      onLoad={(e) => {
+        // Pin the already-decoded `<img>` itself (no duplicate `new Image()` fetch).
+        pinLoadedArtwork(activeSrc, e.currentTarget);
         rememberResolvedCandidate(candidatesKey, activeIdx);
-        setLoadedSrc(activeSrc);
+        if (loadedSrc !== activeSrc) setLoadedSrc(activeSrc);
       }}
       onError={() => {
         setErrorState((prev) => {

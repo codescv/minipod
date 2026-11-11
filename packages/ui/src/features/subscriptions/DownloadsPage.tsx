@@ -11,6 +11,7 @@ import { useRouteStore } from '../../app/routes';
 import { Button, Icon, IconButton } from '../../components/m3';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
+import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { useT } from '../../i18n';
 import {
   applyDownloadStateToViewCache,
@@ -93,6 +94,10 @@ export function DownloadsPage() {
     void loadDownloads();
   }, [loadDownloads]);
 
+  const shouldReloadList = useListReloadFilter(() => {
+    void loadDownloads();
+  });
+
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
       applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
@@ -111,7 +116,8 @@ export function DownloadsPage() {
       ev.type === 'progress-changed' ||
       ev.type === 'queue-changed'
     ) {
-      void loadDownloads();
+      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints.
+      if (shouldReloadList(ev)) void loadDownloads();
     }
   });
 

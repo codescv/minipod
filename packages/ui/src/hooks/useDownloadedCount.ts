@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
+import { useListReloadFilter } from './useListReloadFilter';
 import { applyDownloadStateToViewCache, getHostViewCache } from '../stores/view-cache';
 
 export function useDownloadedCount(): number {
@@ -56,6 +57,12 @@ export function useDownloadedCount(): number {
     void refresh();
   }, [refresh]);
 
+  // Skip RUNNING progress samples and the playing episode's 5 s checkpoints (neither changes the
+  // downloaded count) instead of re-listing every feed several times per second.
+  const shouldRefresh = useListReloadFilter(() => {
+    void refresh();
+  });
+
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
       applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
@@ -69,7 +76,7 @@ export function useDownloadedCount(): number {
       ev.type === 'feeds-changed' ||
       ev.type === 'progress-changed'
     ) {
-      void refresh();
+      if (shouldRefresh(ev)) void refresh();
     }
   });
 

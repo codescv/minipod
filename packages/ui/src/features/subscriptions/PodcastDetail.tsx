@@ -29,11 +29,13 @@ import {
   type MenuEntry,
 } from '../../components/m3';
 import { useDownloadedCount } from '../../hooks/useDownloadedCount';
+import { useProgressiveLimit } from '../../hooks/useProgressiveLimit';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { stripHtmlToText } from '../../lib/format';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerState } from '../../player/usePlayer';
+import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar } from '../../stores/snackbar';
 import {
   applyDownloadStateToViewCache,
@@ -44,10 +46,14 @@ import {
 } from '../../stores/view-cache';
 import { EpisodeRow } from './EpisodeRow';
 
+/** Episodes mounted on frame 0; the IntersectionObserver sentinel adds this many per step. */
+export const DETAIL_PAGE_SIZE = 60;
+
 export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const host = useHost();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: never re-render the episode list on playback position ticks.
+  const player = usePlayerState();
   const openDownloads = useRouteStore((s) => s.openDownloads);
   const downloadedCount = useDownloadedCount();
   const activeEpisodeKeyRef = useRef<EpisodeKey | undefined>(player.episode?.episodeKey);
@@ -203,6 +209,10 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
     void reload();
   }, [reload]);
 
+  const shouldReloadList = useListReloadFilter(() => {
+    void reload();
+  });
+
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
       // Patch every cached slice first so `recomputeHostTimelineAndDownloads` (which walks all
@@ -216,7 +226,9 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
       ev.type === 'queue-changed' ||
       ev.type === 'download-updated'
     ) {
-      void reload();
+      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints (rows update
+      // themselves); real transitions / user actions still re-query.
+      if (shouldReloadList(ev)) void reload();
     }
   });
 
@@ -260,6 +272,39 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
   const filteredVisibleRows = rows.filter((r) => !dismissedKeys.has(r.episode.episodeKey));
   const visibleRows =
     sortOrder === 'asc' ? [...filteredVisibleRows].reverse() : filteredVisibleRows;
+  const {
+    limit: displayLimit,
+    hasMore: hasMoreRows,
+    sentinelRef,
+    loadMore: loadMoreRows,
+  } = useProgressiveLimit(DETAIL_PAGE_SIZE, `${feedKey}|${filter}`, visibleRows.length);
+
+  // Stable row callbacks so memoized `EpisodeRow`s skip re-rendering unchanged rows.
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+  const handleRowStartInlineRemove = useCallback((epKey: EpisodeKey) => {
+    inlineUndoKeysRef.current.add(epKey);
+  }, []);
+  const handleRowRemove = useCallback((epKey: EpisodeKey) => {
+    inlineUndoKeysRef.current.delete(epKey);
+    setDismissedKeys((prev) => {
+      const next = new Set(prev);
+      next.add(epKey);
+      return next;
+    });
+  }, []);
+  const handleRowUndoRemove = useCallback((epKey: EpisodeKey) => {
+    inlineUndoKeysRef.current.delete(epKey);
+    setDismissedKeys((prev) => {
+      if (!prev.has(epKey)) return prev;
+      const next = new Set(prev);
+      next.delete(epKey);
+      return next;
+    });
+  }, []);
+  const handleRowChanged = useCallback(() => {
+    void reloadRef.current();
+  }, []);
 
   const menuItems: MenuEntry[] = [
     ...(downloadedCount > 0
@@ -427,40 +472,37 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         </div>
       ) : visibleRows.length > 0 ? (
         <div className="m-episode-list" data-testid="detail-episode-list">
-          {visibleRows.map((r) => (
+          {visibleRows.slice(0, displayLimit).map((r) => (
             <EpisodeRow
               key={r.episode.episodeKey}
               row={r}
               feedTitle={feed?.title}
               feedImageUrl={feed?.imageUrl}
               allowDownloads={allowDownloads}
-              onStartInlineRemove={(epKey) => {
-                inlineUndoKeysRef.current.add(epKey);
-              }}
-              onRemove={(epKey) => {
-                inlineUndoKeysRef.current.delete(epKey);
-                setDismissedKeys((prev) => {
-                  const next = new Set(prev);
-                  next.add(epKey);
-                  return next;
-                });
-              }}
-              onUndoRemove={(epKey) => {
-                inlineUndoKeysRef.current.delete(epKey);
-                setDismissedKeys((prev) => {
-                  if (!prev.has(epKey)) return prev;
-                  const next = new Set(prev);
-                  next.delete(epKey);
-                  return next;
-                });
-              }}
-              onChanged={() => {
-                void reload();
-              }}
+              onStartInlineRemove={handleRowStartInlineRemove}
+              onRemove={handleRowRemove}
+              onUndoRemove={handleRowUndoRemove}
+              onChanged={handleRowChanged}
             />
           ))}
+          {hasMoreRows && (
+            <div
+              ref={sentinelRef}
+              aria-hidden="true"
+              className="m-list-sentinel"
+              data-testid="detail-list-sentinel"
+            />
+          )}
         </div>
       ) : null}
+
+      {hasMoreRows && (
+        <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 10 }}>
+          <Button variant="tonal" data-testid="detail-load-more" onClick={loadMoreRows}>
+            {t('subs.loadMoreTimeline')}
+          </Button>
+        </div>
+      )}
 
       {feed?.nextPageUrl && (
         <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 8 }}>

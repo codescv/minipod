@@ -4,6 +4,15 @@
  * - Long-Press (~450ms, 10px slop), Right-Click (`contextmenu`), `ContextMenu` / `Shift+F10` -> context menu
  * - Horizontal Swipe (`|deltaX| > 64px` and `|deltaX| > |deltaY| * 1.5`) via both Touch and Pointer drag
  *   with live horizontal translation feedback and deduplication across touch/pointer event streams.
+ *
+ * Scroll-performance notes (iOS WKWebView + Android WebView):
+ * - Window `pointerup` / `pointercancel` fallbacks are attached lazily for an active pointer
+ *   session only (0 window listeners per idle row, instead of 2 per mounted row).
+ * - Once a gesture moves vertically past the slop (`|dy| > slop && |dy| > |dx|`) it is locked out
+ *   as a scroll: the long-press timer is cleared and later move events return in O(1).
+ * - When the Pointer Events stream is tracking the gesture, the duplicate Touch Events stream is
+ *   skipped (touch handlers stay fully functional for touch-only streams).
+ * - Taps and vertical scrolls never call React state setters (no swipe visual to reset).
  */
 import {
   useCallback,
@@ -21,6 +30,8 @@ export const ROW_LONG_PRESS_DELAY_MS = 450;
 export const ROW_LONG_PRESS_SLOP_PX = 10;
 export const ROW_SWIPE_THRESHOLD_PX = 64;
 const ROW_SWIPE_MAX_VISUAL_PX = 116;
+/** Vertical movement beyond this (and dominating horizontal) locks the gesture out as a scroll. */
+const MOVE_SLOP_PX = ROW_LONG_PRESS_SLOP_PX;
 
 export type SwipeDirection = 'left' | 'right' | null;
 
@@ -70,6 +81,13 @@ export function useRowGestures({
   const longPressedRef = useRef(false);
   const suppressClickRef = useRef(false);
   const didSwipeRef = useRef(false);
+  /** Current gesture became a vertical scroll: skip all swipe / long-press math until it ends. */
+  const verticalScrollRef = useRef(false);
+  /** Mirrors `swipeOffsetX` so resets can skip no-op state updates. */
+  const swipeOffsetRef = useRef(0);
+  const swipeArmedRef = useRef(false);
+  /** Detaches the lazily attached window `pointerup` / `pointercancel` listeners. */
+  const detachWindowListenersRef = useRef<(() => void) | null>(null);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -78,9 +96,21 @@ export function useRowGestures({
     }
   }, []);
 
+  const detachWindowListeners = useCallback(() => {
+    const detach = detachWindowListenersRef.current;
+    detachWindowListenersRef.current = null;
+    detach?.();
+  }, []);
+
   const resetSwipeVisual = useCallback(() => {
-    setSwipeOffsetX(0);
-    setSwipeArmed(false);
+    if (swipeOffsetRef.current !== 0) {
+      swipeOffsetRef.current = 0;
+      setSwipeOffsetX(0);
+    }
+    if (swipeArmedRef.current) {
+      swipeArmedRef.current = false;
+      setSwipeArmed(false);
+    }
   }, []);
 
   const updateVisualOffset = useCallback((dx: number, dy: number) => {
@@ -88,18 +118,21 @@ export function useRowGestures({
     const minX = canLeft ? -ROW_SWIPE_MAX_VISUAL_PX : 0;
     const maxX = canRight ? ROW_SWIPE_MAX_VISUAL_PX : 0;
     const clamped = Math.max(minX, Math.min(maxX, Math.round(dx * 0.75)));
+    swipeOffsetRef.current = clamped;
     setSwipeOffsetX(clamped);
     const armed =
       clamped !== 0 &&
       Math.abs(dx) > ROW_SWIPE_THRESHOLD_PX &&
       Math.abs(dx) > Math.abs(dy) * 1.5 &&
       ((dx < 0 && Boolean(canLeft)) || (dx > 0 && Boolean(canRight)));
+    swipeArmedRef.current = armed;
     setSwipeArmed(armed);
   }, []);
 
   const finishPointerAt = useCallback(
     (clientX: number | undefined, clientY: number | undefined, cancelled: boolean) => {
       clearTimer();
+      detachWindowListeners();
       const start = pointerStartRef.current;
       pointerStartRef.current = null;
       resetSwipeVisual();
@@ -107,7 +140,7 @@ export function useRowGestures({
       if (cancelled || !start || touchActiveRef.current || recentTouchEndRef.current) {
         return;
       }
-      if (longPressedRef.current) {
+      if (longPressedRef.current || verticalScrollRef.current) {
         return;
       }
 
@@ -133,26 +166,44 @@ export function useRowGestures({
         suppressClickRef.current = true;
       }
     },
-    [clearTimer, resetSwipeVisual],
+    [clearTimer, detachWindowListeners, resetSwipeVisual],
   );
 
-  useEffect(() => {
+  /**
+   * Window fallbacks for a pointer released outside the row; attached only while a pointer
+   * session is active (see `onPointerDown`) and removed as soon as it ends.
+   */
+  const attachWindowListeners = useCallback(() => {
+    if (detachWindowListenersRef.current !== null || typeof window === 'undefined') return;
     const onWinPointerUp = (ev: PointerEvent) => {
-      if (!pointerStartRef.current) return;
+      if (!pointerStartRef.current) {
+        detachWindowListeners();
+        return;
+      }
       finishPointerAt(ev.clientX, ev.clientY, false);
     };
     const onWinPointerCancel = () => {
-      if (!pointerStartRef.current) return;
+      if (!pointerStartRef.current) {
+        detachWindowListeners();
+        return;
+      }
       finishPointerAt(undefined, undefined, true);
     };
     window.addEventListener('pointerup', onWinPointerUp);
     window.addEventListener('pointercancel', onWinPointerCancel);
-    return () => {
-      clearTimer();
+    detachWindowListenersRef.current = () => {
       window.removeEventListener('pointerup', onWinPointerUp);
       window.removeEventListener('pointercancel', onWinPointerCancel);
     };
-  }, [clearTimer, finishPointerAt]);
+  }, [detachWindowListeners, finishPointerAt]);
+
+  useEffect(
+    () => () => {
+      clearTimer();
+      detachWindowListeners();
+    },
+    [clearTimer, detachWindowListeners],
+  );
 
   const startLongPressTimer = useCallback(
     (x: number, y: number) => {
@@ -171,12 +222,25 @@ export function useRowGestures({
     [clearTimer, resetSwipeVisual],
   );
 
+  /** Returns `true` (and locks the gesture out) once it is a vertical scroll. */
+  const lockOutVerticalScroll = (dx: number, dy: number): boolean => {
+    const ady = Math.abs(dy);
+    if (ady > MOVE_SLOP_PX && ady > Math.abs(dx) && !didSwipeRef.current) {
+      verticalScrollRef.current = true;
+      clearTimer();
+      resetSwipeVisual();
+      return true;
+    }
+    return false;
+  };
+
   const handlers: RowGestureHandlers = {
     onPointerDown: (e) => {
       if (typeof e.button === 'number' && e.button > 0) return;
       longPressedRef.current = false;
       suppressClickRef.current = false;
       didSwipeRef.current = false;
+      verticalScrollRef.current = false;
 
       const hasCoords = Number.isFinite(e.clientX) && Number.isFinite(e.clientY);
       const rect = hasCoords ? null : e.currentTarget.getBoundingClientRect();
@@ -184,17 +248,19 @@ export function useRowGestures({
       const y = hasCoords ? e.clientY : rect ? rect.top + rect.height / 2 : 0;
 
       pointerStartRef.current = { x, y };
+      attachWindowListeners();
       startLongPressTimer(x, y);
     },
 
     onPointerMove: (e) => {
       const start = pointerStartRef.current;
-      if (!start) return;
+      if (!start || verticalScrollRef.current) return;
       const curX = Number.isFinite(e.clientX) ? e.clientX : start.x;
       const curY = Number.isFinite(e.clientY) ? e.clientY : start.y;
       const dx = curX - start.x;
       const dy = curY - start.y;
 
+      if (lockOutVerticalScroll(dx, dy)) return;
       if (Math.hypot(dx, dy) > ROW_LONG_PRESS_SLOP_PX) {
         clearTimer();
       }
@@ -214,12 +280,16 @@ export function useRowGestures({
     },
 
     onTouchStart: (e) => {
+      // Pointer Events already track this gesture (iOS WKWebView / Android WebView): skip the
+      // duplicate touch stream so each frame runs the gesture math once.
+      if (pointerStartRef.current !== null) return;
       const touch = e.touches[0];
       if (!touch) return;
       touchActiveRef.current = true;
       longPressedRef.current = false;
       suppressClickRef.current = false;
       didSwipeRef.current = false;
+      verticalScrollRef.current = false;
 
       const x = Number.isFinite(touch.clientX) ? touch.clientX : 0;
       const y = Number.isFinite(touch.clientY) ? touch.clientY : 0;
@@ -230,6 +300,7 @@ export function useRowGestures({
     },
 
     onTouchMove: (e) => {
+      if (pointerStartRef.current !== null || verticalScrollRef.current) return;
       const touch = e.touches[0];
       const start = touchStartRef.current;
       if (!touch || !start) return;
@@ -238,6 +309,7 @@ export function useRowGestures({
       const dx = curX - start.x;
       const dy = curY - start.y;
 
+      if (lockOutVerticalScroll(dx, dy)) return;
       if (Math.hypot(dx, dy) > ROW_LONG_PRESS_SLOP_PX) {
         clearTimer();
       }
@@ -248,6 +320,8 @@ export function useRowGestures({
     },
 
     onTouchEnd: (e) => {
+      // Still tracked by the pointer stream (its `pointerup` finishes the gesture).
+      if (pointerStartRef.current !== null) return;
       clearTimer();
       const start = touchStartRef.current;
       touchStartRef.current = null;
@@ -269,7 +343,7 @@ export function useRowGestures({
       }
 
       const touch = e.changedTouches[0];
-      if (start && touch) {
+      if (start && touch && !verticalScrollRef.current) {
         const endX = Number.isFinite(touch.clientX) ? touch.clientX : start.x;
         const endY = Number.isFinite(touch.clientY) ? touch.clientY : start.y;
         const dx = endX - start.x;

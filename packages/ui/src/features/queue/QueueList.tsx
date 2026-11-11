@@ -10,7 +10,16 @@
  * - Compact `20×36` drag handle (`queue-handle-*`) with live item-following Pointer/Touch drag-to-reorder
  *   and real-time neighbor slot shifting (plus `Alt+Up/Down` and HTML5 `onDrop` fallback)
  */
-import { useCallback, useEffect, useRef, useState, type CSSProperties, Fragment } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  Fragment,
+} from 'react';
 import type { DownloadState, EpisodeKey, Feed, FeedKey, QueueRow } from '@minipod/core';
 import { useRouteStore } from '../../app/routes';
 import {
@@ -34,7 +43,9 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerLivePositionMs, usePlayerState } from '../../player/usePlayer';
+import { useEpisodeDownloadStatus } from '../../hooks/useEpisodeDownloadStatus';
+import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import {
   applyDownloadStateToViewCache,
@@ -85,7 +96,9 @@ export function QueueList() {
   const host = useHost();
   const locale = useLocale();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: the queue never re-renders on playback position ticks (only the
+  // current row subscribes to the live position for its "time left" label).
+  const player = usePlayerState();
   const openDownloads = useRouteStore((s) => s.openDownloads);
   const openPodcastDetail = useRouteStore((s) => s.openPodcastDetail);
   const downloadedCount = useDownloadedCount();
@@ -96,9 +109,6 @@ export function QueueList() {
     () => getHostViewCache(host).feedsByKey,
   );
   const [loading, setLoading] = useState(() => !getHostViewCache(host).queueLoaded);
-  const [downloadProgressByKey, setDownloadProgressByKey] = useState<
-    ReadonlyMap<EpisodeKey, number>
-  >(() => new Map(getHostViewCache(host).downloadProgressByKey));
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
   const [dragDeltaY, setDragDeltaY] = useState(0);
@@ -184,6 +194,10 @@ export function QueueList() {
     void loadQueue();
   }, [loadQueue]);
 
+  const shouldReloadQueue = useListReloadFilter(() => {
+    void loadQueue();
+  });
+
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
       downloadEventSeqRef.current += 1;
@@ -195,7 +209,8 @@ export function QueueList() {
       // Also records the progress sample in the shared `downloadProgressByKey` (kept on FAILED,
       // cleared on DONE/NONE) so a remount mid-download never flashes back to `0%`.
       applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
-      setDownloadProgressByKey(new Map(getHostViewCache(host).downloadProgressByKey));
+      // Progress-only samples are rendered by the downloading row itself
+      // (`useEpisodeDownloadStatus`); the list only changes on real state transitions.
       // Keep an open `episode-detail-sheet` live even after its episode left the queue.
       setDetailsSnapshot((prev) =>
         prev && prev.episode.episodeKey === ev.episodeKey && prev.episode.downloadState !== ev.state
@@ -203,7 +218,13 @@ export function QueueList() {
           : prev,
       );
       setRows((prev) => {
-        if (!prev.some((r) => r.episode.episodeKey === ev.episodeKey)) return prev;
+        if (
+          !prev.some(
+            (r) => r.episode.episodeKey === ev.episodeKey && r.episode.downloadState !== ev.state,
+          )
+        ) {
+          return prev;
+        }
         const next = prev.map((r) =>
           r.episode.episodeKey === ev.episodeKey
             ? {
@@ -228,7 +249,8 @@ export function QueueList() {
       ev.type === 'progress-changed' ||
       ev.type === 'feeds-changed'
     ) {
-      void loadQueue();
+      // Skip the playing episode's 5 s progress checkpoints (deferred until playback pauses).
+      if (shouldReloadQueue(ev)) void loadQueue();
     }
   });
 
@@ -560,14 +582,6 @@ export function QueueList() {
           ? { ...prev, episode: { ...prev.episode, downloadState: 'NONE' as const } }
           : prev,
       );
-      setDownloadProgressByKey((prev) => {
-        let changed = false;
-        const next = new Map(prev);
-        for (const key of keySet) {
-          if (next.delete(key)) changed = true;
-        }
-        return changed ? next : prev;
-      });
       setRows((prev) => {
         if (!prev.some((r) => keySet.has(r.episode.episodeKey))) return prev;
         const next = prev.map((r) =>
@@ -793,6 +807,15 @@ export function QueueList() {
     (detailsSnapshot && detailsSnapshot.episode.episodeKey === detailsEpisodeKey
       ? detailsSnapshot
       : undefined);
+  const detailsIsCurrent =
+    detailsRow !== undefined && player.episode?.episodeKey === detailsRow.episode.episodeKey;
+  // Only while the details sheet shows the current episode does the queue follow live position.
+  const detailsLivePositionMs = usePlayerLivePositionMs(detailsIsCurrent);
+  // Live download ratio for the open sheet (the list itself no longer re-renders on progress ticks).
+  const { ratio: detailsDownloadRatio } = useEpisodeDownloadStatus(
+    detailsRow?.episode.episodeKey ?? NO_EPISODE_KEY,
+    detailsRow?.episode.downloadState ?? 'NONE',
+  );
   const detailsSheet = (() => {
     if (!detailsRow) return null;
     const episode = detailsRow.episode;
@@ -803,15 +826,15 @@ export function QueueList() {
     const primaryCoverUrl =
       nonEmptyUrl(episode.imageUrl) ?? nonEmptyUrl(detailsRow.entry.stub?.imageUrl);
     const feedCoverUrl = nonEmptyUrl(feed?.imageUrl) ?? nonEmptyUrl(detailsRow.entry.stub?.imageUrl);
-    const isCurrent = player.episode?.episodeKey === epKey;
-    const isPlaying = isCurrent && player.snapshot.playing;
+    const isCurrent = detailsIsCurrent;
+    const isPlaying = isCurrent && player.playing;
     const dur =
-      (isCurrent ? player.snapshot.durationMs : undefined) ??
+      (isCurrent ? player.durationMs : undefined) ??
       detailsRow.progress?.durationMs ??
       episode.durationMs ??
       detailsRow.entry.stub?.durationMs;
     const pos = isCurrent
-      ? player.snapshot.positionMs
+      ? (detailsLivePositionMs ?? 0)
       : detailsRow.progress?.state === 'IN_PROGRESS'
         ? detailsRow.progress.positionMs
         : 0;
@@ -833,7 +856,7 @@ export function QueueList() {
       (episode.downloadState === 'RUNNING' || episode.downloadState === 'QUEUED');
     const isDownloadQueued = isDownloading && episode.downloadState === 'QUEUED';
     const isDownloadFailed = canDownloadEpisode && episode.downloadState === 'FAILED';
-    const downloadRatio = downloadProgressByKey.get(epKey) ?? 0;
+    const downloadRatio = detailsDownloadRatio ?? 0;
     return {
       isDownloading,
       isDownloadQueued,
@@ -855,6 +878,54 @@ export function QueueList() {
       shownotesHtml,
     };
   })();
+
+  // Stable row actions (trampolines to the latest handlers) so memoized `QueueRowItem`s only
+  // re-render when their own props change.
+  const rowActionsImplRef = useRef({
+    play: (_row: QueueRow, _feedTitle: string, _feedImageUrl: string | undefined) => {},
+    context: (_idx: number, _x: number, _y: number) => {},
+    swipeRemove: (_idx: number) => {},
+    move: (_from: number, _to: number) => {},
+    stopDownload: (_epKey: EpisodeKey) => {},
+    resumeDownload: (_epKey: EpisodeKey) => {},
+  });
+  rowActionsImplRef.current = {
+    play: (row, feedTitle, feedImageUrl) => {
+      if (player.episode?.episodeKey === row.episode.episodeKey) {
+        void player.togglePlayPause();
+      } else {
+        void player.playEpisode(row.episode, { feedTitle, feedImageUrl });
+      }
+    },
+    context: (idx, x, y) => {
+      clearTextSelection();
+      setActiveContextMenu({ idx, x, y });
+    },
+    swipeRemove: (idx) => {
+      void handleSwipeRemoveWithInlineUndo(idx);
+    },
+    move: (from, to) => {
+      void moveIndexTo(from, to);
+    },
+    stopDownload: (epKey) => {
+      void handleStopDownload(epKey);
+    },
+    resumeDownload: (epKey) => {
+      void handleResumeDownload(epKey);
+    },
+  };
+  const rowActions = useMemo<QueueRowActions>(
+    () => ({
+      play: (row, feedTitle, feedImageUrl) =>
+        rowActionsImplRef.current.play(row, feedTitle, feedImageUrl),
+      context: (idx, x, y) => rowActionsImplRef.current.context(idx, x, y),
+      swipeRemove: (idx) => rowActionsImplRef.current.swipeRemove(idx),
+      move: (from, to) => rowActionsImplRef.current.move(from, to),
+      stopDownload: (epKey) => rowActionsImplRef.current.stopDownload(epKey),
+      resumeDownload: (epKey) => rowActionsImplRef.current.resumeDownload(epKey),
+    }),
+    [],
+  );
 
   const handleDetailsPlayToggle = () => {
     if (!detailsSheet) return;
@@ -915,29 +986,15 @@ export function QueueList() {
             const feedCoverUrl =
               nonEmptyUrl(feed?.imageUrl) ?? nonEmptyUrl(r.entry.stub?.imageUrl);
             const isCurrent = player.episode?.episodeKey === epKey;
-            const isPlaying = isCurrent && player.snapshot.playing;
+            const isPlaying = isCurrent && player.playing;
             const dur =
-              (isCurrent ? player.snapshot.durationMs : undefined) ??
+              (isCurrent ? player.durationMs : undefined) ??
               r.progress?.durationMs ??
               r.episode.durationMs ??
               r.entry.stub?.durationMs;
-            const pos = isCurrent
-              ? player.snapshot.positionMs
-              : r.progress?.state === 'IN_PROGRESS'
-                ? r.progress.positionMs
-                : 0;
+            const savedPos = r.progress?.state === 'IN_PROGRESS' ? r.progress.positionMs : 0;
             const pubDate = r.episode.pubDate ?? r.entry.stub?.pubDate;
             const dateStr = formatShortDate(pubDate, locale);
-            const remStr =
-              dur && pos > 0 && dur > pos
-                ? t('detail.timeLeft', { time: formatHumanDuration(dur - pos) })
-                : dur
-                  ? formatHumanDuration(dur)
-                  : '';
-            const rawProgress = downloadProgressByKey.get(epKey);
-            const cachingLabel = t('queue.cachingProgress', {
-              percent: downloadRatioToPercent(rawProgress),
-            });
             const canResumeDownload =
               canDownload &&
               !r.episode.feedKey.startsWith('l_') &&
@@ -974,23 +1031,19 @@ export function QueueList() {
                   primaryCoverUrl={primaryCoverUrl}
                   feedCoverUrl={feedCoverUrl}
                   allowProxy={allowProxy}
+                  podcastName={podcastName}
                   dateStr={dateStr}
-                  remStr={remStr}
-                  downloadProgress={rawProgress}
+                  durationMs={dur}
+                  savedPositionMs={savedPos}
                   cachedLabel={t('queue.cached')}
-                  cachingLabel={cachingLabel}
                   waitingLabel={t('queue.waiting')}
                   stopDownloadLabel={t('detail.stopDownload')}
-                  onStopDownload={() => {
-                    void handleStopDownload(epKey);
-                  }}
+                  onStopDownload={rowActions.stopDownload}
                   canResumeDownload={canResumeDownload}
                   resumeDownloadLabel={t('queue.resumeDownload')}
                   resumeDownloadAriaLabel={t('detail.resumeDownload')}
                   downloadFailedLabel={t('queue.downloadFailed')}
-                  onResumeDownload={() => {
-                    void handleResumeDownload(epKey);
-                  }}
+                  onResumeDownload={rowActions.resumeDownload}
                   isCurrent={isCurrent}
                   isPlaying={isPlaying}
                   draggingIdx={draggingIdx}
@@ -1000,26 +1053,10 @@ export function QueueList() {
                   dragHandleLabel={`${t('queue.dragHandle')} ${r.episode.title}`}
                   dragHandleTitle={t('queue.dragHandle')}
                   swipeLeftHintLabel={t('queue.swipeHintRemove')}
-                  onPlay={() => {
-                    if (isCurrent) {
-                      void player.togglePlayPause();
-                    } else {
-                      void player.playEpisode(r.episode, {
-                        feedTitle: podcastName,
-                        feedImageUrl: feedCoverUrl,
-                      });
-                    }
-                  }}
-                  onContext={(x, y) => {
-                    clearTextSelection();
-                    setActiveContextMenu({ idx, x, y });
-                  }}
-                  onSwipeLeftRemove={() => {
-                    void handleSwipeRemoveWithInlineUndo(idx);
-                  }}
-                  onMoveIndex={(from, to) => {
-                    void moveIndexTo(from, to);
-                  }}
+                  onPlay={rowActions.play}
+                  onContext={rowActions.context}
+                  onSwipeLeftRemove={rowActions.swipeRemove}
+                  onMoveIndex={rowActions.move}
                   onSetDragging={setDraggingIdx}
                   onSetDropTarget={setDropTargetIdx}
                   onStartHandleDrag={startHandleDrag}
@@ -1276,17 +1313,29 @@ export function QueueList() {
   );
 }
 
-function QueueRowItem({
+interface QueueRowActions {
+  readonly play: (row: QueueRow, feedTitle: string, feedImageUrl: string | undefined) => void;
+  readonly context: (idx: number, x: number, y: number) => void;
+  readonly swipeRemove: (idx: number) => void;
+  readonly move: (from: number, to: number) => void;
+  readonly stopDownload: (epKey: EpisodeKey) => void;
+  readonly resumeDownload: (epKey: EpisodeKey) => void;
+}
+
+/** Placeholder key for `useEpisodeDownloadStatus` while no details sheet is open. */
+const NO_EPISODE_KEY = '' as EpisodeKey;
+
+const QueueRowItem = memo(function QueueRowItem({
   row,
   idx,
   primaryCoverUrl,
   feedCoverUrl,
   allowProxy,
+  podcastName,
   dateStr,
-  remStr,
-  downloadProgress,
+  durationMs,
+  savedPositionMs,
   cachedLabel,
-  cachingLabel,
   waitingLabel,
   stopDownloadLabel,
   onStopDownload,
@@ -1319,20 +1368,21 @@ function QueueRowItem({
   readonly primaryCoverUrl?: string | undefined;
   readonly feedCoverUrl?: string | undefined;
   readonly allowProxy: boolean;
+  readonly podcastName: string;
   readonly dateStr: string;
-  readonly remStr: string;
-  readonly downloadProgress?: number | undefined;
+  readonly durationMs: number | undefined;
+  /** Saved `IN_PROGRESS` position (used unless this row is the current episode). */
+  readonly savedPositionMs: number;
   readonly cachedLabel: string;
-  readonly cachingLabel: string;
   /** `等待中` label shown instead of `{percent}%` while `QUEUED` (waiting for a download slot). */
   readonly waitingLabel: string;
   readonly stopDownloadLabel: string;
-  readonly onStopDownload: () => void;
+  readonly onStopDownload: (epKey: EpisodeKey) => void;
   readonly canResumeDownload: boolean;
   readonly resumeDownloadLabel: string;
   readonly resumeDownloadAriaLabel: string;
   readonly downloadFailedLabel: string;
-  readonly onResumeDownload: () => void;
+  readonly onResumeDownload: (epKey: EpisodeKey) => void;
   readonly isCurrent: boolean;
   readonly isPlaying: boolean;
   readonly draggingIdx: number | null;
@@ -1342,9 +1392,9 @@ function QueueRowItem({
   readonly dragHandleLabel: string;
   readonly dragHandleTitle: string;
   readonly swipeLeftHintLabel: string;
-  readonly onPlay: () => void;
-  readonly onContext: (x: number, y: number) => void;
-  readonly onSwipeLeftRemove: () => void;
+  readonly onPlay: (row: QueueRow, feedTitle: string, feedImageUrl: string | undefined) => void;
+  readonly onContext: (idx: number, x: number, y: number) => void;
+  readonly onSwipeLeftRemove: (idx: number) => void;
   readonly onMoveIndex: (from: number, to: number) => void;
   readonly onSetDragging: (idx: number | null) => void;
   readonly onSetDropTarget: (idx: number | null) => void;
@@ -1356,12 +1406,25 @@ function QueueRowItem({
     cancelled: boolean,
   ) => void;
 }) {
+  const t = useT();
   const epKey = row.episode.episodeKey;
   const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
-    onTap: onPlay,
-    onContext,
-    onSwipeLeft: onSwipeLeftRemove,
+    onTap: () => onPlay(row, podcastName, feedCoverUrl),
+    onContext: (x, y) => onContext(idx, x, y),
+    onSwipeLeft: () => onSwipeLeftRemove(idx),
   });
+  // Only this (downloading) row re-renders on `download-updated` progress samples.
+  const { ratio: downloadProgress } = useEpisodeDownloadStatus(epKey, row.episode.downloadState);
+  // Only the current episode's row follows the live playback position.
+  const livePositionMs = usePlayerLivePositionMs(isCurrent);
+  const pos = isCurrent ? (livePositionMs ?? 0) : savedPositionMs;
+  const dur = durationMs;
+  const remStr =
+    dur && pos > 0 && dur > pos
+      ? t('detail.timeLeft', { time: formatHumanDuration(dur - pos) })
+      : dur
+        ? formatHumanDuration(dur)
+        : '';
 
   const isDragging = draggingIdx === idx;
   const isAnyDragging = draggingIdx !== null;
@@ -1373,6 +1436,9 @@ function QueueRowItem({
   const isCacheFailed = dlState === 'FAILED' && canResumeDownload;
   const progressRatio = Math.max(0, Math.min(1, downloadProgress ?? 0));
   const progressPercent = downloadRatioToPercent(progressRatio);
+  const cachingLabel = t('queue.cachingProgress', {
+    percent: downloadRatioToPercent(downloadProgress),
+  });
 
   let shiftY = 0;
   if (
@@ -1630,7 +1696,7 @@ function QueueRowItem({
                   data-download-phase={isCacheQueued ? 'queued' : 'running'}
                   data-cache-progress={progressPercent}
                   style={{ cursor: 'pointer' }}
-                  {...inlineRowActionProps(onStopDownload)}
+                  {...inlineRowActionProps(() => onStopDownload(epKey))}
                 >
                   {isCacheQueued ? (
                     <DownloadWaitingText
@@ -1652,7 +1718,7 @@ function QueueRowItem({
                   ariaLabel={resumeDownloadAriaLabel}
                   title={`${downloadFailedLabel} · ${resumeDownloadAriaLabel}`}
                   testId={`queue-resume-download-${epKey}`}
-                  onResume={onResumeDownload}
+                  onResume={() => onResumeDownload(epKey)}
                 />
               )}
             </div>
@@ -1661,4 +1727,4 @@ function QueueRowItem({
       </div>
     </div>
   );
-}
+});

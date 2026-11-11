@@ -517,4 +517,48 @@ describe('NativeAudioEngine', () => {
       engine.dispose();
     });
   });
+
+  it('only reports native activity (journal reconcile) on real state changes, never on 1 s playing position ticks', async () => {
+    const { plugin, emitNative } = createMockMediaHarness();
+    const onNativeActivity = vi.fn();
+    const engine = new NativeAudioEngine({ plugin, isVisible: () => true, onNativeActivity });
+    await new Promise((r) => setTimeout(r, 0));
+
+    await engine.load({
+      episodeKey: 'e_tick',
+      source: { kind: 'url', url: 'https://example.com/tick.mp3' },
+      startMs: 0,
+      speed: 1,
+      metadata: { title: 'Tick', durationMs: 600_000 },
+      mediaType: 'AUDIO',
+    });
+    const base = { episodeKey: 'e_tick', buffering: false, durationMs: 600_000, speed: 1 } as const;
+
+    // play transition -> one activity
+    emitNative('media-state', { ...base, playing: true, positionMs: 1_000 });
+    expect(onNativeActivity).toHaveBeenCalledTimes(1);
+
+    // 5 plain 1 s foreground ticks -> no extra readJournal round-trips
+    for (let i = 2; i <= 6; i++) {
+      emitNative('media-state', { ...base, playing: true, positionMs: i * 1_000 });
+    }
+    expect(onNativeActivity).toHaveBeenCalledTimes(1);
+
+    // explicit seek -> activity
+    emitNative('media-state', { ...base, playing: true, positionMs: 60_000, seeked: true });
+    expect(onNativeActivity).toHaveBeenCalledTimes(2);
+
+    // buffering change -> activity
+    emitNative('media-state', { ...base, playing: true, buffering: true, positionMs: 61_000 });
+    expect(onNativeActivity).toHaveBeenCalledTimes(3);
+
+    // pause -> activity
+    emitNative('media-state', { ...base, playing: false, positionMs: 62_000 });
+    expect(onNativeActivity).toHaveBeenCalledTimes(4);
+
+    // ended -> activity
+    emitNative('media-ended', { episodeKey: 'e_tick' });
+    expect(onNativeActivity).toHaveBeenCalledTimes(5);
+    engine.dispose();
+  });
 });

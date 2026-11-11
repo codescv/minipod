@@ -7,6 +7,7 @@
  * - Manual `⟳` refresh + direct top-right Settings button + touch pull-to-refresh + `.opml` / `.xml` drag-and-drop import
  */
 import {
+  memo,
   useCallback,
   useEffect,
   useRef,
@@ -35,7 +36,8 @@ import { useHostEvents } from '../../host/useHostEvents';
 import { useT } from '../../i18n';
 import { preloadArtworkUrls } from '../../lib/artwork-cache';
 import { clearTextSelection } from '../../lib/text-selection';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerState } from '../../player/usePlayer';
+import { useListReloadFilter } from '../../hooks/useListReloadFilter';
 import { showSnackbar } from '../../stores/snackbar';
 import {
   applyDownloadStateToViewCache,
@@ -186,7 +188,8 @@ function useLongPressHandlers({
 export function SubscriptionsGrid() {
   const host = useHost();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: never re-render the grid/timeline on playback position ticks.
+  const player = usePlayerState();
   const isDesktop = useIsDesktop();
   const allowProxy = shouldUseImageProxy(host.info.platform);
   const activeEpisodeKey = player.episode?.episodeKey;
@@ -428,6 +431,10 @@ export function SubscriptionsGrid() {
     };
   }, [loadFeedsAndTimeline]);
 
+  const shouldReloadList = useListReloadFilter(() => {
+    void loadFeedsAndTimeline();
+  });
+
   useHostEvents((ev) => {
     if (ev.type === 'download-updated') {
       applyDownloadStateToViewCache(host, ev.episodeKey, ev.state, undefined, ev.progress);
@@ -449,7 +456,9 @@ export function SubscriptionsGrid() {
       ev.type === 'queue-changed' ||
       ev.type === 'download-updated'
     ) {
-      void loadFeedsAndTimeline();
+      // Skip RUNNING progress samples and the playing episode's 5 s checkpoints (rows update
+      // themselves); real transitions / user actions still re-query.
+      if (shouldReloadList(ev)) void loadFeedsAndTimeline();
     } else if (ev.type === 'feed-refreshed') {
       if (ev.error?.code === 'auth-required') {
         setAuthFailedKeys((prev) => {
@@ -550,6 +559,41 @@ export function SubscriptionsGrid() {
     },
   ];
 
+  // Stable row/tile callbacks so memoized `EpisodeRow` / `PodcastTile` skip unchanged items.
+  const handleFeedContext = useCallback((feed: Feed, x: number, y: number) => {
+    setContextMenu({ feed, x, y });
+  }, []);
+  const openPodcastCallbacksRef = useRef(new Map<FeedKey, () => void>());
+  const getOpenPodcastCallback = (feedKey: FeedKey): (() => void) => {
+    const cache = openPodcastCallbacksRef.current;
+    let cb = cache.get(feedKey);
+    if (!cb) {
+      cb = () => openPodcastDetail(feedKey);
+      cache.set(feedKey, cb);
+    }
+    return cb;
+  };
+  const handleTimelineStartInlineRemove = useCallback((epKey: EpisodeKey) => {
+    inlineUndoKeysRef.current.add(epKey);
+  }, []);
+  const handleTimelineRemove = useCallback(
+    (epKey: EpisodeKey) => {
+      inlineUndoKeysRef.current.delete(epKey);
+      setTimelineItems((prev) => {
+        const next = prev.filter((entry) => entry.row.episode.episodeKey !== epKey);
+        getHostViewCache(host).timelineItems = next;
+        return next;
+      });
+    },
+    [host],
+  );
+  const handleTimelineUndoRemove = useCallback((epKey: EpisodeKey) => {
+    inlineUndoKeysRef.current.delete(epKey);
+  }, []);
+  const handleTimelineChanged = useCallback(() => {
+    void loadFeedsAndTimeline();
+  }, [loadFeedsAndTimeline]);
+
   const collapseThreshold = gridCols * MAX_SUBS_COLLAPSED_ROWS;
   const canCollapse = feeds.length > collapseThreshold;
   const visibleFeeds = canCollapse && !subsExpanded ? feeds.slice(0, collapseThreshold) : feeds;
@@ -635,8 +679,8 @@ export function SubscriptionsGrid() {
                   needsAuth={authFailedKeys.has(feed.feedKey)}
                   needsAuthLabel={t('subs.needsAuth')}
                   allowProxy={allowProxy}
-                  onOpen={() => openPodcastDetail(feed.feedKey)}
-                  onContext={(x, y) => setContextMenu({ feed, x, y })}
+                  onOpenFeed={openPodcastDetail}
+                  onContextFeed={handleFeedContext}
                 />
               ))}
             </div>
@@ -705,26 +749,11 @@ export function SubscriptionsGrid() {
                         allowDownloads={item.allowDownloads}
                         showPodcastInfo
                         removeWhenQueued
-                        onOpenPodcast={() => openPodcastDetail(item.feed.feedKey)}
-                        onStartInlineRemove={(epKey) => {
-                          inlineUndoKeysRef.current.add(epKey);
-                        }}
-                        onRemove={(epKey) => {
-                          inlineUndoKeysRef.current.delete(epKey);
-                          setTimelineItems((prev) => {
-                            const next = prev.filter(
-                              (entry) => entry.row.episode.episodeKey !== epKey,
-                            );
-                            getHostViewCache(host).timelineItems = next;
-                            return next;
-                          });
-                        }}
-                        onUndoRemove={(epKey) => {
-                          inlineUndoKeysRef.current.delete(epKey);
-                        }}
-                        onChanged={() => {
-                          void loadFeedsAndTimeline();
-                        }}
+                        onOpenPodcast={getOpenPodcastCallback(item.feed.feedKey)}
+                        onStartInlineRemove={handleTimelineStartInlineRemove}
+                        onRemove={handleTimelineRemove}
+                        onUndoRemove={handleTimelineUndoRemove}
+                        onChanged={handleTimelineChanged}
                       />
                     ))}
                   </div>
@@ -775,24 +804,28 @@ export function SubscriptionsGrid() {
   );
 }
 
-function PodcastTile({
+const PodcastTile = memo(function PodcastTile({
   feed,
   needsAuth,
   needsAuthLabel,
   allowProxy,
-  onOpen,
-  onContext,
+  onOpenFeed,
+  onContextFeed,
 }: {
   readonly feed: Feed;
   readonly needsAuth: boolean;
   readonly needsAuthLabel: string;
   readonly allowProxy: boolean;
-  readonly onOpen: () => void;
-  readonly onContext: (x: number, y: number) => void;
+  /** Stable (feed-agnostic) callbacks so `memo` skips re-rendering unchanged tiles. */
+  readonly onOpenFeed: (feedKey: FeedKey) => void;
+  readonly onContextFeed: (feed: Feed, x: number, y: number) => void;
 }) {
   const displayTitle = feed.title ?? feed.url;
   const initial = displayTitle.trim().slice(0, 1).toUpperCase() || '?';
-  const interactions = useLongPressHandlers({ onOpen, onContext });
+  const interactions = useLongPressHandlers({
+    onOpen: () => onOpenFeed(feed.feedKey),
+    onContext: (x, y) => onContextFeed(feed, x, y),
+  });
 
   return (
     <div
@@ -826,4 +859,4 @@ function PodcastTile({
       <div className="m-podcast-tile__title">{displayTitle}</div>
     </div>
   );
-}
+});

@@ -169,7 +169,12 @@ export class NativeAudioEngine implements PlayerEngine {
     }
   }
 
-  private applySnapshotFromPayload(payload: NativeMediaStatePayload, emitEvents: boolean): void {
+  /**
+   * Applies a native state payload. Returns `true` when it is a real state change (episode,
+   * play/pause, buffering, speed, duration, seek, autonomous advance) rather than a plain
+   * position tick while playing.
+   */
+  private applySnapshotFromPayload(payload: NativeMediaStatePayload, emitEvents: boolean): boolean {
     const prev = this.snapshot;
     const rawPosMs = Math.max(0, Math.trunc(Number.isFinite(payload.positionMs) ? payload.positionMs : 0));
     const seeked = payload.seeked === true && payload.episodeKey !== undefined;
@@ -230,7 +235,17 @@ export class NativeAudioEngine implements PlayerEngine {
     this.snapshot = next;
     this.rememberPosition(next, seeked);
 
-    if (!emitEvents) return;
+    const stateChanged =
+      autonomousAdvance ||
+      seeked ||
+      prev.episodeKey !== next.episodeKey ||
+      prev.playing !== next.playing ||
+      prev.buffering !== next.buffering ||
+      prev.speed !== next.speed ||
+      prev.durationMs !== next.durationMs ||
+      (!next.playing && prev.positionMs !== next.positionMs);
+
+    if (!emitEvents) return stateChanged;
 
     if (autonomousAdvance && prev.episodeKey && next.episodeKey) {
       this.emit({
@@ -239,15 +254,6 @@ export class NativeAudioEngine implements PlayerEngine {
         to: next.episodeKey,
       });
     }
-
-    const stateChanged =
-      seeked ||
-      prev.episodeKey !== next.episodeKey ||
-      prev.playing !== next.playing ||
-      prev.buffering !== next.buffering ||
-      prev.speed !== next.speed ||
-      prev.durationMs !== next.durationMs ||
-      (!next.playing && prev.positionMs !== next.positionMs);
 
     if (stateChanged) {
       this.emit(seeked ? { type: 'state', snapshot: next, seeked: true } : { type: 'state', snapshot: next });
@@ -266,6 +272,7 @@ export class NativeAudioEngine implements PlayerEngine {
     if (prev.playing && !next.playing && !this.isVisible()) {
       this.onHiddenFlushNeeded?.('paused');
     }
+    return stateChanged;
   }
 
   /**
@@ -298,7 +305,6 @@ export class NativeAudioEngine implements PlayerEngine {
 
   private handleNativeState(payload: NativeMediaStatePayload): void {
     if (this.disposed) return;
-    this.onNativeActivity?.();
     let effective = payload;
     const completed = this.completedEpisodeKey;
     if (completed !== null) {
@@ -314,7 +320,12 @@ export class NativeAudioEngine implements PlayerEngine {
         effective = { ...payload, positionMs: 0 };
       }
     }
-    this.applySnapshotFromPayload(effective, true);
+    const stateChanged = this.applySnapshotFromPayload(effective, true);
+    // Reconcile the native journal (a `readJournal()` bridge round-trip) only on real state
+    // changes — never on the plain 1 s position ticks of foreground playback.
+    if (stateChanged || !effective.playing || effective.seeked === true) {
+      this.onNativeActivity?.();
+    }
   }
 
   private handleNativeEnded(payload: NativeMediaEndedPayload): void {

@@ -69,7 +69,11 @@ export function MiniPlayer() {
       />
 
       <div className="m-mini-player__bar">
-        <div className="m-mini-player__bar-fill" style={{ width: `${pct}%` }} />
+        {/* GPU-composited `scaleX` (see `.m-mini-player__bar-fill`): no per-tick layout. */}
+        <div
+          className="m-mini-player__bar-fill"
+          style={{ transform: `scaleX(${Math.max(0, Math.min(100, pct)) / 100})` }}
+        />
       </div>
     </div>
   );

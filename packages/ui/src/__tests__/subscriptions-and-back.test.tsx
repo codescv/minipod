@@ -585,11 +585,12 @@ describe('Subscriptions, Unplayed Timeline, Conditional Manage Downloads & LIFO 
     const syntax = feeds.find((f) => f.title === 'Syntax & Signal')!;
     const tileImg = screen.getByTestId(`feed-tile-${syntax.feedKey}`).querySelector('img')!;
 
-    // Triggering load on tile image pins the URL in artwork-cache and switches loading="eager" / decoding="sync"
+    // Triggering load on tile image pins the URL in artwork-cache and switches loading="eager";
+    // decoding stays "async" so cached covers never block the main thread while scrolling.
     fireEvent.load(tileImg);
     expect(isArtworkLoaded(tileImg.getAttribute('src'))).toBe(true);
     expect(tileImg.getAttribute('loading')).toBe('eager');
-    expect(tileImg.getAttribute('decoding')).toBe('sync');
+    expect(tileImg.getAttribute('decoding')).toBe('async');
   });
 
   it('shows calm empty state with Find podcasts CTA when there are no subscriptions', async () => {

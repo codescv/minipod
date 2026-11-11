@@ -8,7 +8,7 @@
  * - Swipe left (`deltaX < -64px`): Play next (`queue.playNext`) + in-place row Undo (no bottom snackbar)
  * - Swipe right (`deltaX > +64px`): Mark played (`progress.markPlayed(key, true)`) & remove + in-place row Undo (no bottom snackbar)
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type { EpisodeKey, EpisodeRow as EpisodeRowModel } from '@minipod/core';
 import {
   ArtworkImage,
@@ -35,7 +35,7 @@ import { useRowGestures } from '../../hooks/useRowGestures';
 import { useHost } from '../../host/HostContext';
 import { useLocale, useT } from '../../i18n';
 import { formatHumanDuration, formatShortDate, sanitizeShownotesHtml } from '../../lib/format';
-import { usePlayer } from '../../player/usePlayer';
+import { usePlayerLivePositionMs, usePlayerState } from '../../player/usePlayer';
 import { showSnackbar, useSnackbarStore } from '../../stores/snackbar';
 import {
   clearDownloadStop,
@@ -70,7 +70,7 @@ export interface EpisodeRowProps {
   readonly onChanged: () => void;
 }
 
-export function EpisodeRow({
+export const EpisodeRow = memo(function EpisodeRow({
   row,
   feedTitle,
   feedImageUrl,
@@ -90,7 +90,9 @@ export function EpisodeRow({
   const host = useHost();
   const locale = useLocale();
   const t = useT();
-  const player = usePlayer();
+  // Low-frequency player state: rows never re-render on playback position ticks (only the
+  // current episode's row subscribes to the live position for its "time left" label).
+  const player = usePlayerState();
   const allowProxy = shouldUseImageProxy(host.info.platform);
 
   const [ctxPos, setCtxPos] = useState<{ readonly x: number; readonly y: number } | null>(null);
@@ -109,11 +111,12 @@ export function EpisodeRow({
 
   const { episode, progress, inQueue } = row;
   const isCurrent = player.episode?.episodeKey === episode.episodeKey;
-  const isPlaying = isCurrent && player.snapshot.playing;
+  const isPlaying = isCurrent && player.playing;
   const isPlayed = progress?.state === 'PLAYED';
-  const positionMs = isCurrent ? player.snapshot.positionMs : (progress?.positionMs ?? 0);
+  const livePositionMs = usePlayerLivePositionMs(isCurrent);
+  const positionMs = isCurrent ? (livePositionMs ?? 0) : (progress?.positionMs ?? 0);
   const durationMs =
-    (isCurrent ? player.snapshot.durationMs : undefined) ?? progress?.durationMs ?? episode.durationMs;
+    (isCurrent ? player.durationMs : undefined) ?? progress?.durationMs ?? episode.durationMs;
 
   const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
 
@@ -288,40 +291,44 @@ export function EpisodeRow({
   const leftHintIcon: IconName = swipeLeftHintIcon ?? 'playlistAdd';
   const leftHintTone = swipeLeftHintTone ?? 'primary';
 
-  const viewDetailsItem: MenuEntry = {
-    key: 'view-details',
-    label: t('detail.viewDetails'),
-    icon: 'shownotes',
-    testId: `ep-view-details-${episode.episodeKey}`,
-    onSelect: () => {
-      setDetailsOpen(true);
-    },
+  // Only built while the context menu is open (avoids per-row allocations on every render).
+  const buildMenuItems = (): MenuEntry[] => {
+    const viewDetailsItem: MenuEntry = {
+      key: 'view-details',
+      label: t('detail.viewDetails'),
+      icon: 'shownotes',
+      testId: `ep-view-details-${episode.episodeKey}`,
+      onSelect: () => {
+        setDetailsOpen(true);
+      },
+    };
+    const menuItems: MenuEntry[] = onDeleteDownload
+      ? [
+          {
+            key: 'delete-download',
+            label: t('detail.deleteDownload'),
+            icon: 'delete',
+            testId: `ep-delete-download-${episode.episodeKey}`,
+            onSelect: () => {
+              onDeleteDownload();
+            },
+          },
+          viewDetailsItem,
+        ]
+      : [
+          {
+            key: 'toggle-queue',
+            label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
+            icon: inQueue ? 'queueMusic' : 'playlistAdd',
+            testId: `ep-queue-btn-${episode.episodeKey}`,
+            onSelect: () => {
+              void handleToggleQueue();
+            },
+          },
+          viewDetailsItem,
+        ];
+    return menuItems;
   };
-  const menuItems: MenuEntry[] = onDeleteDownload
-    ? [
-        {
-          key: 'delete-download',
-          label: t('detail.deleteDownload'),
-          icon: 'delete',
-          testId: `ep-delete-download-${episode.episodeKey}`,
-          onSelect: () => {
-            onDeleteDownload();
-          },
-        },
-        viewDetailsItem,
-      ]
-    : [
-        {
-          key: 'toggle-queue',
-          label: inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue'),
-          icon: inQueue ? 'queueMusic' : 'playlistAdd',
-          testId: `ep-queue-btn-${episode.episodeKey}`,
-          onSelect: () => {
-            void handleToggleQueue();
-          },
-        },
-        viewDetailsItem,
-      ];
 
   const dateStr = formatShortDate(episode.pubDate, locale);
   const remStr =
@@ -500,218 +507,222 @@ export function EpisodeRow({
         </div>
       )}
 
-      <ContextMenu
-        open={ctxPos !== null}
-        x={ctxPos?.x ?? 0}
-        y={ctxPos?.y ?? 0}
-        onClose={() => setCtxPos(null)}
-        items={menuItems}
-        testId="ep-context-menu"
-      />
+      {ctxPos !== null && (
+        <ContextMenu
+          open
+          x={ctxPos.x}
+          y={ctxPos.y}
+          onClose={() => setCtxPos(null)}
+          items={buildMenuItems()}
+          testId="ep-context-menu"
+        />
+      )}
 
-      <BottomSheet
-        open={detailsOpen}
-        onClose={() => setDetailsOpen(false)}
-        title={t('detail.viewDetails')}
-        testId="episode-detail-sheet"
-      >
-        <div
-          style={{
-            padding: '16px 20px calc(24px + var(--m-safe-bottom))',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 14,
-          }}
+      {detailsOpen && (
+        <BottomSheet
+          open={detailsOpen}
+          onClose={() => setDetailsOpen(false)}
+          title={t('detail.viewDetails')}
+          testId="episode-detail-sheet"
         >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <h2 style={{ margin: 0, font: 'var(--md-sys-typescale-title-medium)' }}>
-              {t('detail.viewDetails')}
-            </h2>
-            <IconButton
-              icon="close"
-              label={t('common.close')}
-              data-testid={`ep-detail-close-${episode.episodeKey}`}
-              onClick={() => setDetailsOpen(false)}
-            />
-          </div>
-
-          <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
-            <div
-              style={{
-                width: 64,
-                height: 64,
-                borderRadius: 'var(--md-sys-shape-corner-medium)',
-                overflow: 'hidden',
-                background: 'var(--md-sys-color-surface-container-high)',
-                color: 'var(--md-sys-color-on-surface-variant)',
-                display: 'grid',
-                placeItems: 'center',
-                flex: 'none',
-              }}
-            >
-              <ArtworkImage
-                src={episode.imageUrl}
-                fallbackSrc={feedImageUrl}
-                allowProxyFallback={allowProxy}
-                style={{ width: 64, height: 64, objectFit: 'cover', display: 'block' }}
-                placeholder={<Icon name="podcasts" size={28} />}
-              />
-            </div>
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div
-                style={{
-                  font: 'var(--md-sys-typescale-title-medium)',
-                  color: 'var(--md-sys-color-on-surface)',
-                  overflowWrap: 'anywhere',
-                }}
-              >
-                {episode.title}
-              </div>
-              {feedTitle && (
-                <div
-                  style={{
-                    font: 'var(--md-sys-typescale-body-medium)',
-                    color: 'var(--md-sys-color-on-surface-variant)',
-                  }}
-                >
-                  {feedTitle}
-                </div>
-              )}
-              {(dateStr || remStr) && (
-                <div className="m-episode-row__meta">
-                  {dateStr && <span>{dateStr}</span>}
-                  {dateStr && remStr && <span>·</span>}
-                  {remStr && <span>{remStr}</span>}
-                </div>
-              )}
-              <DetailDownloadStatus
-                state={
-                  isDownloadQueued
-                    ? 'queued'
-                    : isDownloading
-                      ? 'downloading'
-                      : isDownloadFailed
-                        ? 'failed'
-                        : null
-                }
-                ratio={downloadRatio ?? 0}
-                downloadingLabel={t('detail.downloadingProgress', { percent: downloadPercent })}
-                queuedLabel={t('detail.downloadWaiting')}
-                failedLabel={t('queue.downloadFailed')}
-                testId={`ep-detail-download-status-${episode.episodeKey}`}
-              />
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            <Button
-              variant="filled"
-              icon={isPlaying ? 'pause' : 'play'}
-              data-testid={`ep-detail-play-${episode.episodeKey}`}
-              onClick={() => {
-                handlePlayToggle();
-              }}
-            >
-              {isPlaying ? t('detail.pause') : t('detail.play')}
-            </Button>
-            <Button
-              variant="tonal"
-              icon={inQueue ? 'queueMusic' : 'playlistAdd'}
-              data-testid={`ep-detail-queue-${episode.episodeKey}`}
-              onClick={() => {
-                void handleToggleQueue();
-              }}
-            >
-              {inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')}
-            </Button>
-            {isDownloadFailed && (
-              <Button
-                variant="tonal"
-                icon="download"
-                data-testid={`ep-detail-resume-download-${episode.episodeKey}`}
-                onClick={() => {
-                  void handleResumeDownload();
-                }}
-              >
-                {t('detail.resumeDownload')}
-              </Button>
-            )}
-            {isDownloading && (
-              <Button
-                variant="tonal"
-                icon="stop"
-                data-testid={`ep-detail-stop-download-${episode.episodeKey}`}
-                onClick={() => {
-                  void handleStopDownload();
-                }}
-              >
-                {t('detail.stopDownload')}
-              </Button>
-            )}
-            {onOpenPodcast && (
-              <Button
-                variant="outlined"
-                icon="podcasts"
-                data-testid={`ep-open-podcast-${episode.episodeKey}`}
-                onClick={() => {
-                  setDetailsOpen(false);
-                  onOpenPodcast();
-                }}
-              >
-                {t('detail.goToPodcast')}
-              </Button>
-            )}
-            {isAudioOnlyVideo && episode.enclosureUrl && (
-              <Button
-                variant="outlined"
-                icon="openExternal"
-                data-testid={`ep-open-video-${episode.episodeKey}`}
-                onClick={() => {
-                  if (episode.enclosureUrl) {
-                    void host.files.openExternal(episode.enclosureUrl);
-                  }
-                }}
-              >
-                {t('detail.openInVideoPlayer')}
-              </Button>
-            )}
-          </div>
-
           <div
             style={{
-              borderTop: '1px solid var(--md-sys-color-outline-variant)',
-              paddingTop: 12,
+              padding: '16px 20px calc(24px + var(--m-safe-bottom))',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 14,
             }}
           >
-            {shownotesHtml ? (
-              <div
-                className="m-shownotes"
-                data-testid={`ep-detail-shownotes-${episode.episodeKey}`}
-                onClick={(e) => {
-                  const target = (e.target as HTMLElement | null)?.closest?.('a');
-                  if (target && host.info.capabilities.openExternal) {
-                    const href = target.getAttribute('href');
-                    if (href && /^https?:\/\//i.test(href)) {
-                      e.preventDefault();
-                      void host.files.openExternal(href);
-                    }
-                  }
-                }}
-                // Safe: `sanitizeShownotesHtml` strips scripts/styles/iframes/handlers and whitelists benign tags
-                dangerouslySetInnerHTML={{ __html: shownotesHtml }}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h2 style={{ margin: 0, font: 'var(--md-sys-typescale-title-medium)' }}>
+                {t('detail.viewDetails')}
+              </h2>
+              <IconButton
+                icon="close"
+                label={t('common.close')}
+                data-testid={`ep-detail-close-${episode.episodeKey}`}
+                onClick={() => setDetailsOpen(false)}
               />
-            ) : (
+            </div>
+
+            <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
               <div
-                className="m-empty"
-                style={{ padding: '20px 12px' }}
-                data-testid={`ep-detail-shownotes-${episode.episodeKey}`}
+                style={{
+                  width: 64,
+                  height: 64,
+                  borderRadius: 'var(--md-sys-shape-corner-medium)',
+                  overflow: 'hidden',
+                  background: 'var(--md-sys-color-surface-container-high)',
+                  color: 'var(--md-sys-color-on-surface-variant)',
+                  display: 'grid',
+                  placeItems: 'center',
+                  flex: 'none',
+                }}
               >
-                {t('player.noShownotes')}
+                <ArtworkImage
+                  src={episode.imageUrl}
+                  fallbackSrc={feedImageUrl}
+                  allowProxyFallback={allowProxy}
+                  style={{ width: 64, height: 64, objectFit: 'cover', display: 'block' }}
+                  placeholder={<Icon name="podcasts" size={28} />}
+                />
               </div>
-            )}
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <div
+                  style={{
+                    font: 'var(--md-sys-typescale-title-medium)',
+                    color: 'var(--md-sys-color-on-surface)',
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {episode.title}
+                </div>
+                {feedTitle && (
+                  <div
+                    style={{
+                      font: 'var(--md-sys-typescale-body-medium)',
+                      color: 'var(--md-sys-color-on-surface-variant)',
+                    }}
+                  >
+                    {feedTitle}
+                  </div>
+                )}
+                {(dateStr || remStr) && (
+                  <div className="m-episode-row__meta">
+                    {dateStr && <span>{dateStr}</span>}
+                    {dateStr && remStr && <span>·</span>}
+                    {remStr && <span>{remStr}</span>}
+                  </div>
+                )}
+                <DetailDownloadStatus
+                  state={
+                    isDownloadQueued
+                      ? 'queued'
+                      : isDownloading
+                        ? 'downloading'
+                        : isDownloadFailed
+                          ? 'failed'
+                          : null
+                  }
+                  ratio={downloadRatio ?? 0}
+                  downloadingLabel={t('detail.downloadingProgress', { percent: downloadPercent })}
+                  queuedLabel={t('detail.downloadWaiting')}
+                  failedLabel={t('queue.downloadFailed')}
+                  testId={`ep-detail-download-status-${episode.episodeKey}`}
+                />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              <Button
+                variant="filled"
+                icon={isPlaying ? 'pause' : 'play'}
+                data-testid={`ep-detail-play-${episode.episodeKey}`}
+                onClick={() => {
+                  handlePlayToggle();
+                }}
+              >
+                {isPlaying ? t('detail.pause') : t('detail.play')}
+              </Button>
+              <Button
+                variant="tonal"
+                icon={inQueue ? 'queueMusic' : 'playlistAdd'}
+                data-testid={`ep-detail-queue-${episode.episodeKey}`}
+                onClick={() => {
+                  void handleToggleQueue();
+                }}
+              >
+                {inQueue ? t('detail.removeFromQueue') : t('detail.addToQueue')}
+              </Button>
+              {isDownloadFailed && (
+                <Button
+                  variant="tonal"
+                  icon="download"
+                  data-testid={`ep-detail-resume-download-${episode.episodeKey}`}
+                  onClick={() => {
+                    void handleResumeDownload();
+                  }}
+                >
+                  {t('detail.resumeDownload')}
+                </Button>
+              )}
+              {isDownloading && (
+                <Button
+                  variant="tonal"
+                  icon="stop"
+                  data-testid={`ep-detail-stop-download-${episode.episodeKey}`}
+                  onClick={() => {
+                    void handleStopDownload();
+                  }}
+                >
+                  {t('detail.stopDownload')}
+                </Button>
+              )}
+              {onOpenPodcast && (
+                <Button
+                  variant="outlined"
+                  icon="podcasts"
+                  data-testid={`ep-open-podcast-${episode.episodeKey}`}
+                  onClick={() => {
+                    setDetailsOpen(false);
+                    onOpenPodcast();
+                  }}
+                >
+                  {t('detail.goToPodcast')}
+                </Button>
+              )}
+              {isAudioOnlyVideo && episode.enclosureUrl && (
+                <Button
+                  variant="outlined"
+                  icon="openExternal"
+                  data-testid={`ep-open-video-${episode.episodeKey}`}
+                  onClick={() => {
+                    if (episode.enclosureUrl) {
+                      void host.files.openExternal(episode.enclosureUrl);
+                    }
+                  }}
+                >
+                  {t('detail.openInVideoPlayer')}
+                </Button>
+              )}
+            </div>
+
+            <div
+              style={{
+                borderTop: '1px solid var(--md-sys-color-outline-variant)',
+                paddingTop: 12,
+              }}
+            >
+              {shownotesHtml ? (
+                <div
+                  className="m-shownotes"
+                  data-testid={`ep-detail-shownotes-${episode.episodeKey}`}
+                  onClick={(e) => {
+                    const target = (e.target as HTMLElement | null)?.closest?.('a');
+                    if (target && host.info.capabilities.openExternal) {
+                      const href = target.getAttribute('href');
+                      if (href && /^https?:\/\//i.test(href)) {
+                        e.preventDefault();
+                        void host.files.openExternal(href);
+                      }
+                    }
+                  }}
+                  // Safe: `sanitizeShownotesHtml` strips scripts/styles/iframes/handlers and whitelists benign tags
+                  dangerouslySetInnerHTML={{ __html: shownotesHtml }}
+                />
+              ) : (
+                <div
+                  className="m-empty"
+                  style={{ padding: '20px 12px' }}
+                  data-testid={`ep-detail-shownotes-${episode.episodeKey}`}
+                >
+                  {t('player.noShownotes')}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      </BottomSheet>
+        </BottomSheet>
+      )}
     </>
   );
-}
+});
