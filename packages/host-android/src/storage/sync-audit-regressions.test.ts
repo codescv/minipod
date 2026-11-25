@@ -6,10 +6,12 @@ import {
   encodeBase64,
   episodeKey,
   feedKey,
+  HLC_MAX_FORWARD_SKEW_MS,
   HybridLogicalClock,
   parseSyncDocument,
   serializeSyncDocument,
   SyncEngine,
+  TOMBSTONE_TTL_QUEUE_MS,
   type CloudFileProvider,
   type HostEvent,
   type ParsedFeed,
@@ -620,10 +622,18 @@ describe('Stage 3 sync audit regressions (@minipod/host-android)', () => {
     db.close();
   });
 
-  it('[SYNC-P0-05 & SYNC-P1-07 & SYNC-P1-10 & SYNC-P1-11] CapacitorHost reconnect same SAF does not resurrect, bad probe preserves config, queue.list is read-only, and onDecisions updates native queue + deduplicates resumeHints', async () => {
+  it('[SYNC-P0-05 & SYNC-P1-07 & SYNC-P1-10 & SYNC-P1-11] CapacitorHost reconnect same SAF after GC does not resurrect, bad probe preserves config, queue.list is read-only, and onDecisions updates native queue + deduplicates resumeHints + emits progress/unsub-only events', async () => {
     const safFiles = new Map<string, { bytes: Uint8Array; mtimeMs: number }>();
     const safUri = 'content://sync/shared';
+    const badSafUri = 'content://sync/bad-permission';
     const plugin = makeMinimalPlugin({ safFiles });
+    const origStat = plugin.saf.stat;
+    plugin.saf.stat = vi.fn(async (req) => {
+      if (req.uri === badSafUri) {
+        throw Object.assign(new Error('SecurityException: permission denied'), { name: 'SecurityException' });
+      }
+      return origStat(req);
+    });
 
     const bundleA = await createCapacitorPlatformHost({
       plugin,
@@ -644,17 +654,137 @@ describe('Stage 3 sync audit regressions (@minipod/host-android)', () => {
     await bundleB.host.sync.configure({ provider: { id: 'saf', documentUri: safUri }, wifiOnly: false, deviceName: 'PhoneB' });
     expect((await bundleB.host.queue.list()).map((r) => r.episode.episodeKey)).toEqual([ek]);
 
-    // Disconnect B; A removes `ek` and syncs
-    await bundleB.host.sync.disconnect();
-    await bundleA.host.queue.remove(ek);
-    await bundleA.host.sync.syncNow();
+    // Bad probe MUST NOT overwrite existing provider or `lastRemoteFingerprint` (SYNC-P1-10)
+    await expect(
+      bundleB.host.sync.configure({ provider: { id: 'saf', documentUri: badSafUri }, wifiOnly: false, deviceName: 'PhoneB' }),
+    ).rejects.toThrow();
+    expect((await bundleB.syncStore.getSyncState()).lastRemoteFingerprint).toContain(safUri);
+    expect((await bundleB.host.sync.status()).enabled).toBe(true);
 
-    // Reconnect B to the SAME SAF URI -> MUST NOT resurrect `ek`, and emits `queue-changed`
+    // Disconnect B; age the historical active entry on remote & B, then A removes `ek` with an
+    // expired tombstone so GC raises `queue.floor > 0` and evicts the tombstone completely!
+    await bundleB.host.sync.disconnect();
+    const expiredTombTs = Date.now() - TOMBSTONE_TTL_QUEUE_MS - 60_000;
+    const oldActiveTs = expiredTombTs - 10_000;
+    await bundleA.host.queue.remove(ek);
+    const oldQRecA = await bundleA.db.get('queue', ek);
+    await bundleA.db.put('queue', { ...oldQRecA!, updatedAt: expiredTombTs, syncDirty: 1 });
+    const oldQRecB = await bundleB.db.get('queue', ek);
+    await bundleB.db.put('queue', { ...oldQRecB!, updatedAt: oldActiveTs, syncDirty: 0 });
+    const preGcDoc = parseSyncDocument(safFiles.get(safUri)!.bytes);
+    const devB = (await bundleB.syncStore.getSyncState()).deviceId;
+    safFiles.set(safUri, {
+      bytes: serializeSyncDocument({
+        ...preGcDoc,
+        devices: {
+          ...preGcDoc.devices,
+          [devB]: { ...preGcDoc.devices[devB]!, lastSeenAt: Date.now() - 200 * 24 * 3600_000 },
+        },
+        queue: {
+          ...preGcDoc.queue,
+          items: {
+            ...preGcDoc.queue.items,
+            [ek]: { ...preGcDoc.queue.items[ek]!, updatedAt: oldActiveTs },
+          },
+        },
+      }),
+      mtimeMs: Date.now(),
+    });
+    await bundleA.syncStore.setSyncState({ remoteEtag: null });
+    await bundleA.host.sync.syncNow();
+    const postGcDoc = parseSyncDocument(safFiles.get(safUri)!.bytes);
+    expect(postGcDoc.queue.floor).toBeGreaterThanOrEqual(expiredTombTs);
+    expect(postGcDoc.queue.items[ek]).toBeUndefined();
+
+    // Load `ek` as current episode on B so `onDecisions` pushes updated native queue via `plugin.media.setQueue`
+    await bundleB.host.playback.sourceFor(ek);
+
+    // Reconnect B to the SAME SAF URI after GC -> MUST NOT resurrect `ek`, emits `queue-changed`,
+    // AND pushes updated native queue via `plugin.media.setQueue`!
+    const setQueueMock = plugin.media.setQueue as ReturnType<typeof vi.fn>;
+    const setQueueBefore = setQueueMock.mock.calls.length;
     const eventsB: HostEvent[] = [];
     bundleB.host.subscribe((e) => eventsB.push(e));
     await bundleB.host.sync.configure({ provider: { id: 'saf', documentUri: safUri }, wifiOnly: false, deviceName: 'PhoneB' });
     expect(await bundleB.host.queue.list()).toEqual([]);
     expect(eventsB.some((e) => e.type === 'queue-changed')).toBe(true);
+    await new Promise((r) => setTimeout(r, 15));
+    expect(setQueueMock.mock.calls.length).toBeGreaterThan(setQueueBefore);
+
+    // onDecisions deduplicates `resumeHints` AND emits progress-only + unsub-only events (SYNC-P1-07)
+    const progEventsB: HostEvent[] = [];
+    const unsubProgEv = bundleB.host.subscribe((e) => progEventsB.push(e));
+    const curDoc = parseSyncDocument(safFiles.get(safUri)!.bytes);
+    const tProg = Date.now() + 20_000;
+    const ekOther = episodeKey(feed.feedKey, 'ep-other');
+    safFiles.set(safUri, {
+      bytes: serializeSyncDocument({
+        ...curDoc,
+        rev: curDoc.rev + 1,
+        progress: {
+          floor: 0,
+          items: {
+            [ek]: {
+              feedKey: feed.feedKey,
+              positionMs: 33_000,
+              durationMs: 3_600_000,
+              state: 'IN_PROGRESS',
+              playedAt: null,
+              updatedAt: tProg,
+              deviceId: (await bundleA.syncStore.getSyncState()).deviceId,
+              identity: 'ep-1',
+            },
+            [ekOther]: {
+              feedKey: feed.feedKey,
+              positionMs: 0,
+              state: 'PLAYED',
+              playedAt: tProg,
+              updatedAt: tProg,
+              deviceId: (await bundleA.syncStore.getSyncState()).deviceId,
+              identity: 'ep-other',
+            },
+          },
+        },
+      }),
+      mtimeMs: Date.now() + 1000,
+    });
+    await bundleB.syncStore.setSyncState({ remoteEtag: null });
+    await bundleB.host.sync.syncNow();
+    const progChanges = progEventsB.filter((e) => e.type === 'progress-changed');
+    const playingChanges = progChanges.filter((e) => e.episodeKey === ek);
+    expect(playingChanges).toHaveLength(1);
+    expect(playingChanges[0]?.fromSync?.positionMs).toBe(33_000);
+    const otherChanges = progChanges.filter((e) => e.episodeKey === ekOther);
+    expect(otherChanges).toHaveLength(1);
+    expect(otherChanges[0]?.fromSync).toBeUndefined();
+
+    // Unsubscribe-only remote change emits `feeds-changed`
+    progEventsB.length = 0;
+    const curDoc2 = parseSyncDocument(safFiles.get(safUri)!.bytes);
+    safFiles.set(safUri, {
+      bytes: serializeSyncDocument({
+        ...curDoc2,
+        rev: curDoc2.rev + 1,
+        subscriptions: {
+          ...curDoc2.subscriptions,
+          items: {
+            ...curDoc2.subscriptions.items,
+            [feed.feedKey]: {
+              url: feed.url,
+              movedTo: null,
+              updatedAt: tProg + 10_000,
+              deleted: true,
+              deviceId: (await bundleA.syncStore.getSyncState()).deviceId,
+            },
+          },
+        },
+      }),
+      mtimeMs: Date.now() + 2000,
+    });
+    await bundleB.syncStore.setSyncState({ remoteEtag: null });
+    await bundleB.host.sync.syncNow();
+    expect(progEventsB.some((e) => e.type === 'feeds-changed')).toBe(true);
+    unsubProgEv();
 
     // Collided queue entries on `queue.list()` produce zero dirty writes (SYNC-P1-11)
     await bundleB.syncStore.upsertQueueEntries(
@@ -669,5 +799,333 @@ describe('Stage 3 sync audit regressions (@minipod/host-android)', () => {
 
     await bundleA.host.dispose();
     await bundleB.host.dispose();
+  });
+
+  it('[B1 & S2 & S3 & S4 & S5 & S11] IDB heals poisoned HLC, preserves clean cascade-active downloads, keeps unreplayed newer journal over older remote progress, resets legacy provider switch, refreshes stub feeds & emits feed-refreshed on abort, and preserves concurrent unsub/markPlayed/progress + zero spurious upload', async () => {
+    // 1. B1: Poisoned legacy `hlcLast` + feed with `deviceId: undefined` clamped & healed on init()
+    const dbB1 = await openMiniPodDb(new IDBFactory(), 'audit-b1');
+    const poisonedTs = Date.now() + 365 * 24 * 3600_000;
+    await dbB1.put('syncState', {
+      id: 1,
+      deviceId: 'd_android_self',
+      deviceName: 'Pixel',
+      remoteEtag: null,
+      remoteFileId: null,
+      remoteRev: 1,
+      floorSubscriptions: 0,
+      floorQueue: 0,
+      floorProgress: 0,
+      hlcLast: poisonedTs,
+    });
+    await dbB1.put('feeds', {
+      feedKey: 'f_legacy_remote',
+      kind: 'RSS',
+      subscribedNum: 1,
+      url: 'https://legacy.example/rss',
+      hasCredentials: false,
+      lastEpisodeAt: 0,
+      addedAt: poisonedTs,
+      updatedAt: poisonedTs,
+      syncDirty: 0,
+    });
+    const hlcB1 = new HybridLogicalClock();
+    const storeB1 = new IdbSyncStore({ db: dbB1, hlc: hlcB1, appVersion: '0.1.0' });
+    const stB1 = await storeB1.init();
+    expect(hlcB1.current()).toBeLessThanOrEqual(Date.now() + HLC_MAX_FORWARD_SKEW_MS + 100);
+    expect(stB1.hlcLast).toBeLessThanOrEqual(Date.now() + HLC_MAX_FORWARD_SKEW_MS + 100);
+    await storeB1.setSyncState({ hlcLast: poisonedTs });
+    expect((await storeB1.getSyncState()).hlcLast).toBeLessThanOrEqual(Date.now() + HLC_MAX_FORWARD_SKEW_MS + 100);
+    dbB1.close();
+
+    // 2. S2: Cascade preserves EVERY merged-active queue entry (even `q.updatedAt < winSub.updatedAt`)
+    const dbS2 = await openMiniPodDb(new IDBFactory(), 'audit-s2');
+    const hlcS2 = new HybridLogicalClock(0, () => 1_700_000_000_000);
+    const s2DeletedDls: string[] = [];
+    const storeS2 = new IdbSyncStore({
+      db: dbS2,
+      hlc: hlcS2,
+      appVersion: '0.1.0',
+      onDeleteDownloads: (paths) => {
+        s2DeletedDls.push(...paths);
+      },
+    });
+    await storeS2.init();
+    const fkS2 = feedKey('https://android-s2.example/rss');
+    const ekS2 = episodeKey(fkS2, 'ep-1');
+    await storeS2.upsertParsedFeed({
+      feedKey: fkS2,
+      kind: 'RSS',
+      url: 'https://android-s2.example/rss',
+      subscribed: true,
+      deviceId: 'd_remote',
+      parsed: SAMPLE_PARSED,
+      nowWallMs: 1_700_000_000_000,
+      markSyncDirty: false,
+    });
+    await storeS2.setEpisodeDownloadState(ekS2, 'DONE', '/data/s2.mp3');
+    await storeS2.saveMergedChapters(ekS2, [{ startMs: 0, title: 'Ch1', source: 'PSC' }]);
+    const t0 = 1_700_000_010_000;
+    const t1 = 1_700_000_020_000;
+    await storeS2.upsertQueueEntries(
+      [{ episodeKey: ekS2, feedKey: fkS2, pos: 'a0', addedAt: t0, updatedAt: t0, removed: false, deviceId: 'd_remote' }],
+      false,
+    );
+    await storeS2.applyMerged(
+      {
+        ...createEmptySyncDocument('d_remote', t1),
+        subscriptions: {
+          floor: 0,
+          items: { [fkS2]: { url: 'https://android-s2.example/rss', movedTo: null, updatedAt: t1, deleted: true, deviceId: 'd_remote' } },
+        },
+        queue: {
+          floor: 0,
+          items: { [ekS2]: { feedKey: fkS2, pos: 'a0', addedAt: t0, updatedAt: t0, removed: false, deviceId: 'd_remote' } },
+        },
+      },
+      undefined,
+    );
+    expect(s2DeletedDls).toEqual([]);
+    const epS2 = await storeS2.getEpisodeRecord(ekS2);
+    expect(epS2?.isStub).toBe(false);
+    expect(epS2?.downloadPath).toBe('/data/s2.mp3');
+    expect((await storeS2.getChaptersRecord(ekS2)).merged).toBe(true);
+    expect((await storeS2.listActiveQueueRows()).map((r) => r.episode.episodeKey)).toEqual([ekS2]);
+    dbS2.close();
+
+    // 3. S3: Unreplayed native checkpoint (35:00 @ T_native) beats older remote progress (20:00 @ T_native - 30m)
+    // pulled right before journal replay!
+    const tNative = Date.now() - 5 * 60_000;
+    const tOlderDesktop = tNative - 30 * 60_000;
+    let s3Journal: NativeJournalSnapshot = { completed: [] };
+    const s3Plugin = makeMinimalPlugin({
+      journal: () => s3Journal,
+      clearJournal: () => {
+        s3Journal = { completed: [] };
+      },
+    });
+    const bundleS3 = await createCapacitorPlatformHost({
+      plugin: s3Plugin,
+      idbFactory: new IDBFactory(),
+      preferences: createMemoryPreferences(),
+    });
+    const feedS3 = await bundleS3.host.feeds.subscribe('https://s3.example/rss.xml');
+    const ekS3 = episodeKey(feedS3.feedKey, 'ep-1');
+    // Remote sync pulls older desktop 20:00 @ tOlderDesktop while native journal still holds 35:00 @ tNative
+    await bundleS3.syncStore.applyMerged(
+      {
+        ...createEmptySyncDocument('d_desktop', tOlderDesktop),
+        progress: {
+          floor: 0,
+          items: {
+            [ekS3]: {
+              feedKey: feedS3.feedKey,
+              positionMs: 20 * 60_000,
+              durationMs: 3_600_000,
+              state: 'IN_PROGRESS',
+              playedAt: null,
+              updatedAt: tOlderDesktop,
+              deviceId: 'd_desktop',
+              identity: 'ep-1',
+            },
+          },
+        },
+      },
+      undefined,
+    );
+    expect((await bundleS3.syncStore.getProgressRecord(ekS3))?.localWrittenAt).toBe(tOlderDesktop);
+    s3Journal = {
+      completed: [],
+      current: { episodeKey: ekS3, positionMs: 35 * 60_000, durationMs: 3_600_000, wallMs: tNative },
+    };
+    await bundleS3.reconcileJournal();
+    expect((await bundleS3.host.progress.get(ekS3))?.positionMs).toBe(35 * 60_000);
+    await bundleS3.host.dispose();
+
+    // 4. S4: Legacy upgrade (`lastRemoteFingerprint == null`, previous provider non-null) switching SAF URI resets lineage
+    const safMapS4 = new Map<string, { bytes: Uint8Array; mtimeMs: number }>();
+    const uriOld = 'content://sync/legacy-old';
+    const uriNew = 'content://sync/legacy-new';
+    const bundleS4 = await createCapacitorPlatformHost({
+      plugin: makeMinimalPlugin({ safFiles: safMapS4 }),
+      idbFactory: new IDBFactory(),
+      preferences: createMemoryPreferences(),
+    });
+    const feedS4 = await bundleS4.host.feeds.subscribe('https://legacy-s4.example/rss.xml');
+    await bundleS4.host.sync.configure({ provider: { id: 'saf', documentUri: uriOld }, wifiOnly: false, deviceName: 'LegacyPhone' });
+    // Simulate legacy pre-fingerprint DB state
+    const stS4 = await bundleS4.db.get('syncState', 1);
+    await bundleS4.db.put('syncState', { ...stS4!, lastRemoteFingerprint: null, remoteRev: 5 });
+    const fS4Rec = await bundleS4.db.get('feeds', feedS4.feedKey);
+    await bundleS4.db.put('feeds', { ...fS4Rec!, updatedAt: 1_000, syncDirty: 0 });
+    // New remote has higher floor = 50_000
+    safMapS4.set(uriNew, {
+      bytes: serializeSyncDocument({
+        ...createEmptySyncDocument('d_other', 60_000),
+        rev: 10,
+        subscriptions: { floor: 50_000, items: {} },
+      }),
+      mtimeMs: 60_000,
+    });
+    await bundleS4.host.sync.configure({ provider: { id: 'saf', documentUri: uriNew }, wifiOnly: false, deviceName: 'LegacyPhone' });
+    expect((await bundleS4.host.feeds.list()).some((f) => f.feedKey === feedS4.feedKey)).toBe(true);
+    await bundleS4.host.dispose();
+
+    // 5. S5: Stub feed (`subscribedNum=0, deletedAt=null`) refreshes cleanly; aborted subscribed refresh emits `feed-refreshed`
+    let abortUnsubFeedKey: string | null = null;
+    let triggerMidFetchUnsub: (() => Promise<void>) | null = null;
+    const s5Plugin = makeMinimalPlugin({
+      http: vi.fn(async (req) => {
+        if (abortUnsubFeedKey && req.url.includes('abort-s5') && triggerMidFetchUnsub) {
+          await triggerMidFetchUnsub();
+          triggerMidFetchUnsub = null;
+        }
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/rss+xml' },
+          finalUrl: req.url,
+          chain: [],
+          bodyBase64: encodeBase64(new TextEncoder().encode(SAMPLE_RSS)),
+        };
+      }),
+    });
+    const bundleS5 = await createCapacitorPlatformHost({
+      plugin: s5Plugin,
+      idbFactory: new IDBFactory(),
+      preferences: createMemoryPreferences(),
+    });
+    const stubUrl = 'https://stub-s5.example/rss.xml';
+    const stubFk = feedKey(stubUrl);
+    await bundleS5.db.put('feeds', {
+      feedKey: stubFk,
+      kind: 'RSS',
+      subscribedNum: 0,
+      url: stubUrl,
+      hasCredentials: false,
+      lastEpisodeAt: 0,
+      addedAt: 100,
+      updatedAt: 100,
+      deletedAt: null,
+      syncDirty: 0,
+    });
+    await bundleS5.host.feeds.refresh(stubFk);
+    expect((await bundleS5.syncStore.getFeedRecord(stubFk))?.subscribedNum).toBe(0);
+    expect((await bundleS5.host.episodes.list(stubFk, 'all')).items).toHaveLength(1);
+
+    // Aborted subscribed refresh emits `feed-refreshed`
+    const subFeedS5 = await bundleS5.host.feeds.subscribe('https://abort-s5.example/rss.xml');
+    abortUnsubFeedKey = subFeedS5.feedKey;
+    triggerMidFetchUnsub = () => bundleS5.host.feeds.unsubscribe(subFeedS5.feedKey);
+    const s5Events: HostEvent[] = [];
+    bundleS5.host.subscribe((e) => s5Events.push(e));
+    await bundleS5.host.feeds.refresh(subFeedS5.feedKey);
+    expect((await bundleS5.syncStore.getFeedRecord(subFeedS5.feedKey))?.subscribedNum).toBe(0);
+    expect(s5Events.some((e) => e.type === 'feed-refreshed' && e.feedKey === subFeedS5.feedKey)).toBe(true);
+    await bundleS5.host.dispose();
+
+    // 6. P0-01 + P1-12 additional Android checks: concurrent unsubscribe + markPlayed + progress.save during read(),
+    // clean == row NOT falsely dirtied, and zero spurious upload on second sync!
+    const dbConc = await openMiniPodDb(new IDBFactory(), 'audit-conc-p1-12');
+    let concNow = 1_750_000_000_000;
+    const hlcConc = new HybridLogicalClock(0, () => concNow);
+    const storeConc = new IdbSyncStore({ db: dbConc, hlc: hlcConc, appVersion: '0.1.0' });
+    const stConc = await storeConc.init();
+    const fkU = feedKey('https://conc-unsub.example/rss');
+    const fkEq = feedKey('https://conc-eq.example/rss');
+    const ekP = episodeKey(fkEq, 'ep-1');
+    const ekM = episodeKey(fkEq, 'ep-2');
+    await storeConc.upsertParsedFeed({
+      feedKey: fkU,
+      kind: 'RSS',
+      url: 'https://conc-unsub.example/rss',
+      subscribed: true,
+      deviceId: stConc.deviceId,
+      parsed: SAMPLE_PARSED,
+      nowWallMs: concNow,
+      markSyncDirty: false,
+    });
+    await storeConc.upsertParsedFeed({
+      feedKey: fkEq,
+      kind: 'RSS',
+      url: 'https://conc-eq.example/rss',
+      subscribed: true,
+      deviceId: 'd_remote',
+      parsed: SAMPLE_PARSED,
+      nowWallMs: concNow,
+      markSyncDirty: false,
+    });
+    const eqUpdatedAt = (await storeConc.getFeedRecord(fkEq))!.updatedAt;
+    const remoteT = concNow + 2_000;
+    let cloudBytes = serializeSyncDocument({
+      ...createEmptySyncDocument('d_remote', remoteT),
+      rev: 2,
+      subscriptions: {
+        floor: 0,
+        items: {
+          [fkU]: { url: 'https://conc-unsub.example/rss', movedTo: null, updatedAt: remoteT, deleted: false, deviceId: 'd_remote' },
+          [fkEq]: { url: 'https://conc-eq.example/rss', movedTo: null, updatedAt: eqUpdatedAt, deleted: false, deviceId: 'd_remote' },
+        },
+      },
+      progress: {
+        floor: 0,
+        items: {
+          [ekP]: { feedKey: fkEq, positionMs: 10_000, state: 'IN_PROGRESS', playedAt: null, updatedAt: remoteT, deviceId: 'd_remote', identity: 'ep-1' },
+          [ekM]: { feedKey: fkEq, positionMs: 5_000, state: 'IN_PROGRESS', playedAt: null, updatedAt: remoteT, deviceId: 'd_remote', identity: 'ep-2' },
+        },
+      },
+    });
+    let cloudEtag = 'e1';
+    let firstConcRead = true;
+    const concEng = new SyncEngine({
+      store: storeConc,
+      hlc: hlcConc,
+      backgroundSync: false,
+      now: () => concNow,
+      provider: {
+        id: 'saf',
+        supportsNativeConditionalWrite: false,
+        supportsCheapHead: true,
+        probe: async () => ({ ok: true, exists: true, etag: cloudEtag }),
+        head: async () => cloudEtag,
+        read: async (m) => {
+          if (m === cloudEtag) return { kind: 'not-modified' };
+          if (firstConcRead) {
+            firstConcRead = false;
+            concNow = remoteT + 5_000;
+            // Concurrent unsubscribe, progress.save, and markPlayed during read()!
+            await storeConc.softDeleteUnsubscribe(fkU, stConc.deviceId);
+            await storeConc.upsertProgress(
+              { episodeKey: ekP, feedKey: fkEq, positionMs: 45_000, state: 'IN_PROGRESS', updatedAt: hlcConc.now(), deviceId: stConc.deviceId },
+              { syncDirty: true, identity: 'ep-1' },
+            );
+            const tMark = hlcConc.now();
+            await storeConc.upsertProgress(
+              { episodeKey: ekM, feedKey: fkEq, positionMs: 0, state: 'PLAYED', playedAt: tMark, updatedAt: tMark, deviceId: stConc.deviceId },
+              { syncDirty: true, identity: 'ep-2' },
+            );
+          }
+          return { kind: 'blob', bytes: cloudBytes, etag: cloudEtag };
+        },
+        write: async (b) => {
+          cloudBytes = b.slice();
+          cloudEtag = `e${cloudEtag.length + 1}`;
+          return { kind: 'ok', newEtag: cloudEtag };
+        },
+      },
+    });
+    const rConc1 = await concEng.run('manual');
+    expect(rConc1.uploaded).toBe(true);
+    expect((await storeConc.getFeedRecord(fkU))?.subscribedNum).toBe(0);
+    expect((await storeConc.getFeedRecord(fkEq))?.syncDirty).toBe(0); // clean == row NOT falsely dirtied
+    expect((await storeConc.getProgress(ekP))?.positionMs).toBe(45_000);
+    expect((await storeConc.getProgress(ekM))?.state).toBe('PLAYED');
+    const uploadedConc = parseSyncDocument(cloudBytes);
+    expect(uploadedConc.subscriptions.items[fkU]?.deleted).toBe(true);
+    expect(uploadedConc.progress.items[ekP]?.positionMs).toBe(45_000);
+    expect(uploadedConc.progress.items[ekM]?.state).toBe('PLAYED');
+    // P1-12: Second sync with unchanged remote & persisted feed deviceId produces ZERO spurious upload!
+    await storeConc.setSyncState({ remoteEtag: null });
+    const rConc2 = await concEng.run('manual');
+    expect(rConc2.uploaded).toBe(false);
+    dbConc.close();
   });
 });

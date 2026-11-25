@@ -1208,6 +1208,7 @@ export async function createCapacitorPlatformHost(
           return;
         }
 
+        const wasSubscribedBeforeFetch = feedRec.subscribedNum === 1;
         const fetchUrl = feedRec.movedTo || feedRec.url;
         const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(fetchUrl);
         const storedCreds = await secretsStore.getFeedCredentials(feedKey);
@@ -1263,9 +1264,15 @@ export async function createCapacitorPlatformHost(
           if (candidate !== cleanUrl) newPermUrl = candidate;
         }
 
-        // Verify feed is still subscribed after HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+        // Verify feed was not unsubscribed/deleted during HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+        // Stub feeds (`subscribedNum === 0 && deletedAt == null` when `!wasSubscribedBeforeFetch`) are still allowed to refresh.
         const liveRec = await syncStore.getFeedRecord(feedKey);
-        if (!liveRec || liveRec.subscribedNum === 0 || liveRec.deletedAt != null) {
+        if (
+          !liveRec ||
+          liveRec.deletedAt != null ||
+          (wasSubscribedBeforeFetch && liveRec.subscribedNum === 0)
+        ) {
+          emit({ type: 'feed-refreshed', feedKey });
           return;
         }
 
@@ -1281,8 +1288,9 @@ export async function createCapacitorPlatformHost(
           feedKey: targetKey,
           kind: 'RSS',
           url: newPermUrl ?? fetchUrl,
-          subscribed: true,
+          subscribed: wasSubscribedBeforeFetch,
           preserveSubscriptionState: true,
+          requireSubscribed: wasSubscribedBeforeFetch,
           deviceId: st.deviceId,
           parsed,
           nowWallMs: nowMs,
@@ -2473,7 +2481,12 @@ export async function createCapacitorPlatformHost(
           state.lastRemoteFingerprint !== null &&
           state.lastRemoteFingerprint !== nextFingerprint &&
           !sameDriveWithoutReauth;
-        const needLineageReset = fingerprintChanged || state.pendingLineageReset === true;
+        const legacyProviderChanged =
+          state.lastRemoteFingerprint == null &&
+          prevSettings.sync.provider !== null &&
+          JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(effectiveSettings.provider);
+        const needLineageReset =
+          fingerprintChanged || legacyProviderChanged || state.pendingLineageReset === true;
 
         // Phase 1: probe candidate using ephemeral secret without touching persisted secrets or sync_state (SYNC-P1-10)
         const candidate = await instantiateSyncProvider(effectiveSettings.provider, {
@@ -2488,42 +2501,50 @@ export async function createCapacitorPlatformHost(
         }
 
         // Phase 2: probe succeeded -> drain active cycle, then atomically commit secrets/state/provider
+        const prevProvider = syncEngine.getProvider();
         syncEngine.setProvider(null);
         await syncEngine.drainActiveCycle();
 
-        if (safFallbackUri) {
-          driveAuth.consumeSafFallbackUri();
-        }
-        if (secret) {
-          await secretsStore.saveSyncSecret(secret);
-        }
+        let updated: AppSettings;
+        try {
+          if (safFallbackUri) {
+            driveAuth.consumeSafFallbackUri();
+          }
+          if (secret) {
+            await secretsStore.saveSyncSecret(secret);
+          }
 
-        // Never call `markAllDirty()` on configure; flag lineage reset only when remote identity changed (SYNC-P0-05).
-        const statePatch: Partial<SyncState> = needLineageReset
-          ? ({
-              deviceName: effectiveSettings.deviceName,
-              remoteEtag: null,
-              remoteFileId: null,
-              remoteRev: 0,
-              floors: { subscriptions: 0, queue: 0, progress: 0 },
-              lastPullAt: undefined,
-              lastPushAt: undefined,
-              remoteDevices: {},
-              lastRemoteFingerprint: nextFingerprint,
-              pendingLineageReset: true,
-            } as unknown as Partial<SyncState>)
-          : {
-              deviceName: effectiveSettings.deviceName,
-              ...(state.lastRemoteFingerprint == null
-                ? { lastRemoteFingerprint: nextFingerprint }
-                : {}),
-            };
-        await syncStore.setSyncState(statePatch);
+          // Never call `markAllDirty()` on configure; flag lineage reset only when remote identity changed (SYNC-P0-05).
+          const statePatch: Partial<SyncState> = needLineageReset
+            ? ({
+                deviceName: effectiveSettings.deviceName,
+                remoteEtag: null,
+                remoteFileId: null,
+                remoteRev: 0,
+                floors: { subscriptions: 0, queue: 0, progress: 0 },
+                lastPullAt: undefined,
+                lastPushAt: undefined,
+                remoteDevices: {},
+                lastRemoteFingerprint: nextFingerprint,
+                pendingLineageReset: true,
+              } as unknown as Partial<SyncState>)
+            : {
+                deviceName: effectiveSettings.deviceName,
+                ...(state.lastRemoteFingerprint == null
+                  ? { lastRemoteFingerprint: nextFingerprint }
+                  : {}),
+              };
+          await syncStore.setSyncState(statePatch);
 
-        const updated = await writeSettings({ sync: effectiveSettings });
-        syncScheduler.setWifiOnly(updated.sync.wifiOnly);
-        syncEngine.setProvider(candidate);
-        syncScheduler.rebindProviderWatcher();
+          updated = await writeSettings({ sync: effectiveSettings });
+          syncScheduler.setWifiOnly(updated.sync.wifiOnly);
+          syncEngine.setProvider(candidate);
+          syncScheduler.rebindProviderWatcher();
+        } catch (err) {
+          syncEngine.setProvider(prevProvider);
+          syncScheduler.rebindProviderWatcher();
+          throw err;
+        }
         emit({ type: 'settings-changed', settings: updated });
 
         const res = await syncScheduler.requestAsync('configured');

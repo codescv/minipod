@@ -412,7 +412,7 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     expect(afterRet.subscriptions.items['f_gced_while_offline']).toBeUndefined();
   });
 
-  it('[SYNC-P1-01] HostFileProvider fixes SAF size=0/mtime=0 deadlock, racy-git equal-length writes, and torn reads', async () => {
+  it('[SYNC-P1-01] HostFileProvider fixes SAF size=0/mtime=0 deadlock, racy-git equal-length writes, strong fast-path, racy->strong upgrade, torn reads, and EPERM platform split', async () => {
     // (a) SAF stat always returns { size: 0, mtimeMs: 0 }
     let safBytes = serializeSyncDocument(createEmptySyncDocument('d_1', 100));
     const safAccess: HostFileAccess = {
@@ -432,17 +432,25 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
         r1.etag,
       );
       expect(w1.kind).toBe('ok');
+      if (w1.kind === 'ok') {
+        expect(await safProvider.read(w1.newEtag)).toEqual({ kind: 'not-modified' });
+      }
     }
 
     // (b) Racy-git: write & equal-length external modification within same 1s mtime window
     let nowMs = 100_500;
     let fileBytes = enc.encode('{"a":1111}');
     let fileMtime = 100_000;
+    let racyReadCalls = 0;
     const racyAccess: HostFileAccess = {
       stat: async () => ({ size: fileBytes.byteLength, mtimeMs: fileMtime }),
-      read: async () => fileBytes.slice(),
+      read: async () => {
+        racyReadCalls += 1;
+        return fileBytes.slice();
+      },
       write: async (b) => {
         fileBytes = b.slice();
+        fileMtime = nowMs;
       },
     };
     const racyProvider = new HostFileProvider({ id: 'local-folder', access: racyAccess, now: () => nowMs });
@@ -458,9 +466,60 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     expect(racyRead2.kind).toBe('blob');
     if (racyRead2.kind === 'blob') {
       expect(dec.decode(racyRead2.bytes)).toBe('{"a":2222}');
+      // Now `nowMs - fileMtime = 10_500 >= 2_000`, so `racyRead2.etag` is strong!
+      expect(racyRead2.etag).toMatch(/^v2:100000:10:[0-9a-f]{16}$/);
+      // Strong stat fast path MUST return not-modified with ZERO `access.read()` calls!
+      const readsBeforeFastPath = racyReadCalls;
+      const fast304 = await racyProvider.read(racyRead2.etag);
+      expect(fast304).toEqual({ kind: 'not-modified' });
+      expect(racyReadCalls).toBe(readsBeforeFastPath);
     }
     const racyWriteConflict = await racyProvider.write(enc.encode('{"a":3333}'), etagRacy);
     expect(racyWriteConflict.kind).toBe('conflict');
+
+    // (b2) Racy-to-strong ETag upgrade after our own write via SyncEngine (S7)
+    let engineNow = 200_000;
+    let engineFileBytes: Uint8Array | null = null;
+    let engineFileMtime = 0;
+    let engineAccessReads = 0;
+    const engineAccess: HostFileAccess = {
+      stat: async () =>
+        engineFileBytes ? { size: engineFileBytes.byteLength, mtimeMs: engineFileMtime } : null,
+      read: async () => {
+        engineAccessReads += 1;
+        return engineFileBytes!.slice();
+      },
+      write: async (b) => {
+        engineFileBytes = b.slice();
+        engineFileMtime = engineNow;
+      },
+    };
+    const upgProvider = new HostFileProvider({
+      id: 'local-folder',
+      access: engineAccess,
+      now: () => engineNow,
+    });
+    const upgStore = new TestMemorySyncStore('d_upg', 'Desktop');
+    const upgEngine = new SyncEngine({
+      store: upgStore,
+      provider: upgProvider,
+      hlc: new HybridLogicalClock(0, () => engineNow),
+      backgroundSync: true,
+      now: () => engineNow,
+    });
+    // Initial write creates a racy ETag (mtime === now)
+    await upgEngine.run('manual');
+    expect(upgStore.state.remoteEtag).toMatch(/^v2:racy:/);
+
+    // Advance >= 2s: next read returns `not-modified` with upgraded strong ETag and engine persists it
+    engineNow += 5_000;
+    await upgEngine.run('periodic');
+    expect(upgStore.state.remoteEtag).toMatch(/^v2:200000:\d+:[0-9a-f]{16}$/);
+
+    // Subsequent periodic cycle hits strong stat fast-path with ZERO `access.read()` calls!
+    const readsAfterUpgrade = engineAccessReads;
+    await upgEngine.run('periodic');
+    expect(engineAccessReads).toBe(readsAfterUpgrade);
 
     // (c) Torn read retries when stat changes mid-read
     let readCall = 0;
@@ -486,19 +545,69 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
       expect(dec.decode(tornRes.bytes)).toBe('{"v":2222}');
       expect(tornRes.etag).toContain('v2:2000:10:');
     }
+
+    // (d) Torn read exhaustion across all 3 attempts throws retryable `network` (S6)
+    let exhaustTick = 0;
+    const alwaysTornAccess: HostFileAccess = {
+      stat: async () => ({ size: 10, mtimeMs: 1000 + ++exhaustTick * 1000 }),
+      read: async () => enc.encode('{"v":1111}'),
+      write: async () => undefined,
+    };
+    const alwaysTornProvider = new HostFileProvider({
+      id: 'local-folder',
+      access: alwaysTornAccess,
+      now: () => 100_000,
+    });
+    await expect(alwaysTornProvider.read(null)).rejects.toMatchObject({ code: 'network' });
+
+    // (e) EPERM is non-retryable `sync-auth` on macOS (TCC), retryable on win32
+    const epermErr = Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    const epermAccess: HostFileAccess = {
+      stat: async () => {
+        throw epermErr;
+      },
+      read: async () => {
+        throw epermErr;
+      },
+      write: async () => {
+        throw epermErr;
+      },
+    };
+    const macProv = new HostFileProvider({ id: 'local-folder', access: epermAccess, platform: 'darwin' });
+    await expect(macProv.read(null)).rejects.toMatchObject({ code: 'sync-auth' });
+    expect((await macProv.write(enc.encode('{}'), null))).toMatchObject({ kind: 'failed', retryable: false });
+
+    const winProv = new HostFileProvider({ id: 'local-folder', access: epermAccess, platform: 'win32' });
+    await expect(winProv.read(null)).rejects.toMatchObject({ code: 'network' });
+    expect((await winProv.write(enc.encode('{}'), null))).toMatchObject({ kind: 'failed', retryable: true });
   });
 
-  it('[SYNC-P1-02 & SYNC-P1-09 & SYNC-P1-14] GoogleDriveProvider aborts duplicate healing safely, re-lists cached fileId, and classifies 403 rate limits as network', async () => {
-    const docV1 = serializeSyncDocument(createEmptySyncDocument('d_a', 100));
+  it('[SYNC-P1-02 & SYNC-P1-09 & SYNC-P1-14] GoogleDriveProvider aborts duplicate healing safely, trashes duplicates, heals drive-file folders & POST->relist, handles missing md5, and splits 403 rate-limit vs auth', async () => {
+    const docA: SyncDocument = {
+      ...createEmptySyncDocument('d_a', 100),
+      subscriptions: {
+        floor: 0,
+        items: { f_a: { url: 'https://a.example/rss', updatedAt: 100, deleted: false, deviceId: 'd_a' } },
+      },
+    };
+    const docB: SyncDocument = {
+      ...createEmptySyncDocument('d_b', 200),
+      subscriptions: {
+        floor: 0,
+        items: { f_b: { url: 'https://b.example/rss', updatedAt: 200, deleted: false, deviceId: 'd_b' } },
+      },
+    };
+    const docV1 = serializeSyncDocument(docA);
+    const docV1B = serializeSyncDocument(docB);
     const docV2 = enc.encode(JSON.stringify({ ...createEmptySyncDocument('d_b', 200), schemaVersion: 2 }));
 
-    // (a) newerSchemaVersion duplicate -> throws sync-schema with ZERO DELETE calls
-    let deleteCount = 0;
+    // (a) newerSchemaVersion duplicate -> throws sync-schema with ZERO DELETE/trash calls
+    let deleteOrTrashCount = 0;
     const httpNewerSchema: HttpClient = async (req) => {
       const u = new URL(req.url);
-      if (req.method === 'DELETE') {
-        deleteCount += 1;
-        return makeResp(204, '');
+      if (req.method === 'DELETE' || (req.method === 'PATCH' && !u.pathname.includes('/upload/'))) {
+        deleteOrTrashCount += 1;
+        return makeResp(200, '{}');
       }
       if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
         return makeResp(200, JSON.stringify({ files: [{ id: 'f_1', name: SYNC_FILE_NAME }, { id: 'f_2', name: SYNC_FILE_NAME }] }));
@@ -509,45 +618,109 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     };
     const driveSchema = new GoogleDriveProvider({ mode: 'appdata', http: httpNewerSchema, getToken: async () => 'tok' });
     await expect(driveSchema.read(null)).rejects.toMatchObject({ code: 'sync-schema' });
-    expect(deleteCount).toBe(0);
+    expect(deleteOrTrashCount).toBe(0);
 
-    // (b) Survivor PATCH returns 500 -> throws network with ZERO DELETE calls
-    deleteCount = 0;
+    // (a2) Duplicate download 503 -> throws network with ZERO DELETE/trash calls
+    deleteOrTrashCount = 0;
+    const httpDl503: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (req.method === 'DELETE' || (req.method === 'PATCH' && !u.pathname.includes('/upload/'))) {
+        deleteOrTrashCount += 1;
+        return makeResp(200, '{}');
+      }
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        return makeResp(200, JSON.stringify({ files: [{ id: 'f_1', name: SYNC_FILE_NAME }, { id: 'f_2', name: SYNC_FILE_NAME }] }));
+      }
+      if (u.pathname.endsWith('/f_1')) return makeResp(200, docV1);
+      if (u.pathname.endsWith('/f_2')) return makeResp(503, 'Service Unavailable');
+      return makeResp(404, '');
+    };
+    const driveDl503 = new GoogleDriveProvider({ mode: 'appdata', http: httpDl503, getToken: async () => 'tok' });
+    await expect(driveDl503.read(null)).rejects.toMatchObject({ code: 'network' });
+    expect(deleteOrTrashCount).toBe(0);
+
+    // (b) Survivor PATCH returns 500 with distinct docs -> throws network with ZERO DELETE/trash calls
+    deleteOrTrashCount = 0;
     const httpPatchFail: HttpClient = async (req) => {
       const u = new URL(req.url);
-      if (req.method === 'DELETE') {
-        deleteCount += 1;
-        return makeResp(204, '');
+      if (req.method === 'DELETE' || (req.method === 'PATCH' && !u.pathname.includes('/upload/'))) {
+        deleteOrTrashCount += 1;
+        return makeResp(200, '{}');
       }
       if (req.method === 'PATCH') return makeResp(500, 'Internal Error');
       if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
         return makeResp(200, JSON.stringify({ files: [{ id: 'f_1', name: SYNC_FILE_NAME }, { id: 'f_2', name: SYNC_FILE_NAME }] }));
       }
-      if (u.pathname.endsWith('/f_1') || u.pathname.endsWith('/f_2')) return makeResp(200, docV1);
+      if (u.pathname.endsWith('/f_1')) return makeResp(200, docV1);
+      if (u.pathname.endsWith('/f_2')) return makeResp(200, docV1B);
       return makeResp(404, '');
     };
     const drivePatchFail = new GoogleDriveProvider({ mode: 'appdata', http: httpPatchFail, getToken: async () => 'tok' });
     await expect(drivePatchFail.read(null)).rejects.toMatchObject({ code: 'network' });
-    expect(deleteCount).toBe(0);
+    expect(deleteOrTrashCount).toBe(0);
 
-    // (c) Cached `initialFileId = 'f_2'` still lists on first session call and heals to `'f_1'`
-    const deletedIds: string[] = [];
+    // (b2) Unparseable non-survivor dup is kept untouched AND survivor is NOT needlessly re-PATCHed
+    let uploadPatchCount = 0;
+    deleteOrTrashCount = 0;
+    const httpCorruptDup: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (req.method === 'DELETE' || (req.method === 'PATCH' && !u.pathname.includes('/upload/'))) {
+        deleteOrTrashCount += 1;
+        return makeResp(200, '{}');
+      }
+      if (req.method === 'PATCH' && u.pathname.includes('/upload/')) {
+        uploadPatchCount += 1;
+        return makeResp(200, JSON.stringify({ id: 'f_1', md5Checksum: md5Hex(dec.decode(docV1)) }));
+      }
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        return makeResp(200, JSON.stringify({ files: [{ id: 'f_1', name: SYNC_FILE_NAME, md5Checksum: md5Hex(dec.decode(docV1)) }, { id: 'f_2', name: SYNC_FILE_NAME }] }));
+      }
+      if (u.pathname.endsWith('/f_1')) return makeResp(200, docV1);
+      if (u.pathname.endsWith('/f_2')) return makeResp(200, '{corrupt json');
+      return makeResp(404, '');
+    };
+    const driveCorruptDup = new GoogleDriveProvider({ mode: 'appdata', http: httpCorruptDup, getToken: async () => 'tok' });
+    const corruptRes = await driveCorruptDup.read(null);
+    expect(corruptRes.kind).toBe('blob');
+    expect(deleteOrTrashCount).toBe(0);
+    expect(uploadPatchCount).toBe(0);
+
+    // (c) Cached `initialFileId = 'f_2'` lists on first session call, heals to `'f_1'`, trashes `'f_2'`,
+    // AND re-lists again after 24h!
+    let nowDrive = 1_000_000;
+    let listCalls = 0;
+    const trashedIds: string[] = [];
+    let hardDeletes = 0;
     let survivorBytes = docV1;
+    let hasDupF2 = true;
     const httpSplitBrain: HttpClient = async (req) => {
       const u = new URL(req.url);
       if (req.method === 'DELETE') {
-        deletedIds.push(u.pathname.split('/').pop()!);
+        hardDeletes += 1;
         return makeResp(204, '');
       }
-      if (req.method === 'PATCH') {
+      if (req.method === 'PATCH' && !u.pathname.includes('/upload/')) {
+        const id = u.pathname.split('/').pop()!;
+        trashedIds.push(id);
+        if (id === 'f_2') hasDupF2 = false;
+        return makeResp(200, JSON.stringify({ id, trashed: true }));
+      }
+      if (req.method === 'PATCH' && u.pathname.includes('/upload/')) {
         survivorBytes = req.body instanceof Uint8Array ? req.body : enc.encode(String(req.body));
         return makeResp(200, JSON.stringify({ id: 'f_1', md5Checksum: md5Hex(dec.decode(survivorBytes)) }));
       }
       if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
-        return makeResp(200, JSON.stringify({ files: [{ id: 'f_1', name: SYNC_FILE_NAME }, { id: 'f_2', name: SYNC_FILE_NAME }] }));
+        listCalls += 1;
+        const files = hasDupF2
+          ? [{ id: 'f_1', name: SYNC_FILE_NAME, md5Checksum: md5Hex(dec.decode(survivorBytes)) }, { id: 'f_2', name: SYNC_FILE_NAME }]
+          : [{ id: 'f_1', name: SYNC_FILE_NAME, md5Checksum: md5Hex(dec.decode(survivorBytes)) }];
+        return makeResp(200, JSON.stringify({ files }));
       }
-      if (u.pathname.endsWith('/f_1')) return makeResp(200, survivorBytes);
-      if (u.pathname.endsWith('/f_2')) return makeResp(200, docV1);
+      if (u.pathname.endsWith('/f_1')) {
+        if (u.searchParams.get('alt') === 'media') return makeResp(200, survivorBytes);
+        return makeResp(200, JSON.stringify({ id: 'f_1', name: SYNC_FILE_NAME, md5Checksum: md5Hex(dec.decode(survivorBytes)) }));
+      }
+      if (u.pathname.endsWith('/f_2')) return makeResp(200, docV1B);
       return makeResp(404, '');
     };
     const driveSplit = new GoogleDriveProvider({
@@ -555,17 +728,188 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
       initialFileId: 'f_2',
       http: httpSplitBrain,
       getToken: async () => 'tok',
+      now: () => nowDrive,
     });
     const healed = await driveSplit.read(null);
     expect(healed.kind).toBe('blob');
     expect(driveSplit.getFileId()).toBe('f_1');
-    expect(deletedIds).toEqual(['f_2']);
+    expect(trashedIds).toEqual(['f_2']);
+    expect(hardDeletes).toBe(0);
+    expect(listCalls).toBe(1);
 
-    // (d) 403 rateLimitExceeded -> retryable `network`, NOT `sync-auth`
+    // Within 24h: uses direct GET by cached fileId (no list call)
+    nowDrive += 12 * 3600_000;
+    await driveSplit.head();
+    expect(listCalls).toBe(1);
+
+    // After 24h: re-lists automatically
+    nowDrive += 13 * 3600_000;
+    await driveSplit.head();
+    expect(listCalls).toBe(2);
+
+    // (c2) drive-file duplicate-folder merge: merges files across two `MiniPod` folders and TRASHES
+    // (never DELETEs) duplicate file & empty duplicate folder (S8)
+    const dfFiles = new Map<string, { id: string; parents: string[]; bytes: Uint8Array; isFolder?: boolean }>([
+      ['folder_1', { id: 'folder_1', parents: [], bytes: new Uint8Array(0), isFolder: true }],
+      ['folder_2', { id: 'folder_2', parents: [], bytes: new Uint8Array(0), isFolder: true }],
+      ['file_1', { id: 'file_1', parents: ['folder_1'], bytes: docV1 }],
+      ['file_2', { id: 'file_2', parents: ['folder_2'], bytes: docV1B }],
+    ]);
+    const dfTrashed: string[] = [];
+    let dfHardDeletes = 0;
+    const httpDriveFile: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (req.method === 'DELETE') {
+        dfHardDeletes += 1;
+        return makeResp(204, '');
+      }
+      if (req.method === 'PATCH' && !u.pathname.includes('/upload/')) {
+        const id = decodeURIComponent(u.pathname.split('/').pop()!);
+        dfTrashed.push(id);
+        dfFiles.delete(id);
+        return makeResp(200, JSON.stringify({ id, trashed: true }));
+      }
+      if (req.method === 'PATCH' && u.pathname.includes('/upload/')) {
+        const id = decodeURIComponent(u.pathname.split('/').pop()!);
+        const cur = dfFiles.get(id)!;
+        const b = req.body instanceof Uint8Array ? req.body : enc.encode(String(req.body));
+        dfFiles.set(id, { ...cur, bytes: b });
+        return makeResp(200, JSON.stringify({ id, md5Checksum: md5Hex(dec.decode(b)), parents: cur.parents }));
+      }
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        const q = u.searchParams.get('q') ?? '';
+        if (q.includes('application/vnd.google-apps.folder')) {
+          const folders = [...dfFiles.values()].filter((f) => f.isFolder).map((f) => ({ id: f.id, name: 'MiniPod' }));
+          return makeResp(200, JSON.stringify({ files: folders }));
+        }
+        if (q.includes("'folder_2' in parents") && !q.includes(' or ')) {
+          const kids = [...dfFiles.values()].filter((f) => f.parents.includes('folder_2')).map((f) => ({ id: f.id }));
+          return makeResp(200, JSON.stringify({ files: kids }));
+        }
+        const syncFiles = [...dfFiles.values()]
+          .filter((f) => !f.isFolder)
+          .map((f) => ({ id: f.id, name: SYNC_FILE_NAME, md5Checksum: md5Hex(dec.decode(f.bytes)), parents: f.parents }));
+        return makeResp(200, JSON.stringify({ files: syncFiles }));
+      }
+      const id = decodeURIComponent(u.pathname.split('/').pop()!);
+      const hit = dfFiles.get(id);
+      if (!hit) return makeResp(404, '');
+      if (u.searchParams.get('alt') === 'media') return makeResp(200, hit.bytes);
+      return makeResp(200, JSON.stringify({ id: hit.id, md5Checksum: md5Hex(dec.decode(hit.bytes)), parents: hit.parents }));
+    };
+    const driveFileProv = new GoogleDriveProvider({ mode: 'file', http: httpDriveFile, getToken: async () => 'tok' });
+    const dfRead = await driveFileProv.read(null);
+    expect(dfRead.kind).toBe('blob');
+    expect(dfHardDeletes).toBe(0);
+    expect(dfTrashed.sort()).toEqual(['file_2', 'folder_2']);
+    if (dfRead.kind === 'blob') {
+      const mergedDoc = parseSyncDocument(dfRead.bytes);
+      expect(Object.keys(mergedDoc.subscriptions.items).sort()).toEqual(['f_a', 'f_b']);
+    }
+
+    // (c3) B2 regression: POST->relist detects concurrent first-time creation, merges into survivor,
+    // and returns `newEtag: null` so the next SyncEngine cycle pulls the other device's entities!
+    const concurrentFiles = new Map<string, { id: string; bytes: Uint8Array }>();
+    let listAttempt = 0;
+    const httpConcurrentCreate: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (req.method === 'POST' && u.pathname.includes('/upload/')) {
+        // Device B raced and already created `file_a` right before our POST created `file_b`!
+        concurrentFiles.set('file_a', { id: 'file_a', bytes: docV1 });
+        concurrentFiles.set('file_b', { id: 'file_b', bytes: docV1B });
+        return makeResp(200, JSON.stringify({ id: 'file_b', md5Checksum: md5Hex(dec.decode(docV1B)) }));
+      }
+      if (req.method === 'PATCH' && u.pathname.includes('/upload/')) {
+        const id = decodeURIComponent(u.pathname.split('/').pop()!);
+        const b = req.body instanceof Uint8Array ? req.body : enc.encode(String(req.body));
+        concurrentFiles.set(id, { id, bytes: b });
+        return makeResp(200, JSON.stringify({ id, md5Checksum: md5Hex(dec.decode(b)) }));
+      }
+      if (req.method === 'PATCH' && !u.pathname.includes('/upload/')) {
+        const id = decodeURIComponent(u.pathname.split('/').pop()!);
+        concurrentFiles.delete(id);
+        return makeResp(200, JSON.stringify({ id, trashed: true }));
+      }
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        listAttempt += 1;
+        if (listAttempt === 1) {
+          // Pre-write check sees missing
+          return makeResp(200, JSON.stringify({ files: [] }));
+        }
+        const files = [...concurrentFiles.values()].map((f) => ({
+          id: f.id,
+          name: SYNC_FILE_NAME,
+          md5Checksum: md5Hex(dec.decode(f.bytes)),
+        }));
+        return makeResp(200, JSON.stringify({ files }));
+      }
+      const id = decodeURIComponent(u.pathname.split('/').pop()!);
+      const hit = concurrentFiles.get(id);
+      if (!hit) return makeResp(404, '');
+      if (u.searchParams.get('alt') === 'media') return makeResp(200, hit.bytes);
+      return makeResp(200, JSON.stringify({ id: hit.id, md5Checksum: md5Hex(dec.decode(hit.bytes)) }));
+    };
+    const driveB2 = new GoogleDriveProvider({ mode: 'appdata', http: httpConcurrentCreate, getToken: async () => 'tok' });
+    const wB2 = await driveB2.write(docV1B, null);
+    expect(wB2).toEqual({ kind: 'ok', newEtag: null });
+    // Because `newEtag` is `null`, the next `read(null)` pulls the merged doc containing `f_a`!
+    const rAfterB2 = await driveB2.read(null);
+    expect(rAfterB2.kind).toBe('blob');
+    if (rAfterB2.kind === 'blob') {
+      expect(Object.keys(parseSyncDocument(rAfterB2.bytes).subscriptions.items).sort()).toEqual(['f_a', 'f_b']);
+    }
+
+    // (d) Missing `md5Checksum` falls back to `${id}:${version}` so changes & conflicts are still detected
+    let fileVer = '1';
+    let verBytes = docV1;
+    const httpNoMd5: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        return makeResp(200, JSON.stringify({ files: [{ id: 'f_nomd5', name: SYNC_FILE_NAME, version: fileVer }] }));
+      }
+      if (u.pathname.endsWith('/f_nomd5')) {
+        if (u.searchParams.get('alt') === 'media') return makeResp(200, verBytes);
+        return makeResp(200, JSON.stringify({ id: 'f_nomd5', name: SYNC_FILE_NAME, version: fileVer }));
+      }
+      return makeResp(404, '');
+    };
+    const driveNoMd5 = new GoogleDriveProvider({ mode: 'appdata', http: httpNoMd5, getToken: async () => 'tok' });
+    const nm1 = await driveNoMd5.read(null);
+    expect(nm1.kind).toBe('blob');
+    const nmEtag1 = nm1.kind === 'blob' ? nm1.etag : null;
+    expect(nmEtag1).toBe('f_nomd5:1');
+    fileVer = '2';
+    verBytes = docV1B;
+    const nm2 = await driveNoMd5.read(nmEtag1);
+    expect(nm2.kind).toBe('blob');
+    expect(await driveNoMd5.write(docV1, nmEtag1)).toEqual({ kind: 'conflict' });
+
+    // (e) 403 rateLimitExceeded -> retryable `network`; non-rate-limit 403 -> non-retryable `sync-auth` (read + write)
     const httpRateLimit: HttpClient = async () =>
       makeResp(403, JSON.stringify({ error: { errors: [{ reason: 'userRateLimitExceeded' }] } }));
     const driveRate = new GoogleDriveProvider({ mode: 'appdata', http: httpRateLimit, getToken: async () => 'tok' });
     await expect(driveRate.read(null)).rejects.toMatchObject({ code: 'network' });
+
+    const httpAuth403: HttpClient = async (req) => {
+      const u = new URL(req.url);
+      if (u.pathname.endsWith('/drive/v3/files') && req.method === 'GET') {
+        return makeResp(200, JSON.stringify({ files: [] }));
+      }
+      return makeResp(403, JSON.stringify({ error: { errors: [{ reason: 'insufficientFilePermissions' }] } }));
+    };
+    const driveAuth403Read = new GoogleDriveProvider({
+      mode: 'appdata',
+      http: async () => makeResp(403, JSON.stringify({ error: { errors: [{ reason: 'insufficientFilePermissions' }] } })),
+      getToken: async () => 'tok',
+    });
+    await expect(driveAuth403Read.read(null)).rejects.toMatchObject({ code: 'sync-auth' });
+    const driveAuth403Write = new GoogleDriveProvider({ mode: 'appdata', http: httpAuth403, getToken: async () => 'tok' });
+    const w403 = await driveAuth403Write.write(docV1, null);
+    expect(w403.kind).toBe('failed');
+    if (w403.kind === 'failed') {
+      expect(w403.retryable).toBe(false);
+      expect(MiniPodError.wrap(w403.cause, 'network').code).toBe('sync-auth');
+    }
   });
 
   it('[SYNC-P1-04] expired dirty tombstone folded into floor by GC is marked clean and purged on first upload', async () => {
@@ -790,7 +1134,8 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
       expect(r.pos > 'a0' && r.pos < 'a2').toBe(true);
     }
 
-    // Remote malformed active queue `pos` rejected with `sync-schema`
+    // S1 regression: malformed remote active queue `pos` is accepted by parser (no whole-doc rejection)
+    // and self-healed locally on subsequent queue operations without throwing!
     const badDoc = {
       ...createEmptySyncDocument('d_bad', 100),
       queue: {
@@ -800,7 +1145,16 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
         },
       },
     };
-    expect(() => parseSyncDocument(JSON.stringify(badDoc))).toThrowError(/Invalid fractional-index pos/);
+    const parsedBad = parseSyncDocument(JSON.stringify(badDoc));
+    expect(parsedBad.queue.items['e_bad']?.pos).toBe('!!!invalid');
+    const badEntries: QueueEntry[] = [
+      { episodeKey: 'e_bad', feedKey: 'f_1', pos: '!!!invalid', addedAt: 1, updatedAt: 100, removed: false, deviceId: 'd_bad' },
+    ];
+    const healedAfterAdd = queueAdd(badEntries, { episodeKey: 'e_new', feedKey: 'f_1' }, { hlc: hlcA, deviceId: 'd_alpha' });
+    expect(healedAfterAdd.length).toBeGreaterThanOrEqual(1);
+    for (const r of healedAfterAdd) {
+      expect(() => validateOrderKey(r.pos)).not.toThrow();
+    }
   });
 
   it('[SYNC-P1-13] 50k progress soft-cap GC never evicts PLAYED above oldestNonPlayed (zero resurrection ping-pong)', () => {
@@ -857,9 +1211,34 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     expect(putHeaders[0]?.['If-Match']).toBeUndefined(); // weak ETag omitted
     expect(headCallsAfterPut).toBe(0); // no racy head() after PUT
 
-    // Gist: auto-discovers existing secret gist, 404 clears gistId & recreates, 403 rate-limit -> retryable network
+    // WebDAV GET without ETag header -> subsequent `write(bytes, null)` omits `If-None-Match`
+    const noEtagPutHeaders: Array<Record<string, string>> = [];
+    const davNoEtagHttp: HttpClient = async (req: HttpRequest) => {
+      if (req.method === 'GET') return makeResp(200, '{}'); // no ETag header
+      if (req.method === 'PUT') {
+        noEtagPutHeaders.push(req.headers ?? {});
+        return makeResp(204, '');
+      }
+      return makeResp(405, '');
+    };
+    const davNoEtag = new WebDavProvider({
+      fileUrl: 'https://dav.example/no-etag.json',
+      username: 'u',
+      password: 'p',
+      http: davNoEtagHttp,
+    });
+    const rNoEtag = await davNoEtag.read(null);
+    expect(rNoEtag.kind).toBe('blob');
+    expect(rNoEtag.kind === 'blob' ? rNoEtag.etag : 'x').toBeNull();
+    const wNoEtag = await davNoEtag.write(enc.encode('{}'), null);
+    expect(wNoEtag).toEqual({ kind: 'ok', newEtag: null });
+    expect(noEtagPutHeaders[0]?.['If-None-Match']).toBeUndefined();
+
+    // Gist: auto-discovers existing secret gist, uses `history[0].version` for sub-second resolution (S9),
+    // retries discovery after 500 without creating a duplicate (S10), 404 recreates, and body-only 403 rate limit -> network
     let gistDeleted = false;
     let postCount = 0;
+    let commitSha = 'sha_commit_1';
     const gistHttp: HttpClient = async (req: HttpRequest) => {
       if (req.method === 'GET' && req.url.includes('/gists?per_page=100')) {
         return makeResp(
@@ -876,21 +1255,28 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
           JSON.stringify({
             id: 'gist_existing',
             updated_at: '2026-01-01T00:00:00Z',
+            history: [{ version: commitSha }],
             files: { [SYNC_FILE_NAME]: { content: JSON.stringify(createEmptySyncDocument('d_1', 100)) } },
           }),
           { etag: '"strong-get-etag"' },
         );
       }
       if (req.method === 'PATCH' && req.url.includes('/gists/gist_existing')) {
+        commitSha = 'sha_commit_2';
         return makeResp(
           200,
-          JSON.stringify({ id: 'gist_existing', updated_at: '2026-01-01T00:01:00Z', files: {} }),
+          JSON.stringify({
+            id: 'gist_existing',
+            updated_at: '2026-01-01T00:00:00Z', // SAME second as GET!
+            history: [{ version: commitSha }],
+            files: {},
+          }),
           { etag: 'W/"weak-patch-etag"' },
         );
       }
       if (req.method === 'POST' && req.url.endsWith('/gists')) {
         postCount += 1;
-        return makeResp(201, JSON.stringify({ id: 'gist_recreated', updated_at: '2026-01-01T00:02:00Z', files: {} }));
+        return makeResp(201, JSON.stringify({ id: 'gist_recreated', updated_at: '2026-01-01T00:02:00Z', history: [{ version: 'sha_commit_3' }], files: {} }));
       }
       return makeResp(404, '');
     };
@@ -898,13 +1284,53 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     const gr1 = await gist.read(null);
     expect(gr1.kind).toBe('blob');
     expect(gist.getGistId()).toBe('gist_existing');
+    expect(gr1.kind === 'blob' ? gr1.etag : null).toBe('sha_commit_1');
 
-    // Write uses `updated_at` consistently (no weak vs strong ETag false conflict)
+    // Write uses `history[0].version` consistently and advances tag even within same `updated_at` second (S9)
     const gw1 = await gist.write(
       serializeSyncDocument(createEmptySyncDocument('d_1', 200)),
       gr1.kind === 'blob' ? gr1.etag : null,
     );
-    expect(gw1.kind).toBe('ok');
+    expect(gw1).toEqual({ kind: 'ok', newEtag: 'sha_commit_2' });
+    // Stale `sha_commit_1` now detects conflict even though `updated_at` stayed in the same second!
+    expect(await gist.write(serializeSyncDocument(createEmptySyncDocument('d_1', 250)), 'sha_commit_1')).toEqual({
+      kind: 'conflict',
+    });
+
+    // S10: Gist discovery 500 throws retryable `network`, never POSTs duplicate, and retries discovery on next call!
+    let discCalls = 0;
+    let discPosts = 0;
+    const discGist = new GitHubGistProvider({
+      token: 'ghp_tok',
+      http: async (req) => {
+        if (req.method === 'GET' && req.url.includes('/gists?per_page=100')) {
+          discCalls += 1;
+          if (discCalls === 1) return makeResp(500, 'Upstream error');
+          return makeResp(
+            200,
+            JSON.stringify([{ id: 'gist_found_on_retry', public: false, files: { [SYNC_FILE_NAME]: { filename: SYNC_FILE_NAME } } }]),
+          );
+        }
+        if (req.method === 'POST') {
+          discPosts += 1;
+          return makeResp(201, JSON.stringify({ id: 'gist_dup' }));
+        }
+        if (req.method === 'GET' && req.url.includes('/gists/gist_found_on_retry')) {
+          return makeResp(200, JSON.stringify({
+            id: 'gist_found_on_retry',
+            history: [{ version: 'v1' }],
+            files: { [SYNC_FILE_NAME]: { content: JSON.stringify(createEmptySyncDocument('d_1', 100)) } },
+          }));
+        }
+        return makeResp(404, '');
+      },
+    });
+    const wDiscFail = await discGist.write(serializeSyncDocument(createEmptySyncDocument('d_1', 100)), null);
+    expect(wDiscFail).toMatchObject({ kind: 'failed', retryable: true });
+    expect(discPosts).toBe(0);
+    const rDiscRetry = await discGist.read(null);
+    expect(rDiscRetry.kind).toBe('blob');
+    expect(discGist.getGistId()).toBe('gist_found_on_retry');
 
     // Gist deleted remotely -> read clears gistId, next write recreates via POST!
     gistDeleted = true;
@@ -915,21 +1341,30 @@ describe('Stage 3 sync audit regressions (@minipod/core)', () => {
     expect(postCount).toBe(1);
     expect(gist.getGistId()).toBe('gist_recreated');
 
-    // 403 rate limit -> `network`
+    // 403 rate limit (header AND body-only secondary rate limit) -> `network`
     const rateGist = new GitHubGistProvider({
       token: 'ghp_tok',
       gistId: 'g_1',
       http: async () => makeResp(403, '{"message":"API rate limit exceeded"}', { 'x-ratelimit-remaining': '0' }),
     });
     await expect(rateGist.read(null)).rejects.toMatchObject({ code: 'network' });
+    const bodyRateGist = new GitHubGistProvider({
+      token: 'ghp_tok',
+      gistId: 'g_1',
+      http: async () => makeResp(403, '{"message":"You have exceeded a secondary rate limit"}'),
+    });
+    await expect(bodyRateGist.read(null)).rejects.toMatchObject({ code: 'network' });
   });
 
-  it('[SYNC-P2-01 & SYNC-P2-04] HLC restore ignores +5m clamp, skewed remote hlcMax does not poison hlcLast, and read-only device heartbeats every 24h', async () => {
-    // HLC restore vs skewed remote
+  it('[SYNC-P2-01 & SYNC-P2-04 & B1] HLC restore guards backward jumps while clamping forward poisoning, skewed remote hlcMax does not poison hlcLast, and read-only device heartbeats every 24h', async () => {
+    // B1: HLC restore preserves monotonicity on normal backward clock jumps (within +5m)
+    // while clamping any poisoned future timestamp to `wall + HLC_MAX_FORWARD_SKEW_MS`!
     const wall = 1_000_000;
     const hlc = new HybridLogicalClock(0, () => wall);
+    hlc.restore(wall + 120_000);
+    expect(hlc.current()).toBe(wall + 120_000);
     hlc.restore(wall + 10 * HLC_MAX_FORWARD_SKEW_MS);
-    expect(hlc.current()).toBe(wall + 10 * HLC_MAX_FORWARD_SKEW_MS);
+    expect(hlc.current()).toBe(wall + HLC_MAX_FORWARD_SKEW_MS);
 
     // Event-time stamping does not advance global HLC
     const hlcEvent = new HybridLogicalClock(0, () => 5_000_000);

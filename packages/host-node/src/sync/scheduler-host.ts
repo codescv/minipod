@@ -17,6 +17,7 @@ import {
   SyncScheduler,
   WebDavProvider,
   type ApplyDecisions,
+  type AppSettings,
   type CloudFileProvider,
   type EpisodeKey,
   type FeedKey,
@@ -301,6 +302,7 @@ export class NodeSyncService {
     }
 
     // Determine whether this targets a new remote lineage BEFORE mutating secrets/state (SYNC-P0-05, SYNC-P1-10)
+    const prevSettings = this.settingsStore.get();
     const state = this.store.getSyncStateSync();
     const nextFingerprint = computeDesktopRemoteFingerprint(settings.provider, this.settingsStore);
     const isDrive =
@@ -315,7 +317,12 @@ export class NodeSyncService {
       state.lastRemoteFingerprint !== null &&
       state.lastRemoteFingerprint !== nextFingerprint &&
       !sameDriveWithoutReauth;
-    const needLineageReset = fingerprintChanged || state.pendingLineageReset === true;
+    const legacyProviderChanged =
+      state.lastRemoteFingerprint == null &&
+      prevSettings.sync.provider !== null &&
+      JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(settings.provider);
+    const needLineageReset =
+      fingerprintChanged || legacyProviderChanged || state.pendingLineageReset === true;
 
     // Phase 1: construct candidate using ephemeral secret and probe BEFORE mutating any persisted state (SYNC-P1-10)
     const candidate = this.buildProvider(settings.provider, {
@@ -334,38 +341,48 @@ export class NodeSyncService {
     }
 
     // Phase 2: probe succeeded -> drain any in-flight cycle, then atomically commit secrets/state/provider
+    const prevProvider = this.engine.getProvider();
+    const prevLocalProvider = this.activeLocalProvider;
     this.engine.setProvider(null);
     await this.engine.drainActiveCycle();
 
-    if (secret) {
-      this.settingsStore.saveSyncSecret(secret);
+    let updated: AppSettings;
+    try {
+      if (secret) {
+        this.settingsStore.saveSyncSecret(secret);
+      }
+
+      // Never call `markAllDirty()` on configure; use explicit lineage-reset flag only when remote identity changed (SYNC-P0-05).
+      const statePatch: Partial<SyncState> = needLineageReset
+        ? ({
+            deviceName: settings.deviceName,
+            remoteEtag: null,
+            remoteFileId: null,
+            remoteRev: 0,
+            floors: { subscriptions: 0, queue: 0, progress: 0 },
+            lastPullAt: undefined,
+            lastPushAt: undefined,
+            remoteDevices: {},
+            lastRemoteFingerprint: nextFingerprint,
+            pendingLineageReset: true,
+          } as unknown as Partial<SyncState>)
+        : {
+            deviceName: settings.deviceName,
+            ...(state.lastRemoteFingerprint == null ? { lastRemoteFingerprint: nextFingerprint } : {}),
+          };
+      await this.store.setSyncState(statePatch);
+
+      this.activeLocalProvider = candidate.localProvider;
+      updated = this.settingsStore.update({ sync: settings });
+      this.scheduler.setWifiOnly(updated.sync.wifiOnly);
+      this.engine.setProvider(candidate.provider);
+      this.scheduler.rebindProviderWatcher();
+    } catch (err) {
+      this.activeLocalProvider = prevLocalProvider;
+      this.engine.setProvider(prevProvider);
+      this.scheduler.rebindProviderWatcher();
+      throw err;
     }
-
-    // Never call `markAllDirty()` on configure; use explicit lineage-reset flag only when remote identity changed (SYNC-P0-05).
-    const statePatch: Partial<SyncState> = needLineageReset
-      ? ({
-          deviceName: settings.deviceName,
-          remoteEtag: null,
-          remoteFileId: null,
-          remoteRev: 0,
-          floors: { subscriptions: 0, queue: 0, progress: 0 },
-          lastPullAt: undefined,
-          lastPushAt: undefined,
-          remoteDevices: {},
-          lastRemoteFingerprint: nextFingerprint,
-          pendingLineageReset: true,
-        } as unknown as Partial<SyncState>)
-      : {
-          deviceName: settings.deviceName,
-          ...(state.lastRemoteFingerprint == null ? { lastRemoteFingerprint: nextFingerprint } : {}),
-        };
-    await this.store.setSyncState(statePatch);
-
-    this.activeLocalProvider = candidate.localProvider;
-    const updated = this.settingsStore.update({ sync: settings });
-    this.scheduler.setWifiOnly(updated.sync.wifiOnly);
-    this.engine.setProvider(candidate.provider);
-    this.scheduler.rebindProviderWatcher();
     this.emit({ type: 'settings-changed', settings: updated });
 
     const res = await this.scheduler.requestAsync('configured');

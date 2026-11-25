@@ -47,9 +47,17 @@ interface DriveFileMeta {
   readonly id: string;
   readonly name?: string;
   readonly md5Checksum?: string;
+  readonly version?: string;
   readonly modifiedTime?: string;
   readonly trashed?: boolean;
   readonly parents?: readonly string[];
+}
+
+function etagForMeta(meta: DriveFileMeta): string {
+  if (meta.md5Checksum) return meta.md5Checksum;
+  if (meta.version) return `${meta.id}:${meta.version}`;
+  if (meta.modifiedTime) return `${meta.id}:${meta.modifiedTime}`;
+  return meta.id;
 }
 
 interface DriveFileListJson {
@@ -300,7 +308,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
       nowMs - this.lastListedAt >= LIST_REFRESH_INTERVAL_MS;
 
     if (!needListCheck && this.cachedFileId) {
-      const getUrl = `${this.apiBase}/files/${encodeURIComponent(this.cachedFileId)}?fields=${encodeURIComponent('id,name,md5Checksum,modifiedTime,trashed')}`;
+      const getUrl = `${this.apiBase}/files/${encodeURIComponent(this.cachedFileId)}?fields=${encodeURIComponent('id,name,md5Checksum,version,modifiedTime,trashed')}`;
       const resp = await this.authedRequest({
         url: getUrl,
         method: 'GET',
@@ -345,7 +353,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
 
     const spaces = this.mode === 'appdata' ? 'appDataFolder' : 'drive';
     const q = `name = '${escapeDriveQueryValue(this.fileName)}' and ${parentClause} and trashed = false`;
-    const listUrl = `${this.apiBase}/files?spaces=${spaces}&q=${encodeURIComponent(q)}&fields=${encodeURIComponent('files(id,name,md5Checksum,modifiedTime,parents)')}`;
+    const listUrl = `${this.apiBase}/files?spaces=${spaces}&q=${encodeURIComponent(q)}&fields=${encodeURIComponent('files(id,name,md5Checksum,version,modifiedTime,parents)')}`;
 
     const listResp = await this.authedRequest({
       url: listUrl,
@@ -400,9 +408,13 @@ export class GoogleDriveProvider implements CloudFileProvider {
           if (checkResp.status >= 200 && checkResp.status < 300) {
             const checkJson = JSON.parse(await checkResp.text()) as DriveFileListJson;
             if ((checkJson.files ?? []).length === 0) {
+              // Trash duplicate folder instead of permanent DELETE so unseen user files
+              // under `drive.file` scope remain recoverable in Google Drive Trash.
               await this.authedRequest({
                 url: `${this.apiBase}/files/${encodeURIComponent(dupFolder.id)}`,
-                method: 'DELETE',
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+                body: JSON.stringify({ trashed: true }),
                 ...(signal ? { signal } : {}),
               });
             }
@@ -456,13 +468,19 @@ export class GoogleDriveProvider implements CloudFileProvider {
       return survivor;
     }
 
+    // Nothing to merge when only the survivor itself parsed (e.g. unparseable non-survivor duplicates).
+    if (mergedEntries.length === 1 && mergedEntries[0]!.meta.id === survivor.id) {
+      this.setFileId(survivor.id);
+      return survivor;
+    }
+
     let merged = mergedEntries[0]!.doc;
     for (let i = 1; i < mergedEntries.length; i++) {
       merged = mergeSyncDocuments(merged, mergedEntries[i]!.doc);
     }
     const mergedBytes = serializeSyncDocument(merged);
     const updateResp = await this.authedRequest({
-      url: `${this.uploadBase}/files/${encodeURIComponent(survivor.id)}?uploadType=media&fields=${encodeURIComponent('id,md5Checksum,modifiedTime,parents')}`,
+      url: `${this.uploadBase}/files/${encodeURIComponent(survivor.id)}?uploadType=media&fields=${encodeURIComponent('id,md5Checksum,version,modifiedTime,parents')}`,
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: mergedBytes,
@@ -476,18 +494,36 @@ export class GoogleDriveProvider implements CloudFileProvider {
 
     const mergedMeta = JSON.parse(await updateResp.text()) as DriveFileMeta;
 
-    // Delete ONLY duplicates whose contents were successfully parsed and merged into survivor
+    // Trash ONLY duplicates whose contents were successfully parsed and merged into survivor.
+    // In `drive-file` mode never permanently DELETE; in `appdata` mode fall back to DELETE only
+    // if Drive rejects trashing inside `appDataFolder`.
     for (const entry of mergedEntries) {
       if (entry.meta.id === survivor.id) continue;
-      await this.authedRequest({
-        url: `${this.apiBase}/files/${encodeURIComponent(entry.meta.id)}`,
-        method: 'DELETE',
-        ...(signal ? { signal } : {}),
-      }).catch(() => undefined);
+      await this.trashMergedDuplicate(entry.meta.id, signal).catch(() => undefined);
     }
 
     this.setFileId(survivor.id);
     return mergedMeta;
+  }
+
+  private async trashMergedDuplicate(fileId: string, signal?: AbortSignal): Promise<void> {
+    const trashResp = await this.authedRequest({
+      url: `${this.apiBase}/files/${encodeURIComponent(fileId)}`,
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+      body: JSON.stringify({ trashed: true }),
+      ...(signal ? { signal } : {}),
+    });
+    if (trashResp.status >= 200 && trashResp.status < 300) {
+      return;
+    }
+    if (this.mode === 'appdata' && (trashResp.status === 400 || trashResp.status === 403)) {
+      await this.authedRequest({
+        url: `${this.apiBase}/files/${encodeURIComponent(fileId)}`,
+        method: 'DELETE',
+        ...(signal ? { signal } : {}),
+      });
+    }
   }
 
   async probe(signal?: AbortSignal): Promise<ProbeResult> {
@@ -496,7 +532,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
       if (!meta) {
         return { ok: true, exists: false, etag: null };
       }
-      return { ok: true, exists: true, etag: meta.md5Checksum ?? meta.id };
+      return { ok: true, exists: true, etag: etagForMeta(meta) };
     } catch (err) {
       return {
         ok: false,
@@ -509,7 +545,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
 
   async head(signal?: AbortSignal): Promise<string | null> {
     const meta = await this.locateFileMeta(signal);
-    return meta ? (meta.md5Checksum ?? meta.id) : null;
+    return meta ? etagForMeta(meta) : null;
   }
 
   async read(ifNoneMatch: string | null, signal?: AbortSignal): Promise<ReadResult> {
@@ -518,7 +554,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
       return { kind: 'missing' };
     }
     // Keep ETag fallback consistent across `head()`, `read()`, and `write()` (SYNC-P1-14)
-    const etag = meta.md5Checksum ?? meta.id;
+    const etag = etagForMeta(meta);
     if (ifNoneMatch !== null && etag === ifNoneMatch) {
       return { kind: 'not-modified' };
     }
@@ -551,7 +587,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
     try {
       // Pre-write `head()` conflict check before transferring bytes
       const existingMeta = await this.locateFileMeta(signal);
-      const currentEtag = existingMeta ? (existingMeta.md5Checksum ?? existingMeta.id) : null;
+      const currentEtag = existingMeta ? etagForMeta(existingMeta) : null;
 
       if (ifMatch === null) {
         if (currentEtag !== null) {
@@ -578,7 +614,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
         const multipartBody = concatBytes([prefix, bytes, suffix]);
 
         const createResp = await this.authedRequest({
-          url: `${this.uploadBase}/files?uploadType=multipart&fields=${encodeURIComponent('id,md5Checksum')}`,
+          url: `${this.uploadBase}/files?uploadType=multipart&fields=${encodeURIComponent('id,md5Checksum,version,modifiedTime')}`,
           method: 'POST',
           headers: {
             'Content-Type': `multipart/related; boundary=${boundary}`,
@@ -616,23 +652,30 @@ export class GoogleDriveProvider implements CloudFileProvider {
         }
 
         const created = JSON.parse(await createResp.text()) as DriveFileMeta;
+        const createdEtag = etagForMeta(created);
         this.setFileId(created.id);
 
-        // Immediately re-list to detect & heal concurrent first-time creations (SYNC-P1-09)
+        // Immediately re-list to detect & heal concurrent first-time creations (SYNC-P1-09).
+        // If another device's duplicate was merged into the survivor (different id or etag),
+        // return `newEtag: null` so the next cycle pulls the merged remote entities instead of 304.
         try {
           const verified = await this.locateFileMeta(signal, true);
           if (verified) {
-            return { kind: 'ok', newEtag: verified.md5Checksum ?? verified.id };
+            const verifiedEtag = etagForMeta(verified);
+            if (verified.id !== created.id || verifiedEtag !== createdEtag) {
+              return { kind: 'ok', newEtag: null };
+            }
+            return { kind: 'ok', newEtag: verifiedEtag };
           }
         } catch {
           // Create itself succeeded; duplicate healing will retry on the next read
         }
 
-        return { kind: 'ok', newEtag: created.md5Checksum ?? created.id };
+        return { kind: 'ok', newEtag: createdEtag };
       }
 
       const updateResp = await this.authedRequest({
-        url: `${this.uploadBase}/files/${encodeURIComponent(existingMeta.id)}?uploadType=media&fields=${encodeURIComponent('id,md5Checksum')}`,
+        url: `${this.uploadBase}/files/${encodeURIComponent(existingMeta.id)}?uploadType=media&fields=${encodeURIComponent('id,md5Checksum,version,modifiedTime')}`,
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -674,7 +717,7 @@ export class GoogleDriveProvider implements CloudFileProvider {
       }
 
       const updated = JSON.parse(await updateResp.text()) as DriveFileMeta;
-      return { kind: 'ok', newEtag: updated.md5Checksum ?? updated.id };
+      return { kind: 'ok', newEtag: etagForMeta(updated) };
     } catch (err) {
       const wrapped = MiniPodError.wrap(err, 'network');
       return {

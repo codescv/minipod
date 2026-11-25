@@ -181,27 +181,47 @@ export function PlayerProvider({
    */
   const completedEpisodeKeyRef = useRef<string | null>(null);
   /**
-   * Suppresses echoing programmatic sync/Undo/journal-reconcile `engine.seekTo()` calls back to
-   * `host.progress.save()`, eliminating cross-device seek ping-pong (SYNC-P1-05).
+   * One-shot token suppressing echoing programmatic sync/Undo/journal-reconcile `engine.seekTo()`
+   * calls back to `host.progress.save()`, eliminating cross-device seek ping-pong without
+   * swallowing subsequent real user or lock-screen seeks (SYNC-P1-05).
    */
-  const suppressSeekSaveRef = useRef<{ readonly episodeKey: string; readonly untilMs: number } | null>(
-    null,
-  );
+  const suppressSeekSaveRef = useRef<{
+    readonly episodeKey: string;
+    readonly targetPositionMs: number;
+    readonly expiresAtMs: number;
+  } | null>(null);
   /**
    * Tracks whether local playback actually advanced or user-seeked since the last saved/synced
    * position so `pagehide` never flushes stale paused state over remote updates (SYNC-P1-06).
    */
   const hasUnsavedLocalPlaybackRef = useRef(false);
 
-  const isSeekSaveSuppressed = useCallback((episodeKey: string): boolean => {
+  const consumeSeekSaveSuppression = useCallback((episodeKey: string, positionMs: number): boolean => {
     const s = suppressSeekSaveRef.current;
-    return s !== null && s.episodeKey === episodeKey && Date.now() < s.untilMs;
+    if (!s) return false;
+    if (Date.now() >= s.expiresAtMs) {
+      suppressSeekSaveRef.current = null;
+      return false;
+    }
+    if (s.episodeKey !== episodeKey) return false;
+    if (Math.abs(positionMs - s.targetPositionMs) <= 2000) {
+      suppressSeekSaveRef.current = null;
+      return true;
+    }
+    return false;
   }, []);
 
-  const suppressProgrammaticSeekSave = useCallback((episodeKey: string): void => {
-    suppressSeekSaveRef.current = { episodeKey, untilMs: Date.now() + 2000 };
-    lastSavedAtRef.current = Date.now();
-  }, []);
+  const suppressProgrammaticSeekSave = useCallback(
+    (episodeKey: string, targetPositionMs: number): void => {
+      suppressSeekSaveRef.current = {
+        episodeKey,
+        targetPositionMs,
+        expiresAtMs: Date.now() + 2000,
+      };
+      lastSavedAtRef.current = Date.now();
+    },
+    [],
+  );
 
   /**
    * True when a paused `positionMs: 0` for the current episode is a transient native idle/reset
@@ -489,7 +509,7 @@ export function PlayerProvider({
           ev.seeked &&
           nextSnap.episodeKey &&
           completedEpisodeKeyRef.current !== nextSnap.episodeKey &&
-          !isSeekSaveSuppressed(nextSnap.episodeKey)
+          !consumeSeekSaveSuppression(nextSnap.episodeKey, nextSnap.positionMs)
         ) {
           const dur = nextSnap.durationMs ?? episodeRef.current?.durationMs;
           if (!isEpisodeNearEnd(nextSnap.positionMs, dur)) {
@@ -535,7 +555,7 @@ export function PlayerProvider({
           positionMs: ev.positionMs,
           ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
         }));
-        const suppressed = isSeekSaveSuppressed(ev.episodeKey);
+        const suppressed = consumeSeekSaveSuppression(ev.episodeKey, ev.positionMs);
         if (engine.getSnapshot().playing && !suppressed) {
           hasUnsavedLocalPlaybackRef.current = true;
         }
@@ -645,7 +665,7 @@ export function PlayerProvider({
         })();
       }
     });
-  }, [engine, host, saveProgressSafe, isTransientZero, isSeekSaveSuppressed]);
+  }, [engine, host, saveProgressSafe, isTransientZero, consumeSeekSaveSuppression]);
 
   // Hydrate the current episode when the engine already has an active/paused track (e.g. the
   // WebView reloaded while `PlaybackService` kept a paused episode).
@@ -752,7 +772,7 @@ export function PlayerProvider({
             engSnap.episodeKey === event.episodeKey &&
             Math.abs(engSnap.positionMs - posMs) > 1500
           ) {
-            suppressProgrammaticSeekSave(event.episodeKey);
+            suppressProgrammaticSeekSave(event.episodeKey, posMs);
             engine.seekTo(posMs);
           }
           hasUnsavedLocalPlaybackRef.current = false;
@@ -793,7 +813,7 @@ export function PlayerProvider({
             action: {
               label: tRef.current('player.jumpToSync'),
               run: () => {
-                suppressProgrammaticSeekSave(event.episodeKey);
+                suppressProgrammaticSeekSave(event.episodeKey, remotePosMs);
                 if (remotePosMs === 0) {
                   allowZeroUntilRef.current = Date.now() + 2000;
                 }
@@ -808,7 +828,7 @@ export function PlayerProvider({
       }
 
       const previousPositionMs = engSnap.positionMs;
-      suppressProgrammaticSeekSave(event.episodeKey);
+      suppressProgrammaticSeekSave(event.episodeKey, remotePosMs);
       if (remotePosMs === 0) {
         allowZeroUntilRef.current = Date.now() + 2000;
       }
@@ -820,7 +840,7 @@ export function PlayerProvider({
           action: {
             label: tRef.current('common.undo'),
             run: () => {
-              suppressProgrammaticSeekSave(event.episodeKey);
+              suppressProgrammaticSeekSave(event.episodeKey, previousPositionMs);
               if (previousPositionMs === 0) {
                 allowZeroUntilRef.current = Date.now() + 2000;
               }

@@ -177,6 +177,7 @@ export class FeedsRepository {
     readonly nowWallMs: number;
     readonly deviceId?: DeviceId | undefined;
     readonly preserveSubscriptionState?: boolean | undefined;
+    readonly requireSubscribed?: boolean | undefined;
     readonly etag?: string | undefined;
     readonly lastModified?: string | undefined;
     readonly movedTo?: string | undefined;
@@ -189,10 +190,15 @@ export class FeedsRepository {
     return transaction(this.db, () => {
       const existing = this.getRaw(options.feedKey);
 
-      // Refresh guard (SYNC-P0-02): inside the write transaction, verify the feed is still
-      // actively subscribed; if unsubscribed/deleted/purged during the HTTP round-trip, abort.
+      // Refresh guard (SYNC-P0-02): inside the write transaction, verify the feed has not
+      // been deleted or unsubscribed during the HTTP round-trip; stub feeds (`subscribed = 0`
+      // with `deleted_at IS NULL` when `!requireSubscribed`) are still allowed to refresh.
       if (options.preserveSubscriptionState) {
-        if (!existing || existing.subscribed === 0 || existing.deleted_at !== null) {
+        if (
+          !existing ||
+          existing.deleted_at !== null ||
+          (options.requireSubscribed && existing.subscribed === 0)
+        ) {
           const fallbackFeed: Feed = existing
             ? rowToFeed(existing)
             : {
@@ -578,24 +584,29 @@ export class FeedsRepository {
           )?.identity);
         if (!identity) continue;
         const newEpKey = computeEpisodeKey(targetKey, identity);
-        this.queueRepo.upsertEntries(
-          [
-            {
-              ...entry,
-              removed: true,
-              updatedAt: hlc.stamp(entry.updatedAt),
-              deviceId,
-            },
-            {
-              ...entry,
-              episodeKey: newEpKey,
-              feedKey: targetKey,
-              updatedAt: hlc.stamp(entry.updatedAt),
-              deviceId,
-            },
-          ],
-          true,
-        );
+        const existingTargetQ = this.db
+          .prepare('SELECT updated_at FROM queue WHERE episode_key = ?')
+          .get(newEpKey) as { updated_at: number } | undefined;
+        const entriesToWrite = [
+          {
+            ...entry,
+            removed: true,
+            updatedAt: hlc.stamp(entry.updatedAt),
+            deviceId,
+          },
+          ...(!existingTargetQ || entry.updatedAt > existingTargetQ.updated_at
+            ? [
+                {
+                  ...entry,
+                  episodeKey: newEpKey,
+                  feedKey: targetKey,
+                  updatedAt: hlc.stamp(entry.updatedAt),
+                  deviceId,
+                },
+              ]
+            : []),
+        ];
+        this.queueRepo.upsertEntries(entriesToWrite, true);
       }
 
       return targetKey;

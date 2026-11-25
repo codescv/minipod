@@ -38,6 +38,9 @@ import { join, resolve } from 'node:path';
 export interface LocalFolderFileProviderOptions {
   readonly fileName?: string;
   readonly watchDebounceMs?: number;
+  readonly renameSyncFn?: typeof renameSync;
+  readonly platform?: NodeJS.Platform;
+  readonly renameRetryDelaysMs?: readonly number[];
 }
 
 export interface LocalFolderCloudProvider extends CloudFileProvider {
@@ -116,18 +119,21 @@ export function createLocalFolderFileAccess(
           closeSync(fd);
         }
         // Windows cloud daemons / AV scanners occasionally hold brief locks during atomic rename;
-        // retry transient EPERM / EBUSY with short backoff before failing (SYNC-P2-08).
-        const renameRetryDelaysMs = [25, 50, 100, 200];
+        // retry transient EBUSY (and EPERM on win32) with short backoff before failing (SYNC-P2-08).
+        const effectivePlatform = options?.platform ?? process.platform;
+        const doRename = options?.renameSyncFn ?? renameSync;
+        const renameRetryDelaysMs = options?.renameRetryDelaysMs ?? [25, 50, 100, 200];
         for (let attempt = 0; ; attempt++) {
           try {
-            renameSync(tmpPath, filePath);
+            doRename(tmpPath, filePath);
             break;
           } catch (renameErr) {
             const code =
               renameErr && typeof renameErr === 'object'
                 ? (renameErr as { code?: unknown }).code
                 : undefined;
-            const isTransientLock = code === 'EPERM' || code === 'EBUSY';
+            const isTransientLock =
+              code === 'EBUSY' || (code === 'EPERM' && effectivePlatform === 'win32');
             if (!isTransientLock || attempt >= renameRetryDelaysMs.length) {
               throw renameErr;
             }
@@ -241,6 +247,7 @@ export function createLocalFolderFileProvider(
   const inner = new HostFileProvider({
     id: 'local-folder',
     access,
+    ...(options?.platform !== undefined ? { platform: options.platform } : {}),
   });
 
   const provider: LocalFolderCloudProvider = {

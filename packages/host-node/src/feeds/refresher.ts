@@ -218,6 +218,7 @@ export class FeedRefresher {
   }
 
   private async refreshRssRow(row: FeedDbRow): Promise<void> {
+    const wasSubscribedBeforeFetch = row.subscribed !== 0;
     const fetchUrl = row.moved_to || row.url;
     const { cleanUrl, credentials: inlineCreds } = extractUrlCredentials(fetchUrl);
     const creds = inlineCreds ?? this.deps.getCredentials(row.feed_key);
@@ -288,9 +289,15 @@ export class FeedRefresher {
       }
     }
 
-    // Verify feed is still subscribed after HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+    // Verify feed was not unsubscribed/deleted during HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+    // Stub feeds (`subscribed = 0 && deleted_at IS NULL` when `!wasSubscribedBeforeFetch`) are still allowed to refresh.
     const liveRow = this.feedsRepo.getRaw(row.feed_key);
-    if (!liveRow || liveRow.subscribed === 0 || liveRow.deleted_at !== null) {
+    if (
+      !liveRow ||
+      liveRow.deleted_at !== null ||
+      (wasSubscribedBeforeFetch && liveRow.subscribed === 0)
+    ) {
+      this.deps.emit({ type: 'feed-refreshed', feedKey: row.feed_key });
       return;
     }
 
@@ -311,8 +318,9 @@ export class FeedRefresher {
       feedKey: targetFeedKey,
       kind: 'RSS',
       url: effectiveUrl,
-      subscribed: true,
+      subscribed: wasSubscribedBeforeFetch,
       preserveSubscriptionState: true,
+      requireSubscribed: wasSubscribedBeforeFetch,
       deviceId: this.deps.getDeviceId(),
       parsed,
       hlc: this.hlc,
@@ -323,6 +331,7 @@ export class FeedRefresher {
       ...(moved ? { markSyncDirty: true } : {}),
     });
     if (upsertRes.skipped) {
+      this.deps.emit({ type: 'feed-refreshed', feedKey: targetFeedKey });
       return;
     }
 

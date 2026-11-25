@@ -29,15 +29,17 @@ export class HybridLogicalClock {
   }
 
   /**
-   * Restores this device's own persisted local HLC lower bound across restarts without
-   * clamping to `wallNow + 5 min` so local monotonicity survives backward wall-clock jumps.
-   * Only pass bounded local `hlcLast` values (never unbounded remote `hlcMax`).
+   * Restores this device's own persisted local HLC lower bound across restarts while
+   * clamping to `wallNow + HLC_MAX_FORWARD_SKEW_MS` so normal backward wall-clock jumps
+   * stay monotonic without allowing a poisoned future timestamp to persist forever.
    */
   restore(persistedLocalHlc: HlcMs): HlcMs {
     if (!Number.isFinite(persistedLocalHlc) || persistedLocalHlc <= 0) {
       return this.hlc;
     }
-    this.hlc = Math.max(this.hlc, Math.trunc(persistedLocalHlc));
+    const maxAllowed = Math.trunc(this.wallNow()) + HLC_MAX_FORWARD_SKEW_MS;
+    const bounded = Math.min(Math.trunc(persistedLocalHlc), maxAllowed);
+    this.hlc = Math.max(this.hlc, bounded);
     return this.hlc;
   }
 

@@ -437,7 +437,7 @@ export class SyncEngine {
       const initialState = await this.store.getSyncState();
       if (isStale()) return await returnStale();
 
-      // Restore persisted local HLC without +5m forward-skew clamping (SYNC-P2-01).
+      // Restore persisted local HLC (clamped to `wall + HLC_MAX_FORWARD_SKEW_MS`).
       if (initialState.hlcLast > this.hlc.current()) {
         this.hlc.restore(initialState.hlcLast);
       }
@@ -512,6 +512,9 @@ export class SyncEngine {
 
         if (readResult.kind === 'not-modified') {
           pulled = true;
+          if (readResult.etag !== undefined) {
+            currentEtag = readResult.etag;
+          }
           if (dirtyTotal === 0) {
             // Read-only pull with unchanged remote and zero dirty rows -> no-op (§9.1)
             this.consecutiveFailures = 0;
@@ -521,6 +524,7 @@ export class SyncEngine {
               clearErrorAndBackoffPatch({
                 lastPullAt: attemptNow,
                 hlcLast: this.hlc.current(),
+                ...(readResult.etag !== undefined ? { remoteEtag: readResult.etag } : {}),
               }),
             );
             if (isStale()) return await returnStale();

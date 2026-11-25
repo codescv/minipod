@@ -1,5 +1,4 @@
 import { MiniPodError } from '../errors';
-import { validateOrderKey } from './fractional-index';
 import {
   SYNC_SCHEMA_ID,
   SYNC_SCHEMA_VERSION,
@@ -150,15 +149,6 @@ function parseQueueMap(raw: unknown): SyncMap<SyncQueueEntry> {
     const updatedAt = expectNonNegInt(item['updatedAt'], `queue.items.${key}.updatedAt`);
     const removed = expectBoolean(item['removed'], `queue.items.${key}.removed`);
     const deviceId = expectString(item['deviceId'], `queue.items.${key}.deviceId`);
-    if (!removed) {
-      try {
-        validateOrderKey(pos);
-      } catch (err) {
-        throw new MiniPodError('sync-schema', `Invalid fractional-index pos for queue item "${key}": "${pos}"`, {
-          cause: err,
-        });
-      }
-    }
     const stub = item['stub'] !== undefined && item['stub'] !== null ? parseQueueStub(item['stub'], key) : undefined;
 
     items[key] = {

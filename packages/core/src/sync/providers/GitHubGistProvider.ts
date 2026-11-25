@@ -40,6 +40,7 @@ interface GistResponseJson {
   readonly id?: string;
   readonly public?: boolean;
   readonly updated_at?: string;
+  readonly history?: ReadonlyArray<{ readonly version?: string }>;
   readonly files?: Readonly<Record<string, GistFileJson | null | undefined>>;
 }
 
@@ -122,8 +123,13 @@ export class GitHubGistProvider implements CloudFileProvider {
   }
 
   private extractVersionTag(resp: HttpResponse, parsed: GistResponseJson): string | null {
-    // Prefer `updated_at` (consistent between GET and PATCH on GitHub API) with normalized ETag fallback (SYNC-P1-14).
-    const tag = parsed.updated_at ?? normalizeHttpEtag(resp.headers['etag']);
+    // Prefer `history[0].version` (sub-second commit SHA returned on both GET and PATCH),
+    // falling back to `updated_at` and normalized HTTP ETag (SYNC-P1-14).
+    const commitVersion = parsed.history?.[0]?.version;
+    const tag =
+      (typeof commitVersion === 'string' && commitVersion.length > 0 ? commitVersion : null) ??
+      parsed.updated_at ??
+      normalizeHttpEtag(resp.headers['etag']);
     this.lastHttpEtag = resp.headers['etag'] ?? null;
     this.lastReturnedTag = tag;
     return tag;
@@ -143,10 +149,11 @@ export class GitHubGistProvider implements CloudFileProvider {
   /**
    * When `gistId` is not configured, scans the user's secret gists once to reuse an existing
    * MiniPod sync gist rather than creating a duplicate (SYNC-P2-08).
+   * Only marks `discoveryAttempted = true` after a 2xx JSON array parse; 5xx/network errors throw
+   * a retryable `network` error so `write()` never creates a duplicate gist.
    */
   private async discoverExistingGist(signal?: AbortSignal): Promise<string | undefined> {
     if (this.gistId || this.discoveryAttempted) return this.gistId;
-    this.discoveryAttempted = true;
 
     const resp = await this.http({
       url: `${this.apiBase}/gists?per_page=100`,
@@ -158,17 +165,24 @@ export class GitHubGistProvider implements CloudFileProvider {
     if (resp.status === 401 || resp.status === 403) {
       throw await this.classifyAuthOrRateLimit(resp, 'list');
     }
-    if (resp.status < 200 || resp.status >= 300) {
+    if (resp.status === 404) {
       return undefined;
+    }
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new MiniPodError('network', `GitHub Gist list failed (HTTP ${resp.status})`);
     }
 
     let list: unknown;
     try {
       list = JSON.parse(await resp.text());
-    } catch {
-      return undefined;
+    } catch (err) {
+      throw new MiniPodError('network', 'GitHub Gist list returned invalid JSON', { cause: err });
     }
-    if (!Array.isArray(list)) return undefined;
+    if (!Array.isArray(list)) {
+      throw new MiniPodError('network', 'GitHub Gist list returned unexpected payload');
+    }
+
+    this.discoveryAttempted = true;
 
     for (const item of list as GistResponseJson[]) {
       if (item && item.id && item.public === false && item.files && item.files[this.fileName]) {
@@ -224,25 +238,40 @@ export class GitHubGistProvider implements CloudFileProvider {
           return { ok: false, exists: false, etag: null, error: err.toShape() };
         }
         if (resp.status >= 200 && resp.status < 300) {
-          this.discoveryAttempted = true;
+          let list: unknown;
           try {
-            const list = JSON.parse(await resp.text()) as GistResponseJson[];
-            if (Array.isArray(list)) {
-              const found = list.find(
-                (item) =>
-                  item && item.id && item.public === false && item.files && item.files[this.fileName],
-              );
-              if (found?.id) {
-                this.gistId = found.id;
-                this.onGistCreated?.(found.id);
-                const etag = await this.head(signal);
-                return { ok: true, exists: etag !== null, etag };
-              }
+            list = JSON.parse(await resp.text());
+          } catch (err) {
+            return {
+              ok: false,
+              exists: false,
+              etag: null,
+              error: new MiniPodError('network', 'GitHub probe returned invalid JSON', { cause: err }).toShape(),
+            };
+          }
+          if (Array.isArray(list)) {
+            this.discoveryAttempted = true;
+            const found = (list as GistResponseJson[]).find(
+              (item) =>
+                item && item.id && item.public === false && item.files && item.files[this.fileName],
+            );
+            if (found?.id) {
+              this.gistId = found.id;
+              this.onGistCreated?.(found.id);
+              const etag = await this.head(signal);
+              return { ok: true, exists: etag !== null, etag };
             }
-          } catch {
-            // Fall through as empty
           }
           return { ok: true, exists: false, etag: null };
+        }
+
+        if (resp.status !== 404) {
+          return {
+            ok: false,
+            exists: false,
+            etag: null,
+            error: new MiniPodError('network', `GitHub probe failed (HTTP ${resp.status})`).toShape(),
+          };
         }
 
         // Fallback lightweight token check `/gists?per_page=1`

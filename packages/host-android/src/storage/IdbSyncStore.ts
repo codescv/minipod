@@ -14,6 +14,7 @@ import {
   feedKey as deriveFeedKey,
   fromSyncQueueEntry,
   generateDeviceId,
+  HLC_MAX_FORWARD_SKEW_MS,
   HybridLogicalClock,
   MiniPodError,
   pickProgress,
@@ -251,6 +252,11 @@ export class IdbSyncStore implements SyncStore {
       };
       await syncStore.put(stateRow);
     } else {
+      const maxAllowedHlc = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+      if (stateRow.hlcLast > maxAllowedHlc) {
+        stateRow = { ...stateRow, hlcLast: maxAllowedHlc };
+        await syncStore.put(stateRow);
+      }
       const [allFeeds, allQueue, allProg] = await Promise.all([
         tx.objectStore('feeds').getAll(),
         tx.objectStore('queue').getAll(),
@@ -258,7 +264,7 @@ export class IdbSyncStore implements SyncStore {
       ]);
       let maxLocalHlc = stateRow.hlcLast;
       for (const f of allFeeds) {
-        if (f.kind === 'RSS' && (!f.deviceId || f.deviceId === stateRow.deviceId)) {
+        if (f.kind === 'RSS' && f.deviceId === stateRow.deviceId) {
           if (f.updatedAt > maxLocalHlc) maxLocalHlc = f.updatedAt;
         }
       }
@@ -318,11 +324,17 @@ export class IdbSyncStore implements SyncStore {
   }): Promise<IdbSyncStateRecord> {
     const existing = await store.get(1);
     if (existing) {
-      if (existing.hlcLast > this.hlc.current()) {
-        this.hlc.restore(existing.hlcLast);
+      const maxAllowedHlc = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+      let effective = existing;
+      if (existing.hlcLast > maxAllowedHlc) {
+        effective = { ...existing, hlcLast: maxAllowedHlc };
+        await store.put(effective);
       }
-      this.cachedSyncState = existing;
-      return existing;
+      if (effective.hlcLast > this.hlc.current()) {
+        this.hlc.restore(effective.hlcLast);
+      }
+      this.cachedSyncState = effective;
+      return effective;
     }
     const created: IdbSyncStateRecord = {
       id: 1,
@@ -373,6 +385,8 @@ export class IdbSyncStore implements SyncStore {
         ? Boolean(patch.pendingLineageReset)
         : Boolean(current.pendingLineageReset);
 
+    const maxAllowedHlc = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+    const clampedCurrentHlc = Math.min(current.hlcLast, maxAllowedHlc);
     const updated: IdbSyncStateRecord = {
       id: 1,
       deviceId: patch.deviceId ?? current.deviceId,
@@ -383,7 +397,10 @@ export class IdbSyncStore implements SyncStore {
       floorSubscriptions: patch.floors?.subscriptions ?? current.floorSubscriptions,
       floorQueue: patch.floors?.queue ?? current.floorQueue,
       floorProgress: patch.floors?.progress ?? current.floorProgress,
-      hlcLast: Math.max(current.hlcLast, patch.hlcLast ?? 0, this.hlc.current()),
+      hlcLast: Math.min(
+        Math.max(clampedCurrentHlc, patch.hlcLast ?? 0, this.hlc.current()),
+        maxAllowedHlc,
+      ),
       ...(lastPullAt !== undefined ? { lastPullAt } : {}),
       ...(lastPushAt !== undefined ? { lastPushAt } : {}),
       ...(lastError !== undefined ? { lastError } : {}),
@@ -400,19 +417,18 @@ export class IdbSyncStore implements SyncStore {
 
   async getDirtyCount(): Promise<number> {
     const tx = this.db.transaction(['feeds', 'queue', 'progress'], 'readonly');
-    const [allFeeds, dirtyQueueCount, dirtyProgCount] = await Promise.all([
-      tx.objectStore('feeds').getAll(),
+    const [dirtyFeeds, dirtyQueueCount, dirtyProgCount] = await Promise.all([
+      tx.objectStore('feeds').index('bySyncDirty').getAll(1),
       tx.objectStore('queue').index('bySyncDirty').count(1),
       tx.objectStore('progress').index('bySyncDirty').count(1),
     ]);
     await tx.done;
     let dirtySubsCount = 0;
-    for (const f of allFeeds) {
+    for (const f of dirtyFeeds) {
       if (
         f.kind === 'RSS' &&
         !f.feedKey.startsWith('l_') &&
-        (f.subscribedNum === 1 || f.deletedAt != null) &&
-        f.syncDirty === 1
+        (f.subscribedNum === 1 || f.deletedAt != null)
       ) {
         dirtySubsCount += 1;
       }
@@ -660,13 +676,12 @@ export class IdbSyncStore implements SyncStore {
       allProgress.map((p) => [p.episodeKey, p]),
     );
 
-    const collectMergedPreserveQueueKeys = (
-      fk: FeedKey,
-      cutoff: HlcMs,
-    ): ReadonlySet<EpisodeKey> => {
+    // Preserve EVERY merged-active queue key of `fk` so cascade never wipes
+    // episodes/downloads that Step 2 will keep active in the merged queue.
+    const collectMergedPreserveQueueKeys = (fk: FeedKey): ReadonlySet<EpisodeKey> => {
       const preserved = new Set<EpisodeKey>();
       for (const [epKey, q] of Object.entries(merged.queue.items)) {
-        if (q.feedKey === fk && !q.removed && q.updatedAt > cutoff) {
+        if (q.feedKey === fk && !q.removed) {
           preserved.add(epKey);
         }
       }
@@ -842,7 +857,7 @@ export class IdbSyncStore implements SyncStore {
         }
       } else {
         if (localRow.subscribedNum === 1 || localRow.deletedAt == null) {
-          const preserveQueueKeys = collectMergedPreserveQueueKeys(fk, winSub.updatedAt);
+          const preserveQueueKeys = collectMergedPreserveQueueKeys(fk);
           await softDeleteFeedInTx(fk, winSub.updatedAt, winSub.deviceId, 0, preserveQueueKeys);
           subsChanged = true;
         } else {
@@ -866,7 +881,7 @@ export class IdbSyncStore implements SyncStore {
       if (localRow.subscribedNum === 0 && localRow.deletedAt == null) continue; // stub
       if (!(localRow.feedKey in merged.subscriptions.items)) {
         const floorStamp = Math.max(merged.subscriptions.floor, localRow.updatedAt);
-        const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feedKey, floorStamp);
+        const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feedKey);
         if (localRow.subscribedNum === 1) {
           await softDeleteFeedInTx(
             localRow.feedKey,
@@ -1045,7 +1060,9 @@ export class IdbSyncStore implements SyncStore {
         playedAt: winP.playedAt ?? null,
         updatedAt: winP.updatedAt,
         deviceId: winP.deviceId,
-        localWrittenAt: writeWallMs,
+        // Cap remote event timestamp at `writeWallMs` while preserving older remote `updatedAt`
+        // so an unreplayed newer native playback checkpoint still wins reconciliation (SYNC-P0-03).
+        localWrittenAt: Math.min(writeWallMs, winP.updatedAt),
         syncDirty: 0,
         ...(winP.identity !== undefined ? { identity: winP.identity } : {}),
         ...(winP.durationMs !== undefined ? { durationMs: winP.durationMs } : {}),
@@ -1076,13 +1093,17 @@ export class IdbSyncStore implements SyncStore {
       }
     }
 
-    // Raise floors monotonically inside the same transaction
+    // Raise floors monotonically and persist bounded local HLC inside the same transaction
+    const maxAllowedHlc = writeWallMs + HLC_MAX_FORWARD_SKEW_MS;
     const nextState: IdbSyncStateRecord = {
       ...stateRow,
       floorSubscriptions: Math.max(stateRow.floorSubscriptions, merged.subscriptions.floor),
       floorQueue: Math.max(stateRow.floorQueue, merged.queue.floor),
       floorProgress: Math.max(stateRow.floorProgress, merged.progress.floor),
-      hlcLast: Math.max(stateRow.hlcLast, this.hlc.current()),
+      hlcLast: Math.min(
+        Math.max(Math.min(stateRow.hlcLast, maxAllowedHlc), this.hlc.current()),
+        maxAllowedHlc,
+      ),
     };
     await syncStateStore.put(nextState);
     await tx.done;
@@ -1285,6 +1306,7 @@ export class IdbSyncStore implements SyncStore {
     readonly nowWallMs: EpochMs;
     readonly deviceId?: DeviceId;
     readonly preserveSubscriptionState?: boolean;
+    readonly requireSubscribed?: boolean;
     readonly hasCredentials?: boolean;
     readonly movedTo?: string;
     readonly etag?: string;
@@ -1303,10 +1325,15 @@ export class IdbSyncStore implements SyncStore {
 
     const existingFeed = await feedsStore.get(params.feedKey);
 
-    // Refresh guard (SYNC-P0-02): re-check live subscription status inside the write tx;
-    // abort write-back if unsubscribed/deleted/purged during the HTTP fetch.
+    // Refresh guard (SYNC-P0-02): re-check live status inside the write tx;
+    // abort write-back if deleted or unsubscribed during the HTTP fetch, while allowing
+    // stub feeds (`subscribedNum === 0 && deletedAt == null` when `!requireSubscribed`).
     if (params.preserveSubscriptionState) {
-      if (!existingFeed || existingFeed.subscribedNum === 0 || existingFeed.deletedAt != null) {
+      if (
+        !existingFeed ||
+        existingFeed.deletedAt != null ||
+        (params.requireSubscribed && existingFeed.subscribedNum === 0)
+      ) {
         await tx.done;
         if (existingFeed) {
           return idbRecordToFeed(existingFeed);
@@ -1676,6 +1703,7 @@ export class IdbSyncStore implements SyncStore {
       syncDirty: 1,
     });
 
+    const downloadsToDelete: string[] = [];
     const oldEps = await episodesStore.index('byFeed').getAll(oldFeedKey);
     const identityByOldEpKey = new Map<EpisodeKey, string>();
     for (const ep of oldEps) {
@@ -1689,6 +1717,16 @@ export class IdbSyncStore implements SyncStore {
           episodeKey: nextEpKey,
           feedKey: newFeedKey,
         });
+      } else if (ep.downloadPath) {
+        if (!existingTargetEp.downloadPath && ep.downloadState === 'DONE') {
+          await episodesStore.put({
+            ...existingTargetEp,
+            downloadState: ep.downloadState,
+            downloadPath: ep.downloadPath,
+          });
+        } else if (ep.downloadPath !== existingTargetEp.downloadPath) {
+          downloadsToDelete.push(ep.downloadPath);
+        }
       }
       const ch = await chaptersStore.get(ep.episodeKey);
       if (ch) {
@@ -1701,14 +1739,15 @@ export class IdbSyncStore implements SyncStore {
 
     // Re-key active queue rows: write a Tombstone on `oldEpKey` (NEVER hard delete!)
     // so old keys never boomerang back as stubs after sync (SYNC-P1-03).
+    // Compare `updatedAt` before overwriting an existing target queue entry/tombstone.
     const oldQueue = await queueStore.index('byFeed').getAll(oldFeedKey);
     for (const q of oldQueue) {
       if (q.removedNum !== 0) continue;
       const identity = q.stub?.identity ?? identityByOldEpKey.get(q.episodeKey);
       if (!identity) continue;
       const nextEpKey = deriveEpisodeKey(newFeedKey, identity);
+      const existingTargetQ = await queueStore.get(nextEpKey);
       const tombStamp = this.hlc.stamp(q.updatedAt);
-      const nextStamp = this.hlc.stamp(q.updatedAt);
       const tombRec: IdbQueueRecord = {
         episodeKey: q.episodeKey,
         feedKey: q.feedKey,
@@ -1720,15 +1759,18 @@ export class IdbSyncStore implements SyncStore {
         syncDirty: 1,
       };
       await queueStore.put(tombRec);
-      await queueStore.put({
-        ...q,
-        episodeKey: nextEpKey,
-        feedKey: newFeedKey,
-        updatedAt: nextStamp,
-        removedNum: 0,
-        deviceId,
-        syncDirty: 1,
-      });
+      if (!existingTargetQ || q.updatedAt > existingTargetQ.updatedAt) {
+        const nextStamp = this.hlc.stamp(q.updatedAt);
+        await queueStore.put({
+          ...q,
+          episodeKey: nextEpKey,
+          feedKey: newFeedKey,
+          updatedAt: nextStamp,
+          removedNum: 0,
+          deviceId,
+          syncDirty: 1,
+        });
+      }
     }
 
     // Re-key progress rows: compare against existing target progress via `pickProgress`
@@ -1758,6 +1800,9 @@ export class IdbSyncStore implements SyncStore {
     }
 
     await tx.done;
+    if (downloadsToDelete.length > 0 && this.onDeleteDownloads) {
+      await this.onDeleteDownloads(downloadsToDelete);
+    }
     return newFeedKey;
   }
 

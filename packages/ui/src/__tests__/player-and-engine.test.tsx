@@ -159,6 +159,12 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const pausedPos = engine.getSnapshot().positionMs;
     const savesBeforePausedSync = host.progressSaves.length;
 
+    // 1b0. Paused with zero further interaction -> `pagehide` MUST NOT flush stale progress (SYNC-P1-06)
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+    expect(host.progressSaves.length).toBe(savesBeforePausedSync);
+
     act(() => {
       host.simulateRemoteProgress(loadedKey, 900_000, 'Pixel 9');
     });
@@ -168,7 +174,29 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const snackbar = await screen.findByTestId('snackbar');
     expect(snackbar).toHaveTextContent('Resumed from Pixel 9 at 15:00');
 
+    // One-shot seek suppression: a real lock-screen/OS seek immediately after programmatic sync seek
+    // MUST still be persisted (not swallowed by a fixed 2s window)!
+    const savesBeforeOsSeek = host.progressSaves.length;
+    act(() => {
+      engine.emitRawState(
+        {
+          episodeKey: loadedKey,
+          playing: false,
+          buffering: false,
+          positionMs: 1_200_000,
+          speed: 1,
+          ...(engine.getSnapshot().durationMs !== undefined
+            ? { durationMs: engine.getSnapshot().durationMs }
+            : {}),
+        },
+        { seeked: true },
+      );
+    });
+    expect(host.progressSaves.length).toBe(savesBeforeOsSeek + 1);
+    expect(host.progressSaves[host.progressSaves.length - 1]?.positionMs).toBe(1_200_000);
+
     // Clicking Undo seeks back to pausedPos and invokes `host.sync.undoResume` (and NOT plain `progress.save`)
+    const savesBeforeUndo = host.progressSaves.length;
     fireEvent.click(screen.getByTestId('snackbar-action'));
     expect(engine.getSnapshot().positionMs).toBe(pausedPos);
     await waitFor(() => {
@@ -179,7 +207,7 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
       ).toBe(true);
     });
     // Only the single undoResume call was recorded (no extra non-flush progress.save echo)
-    expect(host.progressSaves.length).toBe(savesBeforePausedSync + 1);
+    expect(host.progressSaves.length).toBe(savesBeforeUndo + 1);
 
     // 1c. Receiving `fromSync` PLAYED while paused suppresses `pagehide` IN_PROGRESS flush (SYNC-P1-06)
     const savesBeforePlayedSync = host.progressSaves.length;

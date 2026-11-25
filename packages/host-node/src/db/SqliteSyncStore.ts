@@ -8,6 +8,7 @@
 import {
   fromSyncQueueEntry,
   generateDeviceId,
+  HLC_MAX_FORWARD_SKEW_MS,
   HybridLogicalClock,
   toSyncQueueEntry,
   type ApplyDecisions,
@@ -171,9 +172,7 @@ export class SqliteSyncStore implements SyncStore {
   private queryMaxLocalEntityHlc(deviceId: DeviceId): HlcMs {
     const maxFeed = (
       this.db
-        .prepare(
-          "SELECT MAX(updated_at) AS m FROM feeds WHERE kind = 'RSS' AND (device_id = ? OR device_id IS NULL)",
-        )
+        .prepare("SELECT MAX(updated_at) AS m FROM feeds WHERE kind = 'RSS' AND device_id = ?")
         .get(deviceId) as { m: number | null } | undefined
     )?.m ?? 0;
     const maxQueue = (
@@ -195,10 +194,19 @@ export class SqliteSyncStore implements SyncStore {
       .get() as SyncStateRow | undefined;
     if (existing) {
       if (restoreHlc) {
-        // Restore local HLC without +5m clamp using MAX(hlc_last, own local entity timestamps) (SYNC-P2-01).
-        const maxLocal = Math.max(existing.hlc_last, this.queryMaxLocalEntityHlc(existing.device_id));
+        // Heal any legacy forward-poisoned `hlc_last` and restore capped at `now + HLC_MAX_FORWARD_SKEW_MS`.
+        const maxAllowed = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+        let effectiveHlcLast = existing.hlc_last;
+        if (effectiveHlcLast > maxAllowed) {
+          effectiveHlcLast = maxAllowed;
+          this.db.prepare('UPDATE sync_state SET hlc_last = ? WHERE id = 1').run(effectiveHlcLast);
+        }
+        const maxLocal = Math.max(effectiveHlcLast, this.queryMaxLocalEntityHlc(existing.device_id));
         if (maxLocal > this.hlc.current()) {
           this.hlc.restore(maxLocal);
+        }
+        if (effectiveHlcLast !== existing.hlc_last) {
+          return { ...existing, hlc_last: effectiveHlcLast };
         }
       }
       return existing;
@@ -263,7 +271,12 @@ export class SqliteSyncStore implements SyncStore {
       const floorSub = patch.floors?.subscriptions ?? current.floor_subscriptions;
       const floorQueue = patch.floors?.queue ?? current.floor_queue;
       const floorProg = patch.floors?.progress ?? current.floor_progress;
-      const hlcLast = Math.max(current.hlc_last, patch.hlcLast ?? 0, this.hlc.current());
+      const maxAllowedHlc = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+      const clampedCurrentHlc = Math.min(current.hlc_last, maxAllowedHlc);
+      const hlcLast = Math.min(
+        Math.max(clampedCurrentHlc, patch.hlcLast ?? 0, this.hlc.current()),
+        maxAllowedHlc,
+      );
       const lastPullAt = 'lastPullAt' in patch ? (patch.lastPullAt ?? null) : current.last_pull_at;
       const lastPushAt = 'lastPushAt' in patch ? (patch.lastPushAt ?? null) : current.last_push_at;
       const lastErrorJson =
@@ -564,14 +577,12 @@ export class SqliteSyncStore implements SyncStore {
         existingProg.map((p) => [p.episode_key, p]),
       );
 
-      // Helper: collect active merged queue keys for a feed that are newer than a subscription tombstone/floor
-      const collectMergedPreserveQueueKeys = (
-        feedKey: FeedKey,
-        cutoff: HlcMs,
-      ): ReadonlySet<EpisodeKey> => {
+      // Helper: collect EVERY merged-active queue key for a feed so cascade never wipes
+      // downloads/episodes that Step 2 will keep active in the merged queue.
+      const collectMergedPreserveQueueKeys = (feedKey: FeedKey): ReadonlySet<EpisodeKey> => {
         const preserved = new Set<EpisodeKey>();
         for (const [epKey, q] of Object.entries(merged.queue.items)) {
-          if (q.feedKey === feedKey && !q.removed && q.updatedAt > cutoff) {
+          if (q.feedKey === feedKey && !q.removed) {
             preserved.add(epKey);
           }
         }
@@ -679,7 +690,7 @@ export class SqliteSyncStore implements SyncStore {
         } else {
           // Winner is deleted tombstone
           if (localRow.subscribed !== 0 || localRow.deleted_at === null) {
-            const preserveQueueKeys = collectMergedPreserveQueueKeys(feedKey, winSub.updatedAt);
+            const preserveQueueKeys = collectMergedPreserveQueueKeys(feedKey);
             const dlPaths = this.feedsRepo.softDeleteUnsubscribe(
               feedKey,
               this.hlc,
@@ -712,7 +723,7 @@ export class SqliteSyncStore implements SyncStore {
         if (localRow.subscribed === 0 && localRow.deleted_at === null) continue; // stub
         if (!(localRow.feed_key in merged.subscriptions.items)) {
           const floorStamp = Math.max(merged.subscriptions.floor, localRow.updated_at);
-          const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feed_key, floorStamp);
+          const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feed_key);
           if (localRow.subscribed !== 0) {
             const dlPaths = this.feedsRepo.softDeleteUnsubscribe(
               localRow.feed_key,
@@ -876,22 +887,27 @@ export class SqliteSyncStore implements SyncStore {
         }
       }
 
-      // Raise floors monotonically
+      // Raise floors monotonically and persist bounded local HLC
       const curState = this.ensureSyncStateRow('MiniPod Desktop');
+      const maxAllowedHlc = Date.now() + HLC_MAX_FORWARD_SKEW_MS;
+      const nextHlcLast = Math.min(
+        Math.max(Math.min(curState.hlc_last, maxAllowedHlc), this.hlc.current()),
+        maxAllowedHlc,
+      );
       this.db
         .prepare(
           `UPDATE sync_state SET
              floor_subscriptions = MAX(floor_subscriptions, ?),
              floor_queue = MAX(floor_queue, ?),
              floor_progress = MAX(floor_progress, ?),
-             hlc_last = MAX(hlc_last, ?)
+             hlc_last = ?
            WHERE id = 1`,
         )
         .run(
           merged.subscriptions.floor,
           merged.queue.floor,
           merged.progress.floor,
-          Math.max(this.hlc.current(), curState.hlc_last),
+          nextHlcLast,
         );
     });
 

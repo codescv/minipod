@@ -569,7 +569,7 @@ export type SyncEntityMaps = Pick<SyncDocument, 'subscriptions' | 'queue' | 'pro
 export type ProviderId = 'local-folder' | 'saf' | 'drive-appdata' | 'drive-file' | 'webdav' | 'gist';
 
 export type ReadResult =
-  | { readonly kind: 'not-modified' }
+  | { readonly kind: 'not-modified'; readonly etag?: string }
   | { readonly kind: 'missing' }
   | { readonly kind: 'blob'; readonly bytes: Uint8Array; readonly etag: string | null; readonly lastModified?: EpochMs };
 

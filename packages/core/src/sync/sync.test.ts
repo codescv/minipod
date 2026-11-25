@@ -849,7 +849,7 @@ describe('sync/providers contract suite (HostFile, GoogleDrive, WebDAV, GitHubGi
             .map((f) => ({ id: f.id, name: f.name, md5Checksum: f.md5 }));
           return makeHttpResponse(200, JSON.stringify({ files: list }));
         }
-        // File get / delete
+        // File get / trash / delete
         const fileMatch = /\/drive\/v3\/files\/([^/]+)$/.exec(u.pathname);
         if (fileMatch) {
           const id = decodeURIComponent(fileMatch[1]!);
@@ -858,6 +858,13 @@ describe('sync/providers contract suite (HostFile, GoogleDrive, WebDAV, GitHubGi
           if (req.method === 'DELETE') {
             this.files.delete(id);
             return makeHttpResponse(204, '');
+          }
+          if (req.method === 'PATCH') {
+            const patchBody = JSON.parse(String(req.body ?? '{}')) as { trashed?: boolean };
+            if (patchBody.trashed) {
+              this.files.delete(id);
+              return makeHttpResponse(200, JSON.stringify({ id: existing.id, trashed: true }));
+            }
           }
           if (u.searchParams.get('alt') === 'media') {
             return makeHttpResponse(200, existing.bytes);

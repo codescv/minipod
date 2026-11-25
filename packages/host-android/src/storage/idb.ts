@@ -28,7 +28,7 @@ import {
 } from '@minipod/core';
 
 export const MINIPOD_IDB_NAME = 'minipod';
-export const MINIPOD_IDB_VERSION = 1;
+export const MINIPOD_IDB_VERSION = 2;
 
 export interface IdbFeedRecord {
   readonly feedKey: FeedKey;
@@ -151,6 +151,7 @@ export interface MiniPodDbSchema extends DBSchema {
     indexes: {
       subscribed: number;
       lastEpisodeAt: number;
+      bySyncDirty: number;
     };
   };
   episodes: {
@@ -222,6 +223,12 @@ export async function openMiniPodDb(
       db.createObjectStore('chapters', { keyPath: 'episodeKey' });
       db.createObjectStore('syncState', { keyPath: 'id' });
       db.createObjectStore('settings', { keyPath: 'key' });
+    }
+    if (event.oldVersion < 2) {
+      const feeds = request.transaction!.objectStore('feeds');
+      if (!feeds.indexNames.contains('bySyncDirty')) {
+        feeds.createIndex('bySyncDirty', 'syncDirty');
+      }
     }
   };
   return (await wrap(request)) as unknown as MiniPodDb;

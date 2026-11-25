@@ -16,6 +16,7 @@ export interface HostFileProviderDeps {
   readonly id: 'local-folder' | 'saf';
   readonly access: HostFileAccess;
   readonly now?: () => number;
+  readonly platform?: string;
 }
 
 type ParsedEtag =
@@ -96,16 +97,20 @@ function isBlankBytes(bytes: Uint8Array): boolean {
 
 /**
  * Classifies persistent permission/configuration errors as non-retryable (`sync-auth`),
- * while treating transient filesystem states (`ENOENT` on unmounted drives, Windows `EPERM`/`EBUSY`)
- * as retryable (`network`) (SYNC-P2-08).
+ * while treating transient filesystem states (`ENOENT` on unmounted drives, `EBUSY`,
+ * and Windows `EPERM`) as retryable (`network`). On non-win32 (e.g. macOS TCC), `EPERM`
+ * is treated as non-retryable `sync-auth` (SYNC-P2-08).
  */
-function isNonRetryableFsError(err: unknown): boolean {
+function isNonRetryableFsError(err: unknown, platform?: string): boolean {
   if (err instanceof MiniPodError) {
     return err.code === 'sync-auth' || err.code === 'invalid-argument';
   }
+  const effectivePlatform =
+    platform ?? (globalThis as { process?: { platform?: string } }).process?.platform;
+  const isWin32 = effectivePlatform === 'win32';
   if (err && typeof err === 'object') {
     const code = (err as { code?: unknown }).code;
-    if (code === 'EACCES' || code === 'ENOTDIR') {
+    if (code === 'EACCES' || code === 'ENOTDIR' || (code === 'EPERM' && !isWin32)) {
       return true;
     }
     const name = (err as { name?: unknown }).name;
@@ -135,6 +140,7 @@ export class HostFileProvider implements CloudFileProvider {
 
   private readonly access: HostFileAccess;
   private readonly now: () => number;
+  private readonly platform?: string;
   private writeInProgress = false;
   private lastWrittenHash: string | null = null;
   private lastWrittenStat: { readonly mtimeMs: number; readonly size: number } | null = null;
@@ -143,6 +149,9 @@ export class HostFileProvider implements CloudFileProvider {
     this.id = deps.id;
     this.access = deps.access;
     this.now = deps.now ?? Date.now;
+    if (deps.platform !== undefined) {
+      this.platform = deps.platform;
+    }
     if (deps.access.watch) {
       this.watch = (onChange: () => void): Unsubscribe => {
         return this.access.watch!(() => {
@@ -199,7 +208,7 @@ export class HostFileProvider implements CloudFileProvider {
       }
       return { ok: true, exists: true, etag: legacySyntheticEtag(st) };
     } catch (err) {
-      const code = isNonRetryableFsError(err) ? 'sync-auth' : 'network';
+      const code = isNonRetryableFsError(err, this.platform) ? 'sync-auth' : 'network';
       return {
         ok: false,
         exists: false,
@@ -238,6 +247,7 @@ export class HostFileProvider implements CloudFileProvider {
       // Read bytes with pre/post stat consistency check to prevent torn (bytes, etag) pairs (SYNC-P1-01)
       let bytes: Uint8Array = new Uint8Array(0);
       let effectiveSt: { readonly size: number; readonly mtimeMs: number } = initialSt;
+      let statConsistent = false;
 
       for (let attempt = 0; attempt < MAX_READ_CONSISTENCY_ATTEMPTS; attempt++) {
         if (signal?.aborted) throw new MiniPodError('cancelled', 'Read cancelled');
@@ -252,15 +262,16 @@ export class HostFileProvider implements CloudFileProvider {
           preSt.mtimeMs > 0 ||
           preSt.size > 0 ||
           (postSt !== null && (postSt.mtimeMs > 0 || postSt.size > 0));
-        if (
-          postSt !== null &&
-          hasMeaningfulStat &&
-          !statsMatch(preSt, postSt) &&
-          attempt + 1 < MAX_READ_CONSISTENCY_ATTEMPTS
-        ) {
-          continue;
+        const torn = postSt !== null && hasMeaningfulStat && !statsMatch(preSt, postSt);
+        if (torn) {
+          if (attempt + 1 < MAX_READ_CONSISTENCY_ATTEMPTS) {
+            continue;
+          }
+          // All consistency attempts were torn: never pair potentially stale bytes with a strong stat ETag.
+          throw new MiniPodError('network', 'Sync file changed concurrently during read');
         }
 
+        statConsistent = postSt !== null;
         effectiveSt = postSt
           ? {
               size: postSt.size > 0 ? postSt.size : bytes.byteLength,
@@ -280,6 +291,13 @@ export class HostFileProvider implements CloudFileProvider {
         (parsedIfNoneMatch.kind === 'strong' || parsedIfNoneMatch.kind === 'racy') &&
         parsedIfNoneMatch.hash === hash
       ) {
+        // Upgrade racy (or re-touched) ETag to strong stat-skippable ETag once stat is consistent and >= 2s old.
+        if (statConsistent) {
+          const candidate = buildV2Etag(effectiveSt, hash, this.now());
+          if (candidate !== ifNoneMatch && parseEtag(candidate).kind === 'strong') {
+            return { kind: 'not-modified', etag: candidate };
+          }
+        }
         return { kind: 'not-modified' };
       }
 
@@ -292,7 +310,7 @@ export class HostFileProvider implements CloudFileProvider {
       };
     } catch (err) {
       if (err instanceof MiniPodError) throw err;
-      throw MiniPodError.wrap(err, isNonRetryableFsError(err) ? 'sync-auth' : 'network');
+      throw MiniPodError.wrap(err, isNonRetryableFsError(err, this.platform) ? 'sync-auth' : 'network');
     }
   }
 
@@ -361,7 +379,7 @@ export class HostFileProvider implements CloudFileProvider {
       return {
         kind: 'failed',
         cause: err,
-        retryable: !isNonRetryableFsError(err),
+        retryable: !isNonRetryableFsError(err, this.platform),
       };
     }
   }
