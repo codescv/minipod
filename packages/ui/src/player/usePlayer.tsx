@@ -181,9 +181,11 @@ export function PlayerProvider({
    */
   const completedEpisodeKeyRef = useRef<string | null>(null);
   /**
-   * One-shot token suppressing echoing programmatic sync/Undo/journal-reconcile `engine.seekTo()`
-   * calls back to `host.progress.save()`, eliminating cross-device seek ping-pong without
-   * swallowing subsequent real user or lock-screen seeks (SYNC-P1-05).
+   * Suppresses echoing programmatic sync/Undo/journal-reconcile `engine.seekTo()` calls back to
+   * `host.progress.save()`, eliminating cross-device seek ping-pong across both HTML and Android
+   * `NativeAudioEngine` event orders (`state` -> `position@target` -> async `state{seeked:true}`
+   * and optional `SEEK_ADJUSTMENT` echo) without swallowing real user/lock-screen seeks to other
+   * positions (SYNC-P1-05).
    */
   const suppressSeekSaveRef = useRef<{
     readonly episodeKey: string;
@@ -196,19 +198,14 @@ export function PlayerProvider({
    */
   const hasUnsavedLocalPlaybackRef = useRef(false);
 
-  const consumeSeekSaveSuppression = useCallback((episodeKey: string, positionMs: number): boolean => {
+  const isProgrammaticSeekSuppressed = useCallback((episodeKey: string, positionMs: number): boolean => {
     const s = suppressSeekSaveRef.current;
     if (!s) return false;
     if (Date.now() >= s.expiresAtMs) {
       suppressSeekSaveRef.current = null;
       return false;
     }
-    if (s.episodeKey !== episodeKey) return false;
-    if (Math.abs(positionMs - s.targetPositionMs) <= 2000) {
-      suppressSeekSaveRef.current = null;
-      return true;
-    }
-    return false;
+    return s.episodeKey === episodeKey && Math.abs(positionMs - s.targetPositionMs) <= 2000;
   }, []);
 
   const suppressProgrammaticSeekSave = useCallback(
@@ -509,7 +506,7 @@ export function PlayerProvider({
           ev.seeked &&
           nextSnap.episodeKey &&
           completedEpisodeKeyRef.current !== nextSnap.episodeKey &&
-          !consumeSeekSaveSuppression(nextSnap.episodeKey, nextSnap.positionMs)
+          !isProgrammaticSeekSuppressed(nextSnap.episodeKey, nextSnap.positionMs)
         ) {
           const dur = nextSnap.durationMs ?? episodeRef.current?.durationMs;
           if (!isEpisodeNearEnd(nextSnap.positionMs, dur)) {
@@ -555,7 +552,7 @@ export function PlayerProvider({
           positionMs: ev.positionMs,
           ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
         }));
-        const suppressed = consumeSeekSaveSuppression(ev.episodeKey, ev.positionMs);
+        const suppressed = isProgrammaticSeekSuppressed(ev.episodeKey, ev.positionMs);
         if (engine.getSnapshot().playing && !suppressed) {
           hasUnsavedLocalPlaybackRef.current = true;
         }
@@ -665,7 +662,7 @@ export function PlayerProvider({
         })();
       }
     });
-  }, [engine, host, saveProgressSafe, isTransientZero, consumeSeekSaveSuppression]);
+  }, [engine, host, saveProgressSafe, isTransientZero, isProgrammaticSeekSuppressed]);
 
   // Hydrate the current episode when the engine already has an active/paused track (e.g. the
   // WebView reloaded while `PlaybackService` kept a paused episode).

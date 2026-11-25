@@ -303,7 +303,7 @@ export class FeedRefresher {
 
     let targetFeedKey = row.feed_key;
     let moved = false;
-    if (newPermUrl && newPermUrl !== fetchUrl) {
+    if (wasSubscribedBeforeFetch && newPermUrl && newPermUrl !== fetchUrl) {
       targetFeedKey = this.feedsRepo.recordPermanentMove(
         row.feed_key,
         newPermUrl,
@@ -313,7 +313,7 @@ export class FeedRefresher {
       moved = true;
     }
 
-    const effectiveUrl = newPermUrl ?? fetchUrl;
+    const effectiveUrl = wasSubscribedBeforeFetch ? (newPermUrl ?? fetchUrl) : fetchUrl;
     const upsertRes = this.feedsRepo.upsertParsedFeed({
       feedKey: targetFeedKey,
       kind: 'RSS',
@@ -327,7 +327,7 @@ export class FeedRefresher {
       nowWallMs: nowMs,
       etag: resp.headers['etag'],
       lastModified: resp.headers['last-modified'],
-      ...(newPermUrl ? { movedTo: newPermUrl } : {}),
+      ...(wasSubscribedBeforeFetch && newPermUrl ? { movedTo: newPermUrl } : {}),
       ...(moved ? { markSyncDirty: true } : {}),
     });
     if (upsertRes.skipped) {

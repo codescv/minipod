@@ -1279,7 +1279,7 @@ export async function createCapacitorPlatformHost(
         const st = await syncStore.getSyncState();
         let targetKey = feedKey;
         let moved = false;
-        if (newPermUrl && newPermUrl !== fetchUrl) {
+        if (wasSubscribedBeforeFetch && newPermUrl && newPermUrl !== fetchUrl) {
           targetKey = await syncStore.recordPermanentMove(feedKey, newPermUrl, st.deviceId);
           moved = true;
         }
@@ -1287,7 +1287,7 @@ export async function createCapacitorPlatformHost(
         await syncStore.upsertParsedFeed({
           feedKey: targetKey,
           kind: 'RSS',
-          url: newPermUrl ?? fetchUrl,
+          url: wasSubscribedBeforeFetch ? (newPermUrl ?? fetchUrl) : fetchUrl,
           subscribed: wasSubscribedBeforeFetch,
           preserveSubscriptionState: true,
           requireSubscribed: wasSubscribedBeforeFetch,
@@ -1298,7 +1298,7 @@ export async function createCapacitorPlatformHost(
           ...(resp.headers['last-modified'] !== undefined
             ? { lastModified: resp.headers['last-modified'] }
             : {}),
-          ...(newPermUrl !== undefined ? { movedTo: newPermUrl } : {}),
+          ...(wasSubscribedBeforeFetch && newPermUrl !== undefined ? { movedTo: newPermUrl } : {}),
           ...(moved ? { markSyncDirty: true } : {}),
         });
 

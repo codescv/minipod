@@ -174,8 +174,46 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const snackbar = await screen.findByTestId('snackbar');
     expect(snackbar).toHaveTextContent('Resumed from Pixel 9 at 15:00');
 
-    // One-shot seek suppression: a real lock-screen/OS seek immediately after programmatic sync seek
-    // MUST still be persisted (not swallowed by a fixed 2s window)!
+    // NativeAudioEngine event order: `state` (no seeked) -> `position@target` -> async `state{seeked:true}`
+    // echo #1 -> optional `SEEK_ADJUSTMENT` `state{seeked:true}` echo #2 MUST ALL be suppressed (zero ping-pong!)
+    const durForEcho = engine.getSnapshot().durationMs;
+    act(() => {
+      engine.emitRawState({
+        episodeKey: loadedKey,
+        playing: false,
+        buffering: false,
+        positionMs: 900_000,
+        speed: 1,
+        ...(durForEcho !== undefined ? { durationMs: durForEcho } : {}),
+      });
+      engine.emitPosition(900_000);
+      engine.emitRawState(
+        {
+          episodeKey: loadedKey,
+          playing: false,
+          buffering: false,
+          positionMs: 900_000,
+          speed: 1,
+          ...(durForEcho !== undefined ? { durationMs: durForEcho } : {}),
+        },
+        { seeked: true },
+      );
+      engine.emitRawState(
+        {
+          episodeKey: loadedKey,
+          playing: false,
+          buffering: false,
+          positionMs: 900_400,
+          speed: 1,
+          ...(durForEcho !== undefined ? { durationMs: durForEcho } : {}),
+        },
+        { seeked: true },
+      );
+    });
+    expect(host.progressSaves.length).toBe(savesBeforePausedSync);
+
+    // Real lock-screen/OS seek to a different position (>2s away) within the same window
+    // MUST still be persisted immediately!
     const savesBeforeOsSeek = host.progressSaves.length;
     act(() => {
       engine.emitRawState(
@@ -185,9 +223,7 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
           buffering: false,
           positionMs: 1_200_000,
           speed: 1,
-          ...(engine.getSnapshot().durationMs !== undefined
-            ? { durationMs: engine.getSnapshot().durationMs }
-            : {}),
+          ...(durForEcho !== undefined ? { durationMs: durForEcho } : {}),
         },
         { seeked: true },
       );
