@@ -191,11 +191,23 @@ export class DesktopDriveAuthManager {
       body: form.toString(),
     });
 
-    const parsed = JSON.parse(await resp.text()) as GoogleTokenResponse;
-    if (resp.status < 200 || resp.status >= 300 || !parsed.access_token) {
+    const rawText = await resp.text();
+    let parsed: GoogleTokenResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as GoogleTokenResponse;
+    } catch {
+      parsed = null;
+    }
+    if (resp.status >= 500 || resp.status === 429) {
+      throw new MiniPodError(
+        'network',
+        parsed?.error_description || parsed?.error || `Token exchange temporarily unavailable (HTTP ${resp.status})`,
+      );
+    }
+    if (resp.status < 200 || resp.status >= 300 || !parsed?.access_token) {
       throw new MiniPodError(
         'sync-auth',
-        parsed.error_description || parsed.error || `Token exchange failed (HTTP ${resp.status})`,
+        parsed?.error_description || parsed?.error || `Token exchange failed (HTTP ${resp.status})`,
       );
     }
 
@@ -257,11 +269,35 @@ export class DesktopDriveAuthManager {
       body: form.toString(),
     });
 
-    const parsed = JSON.parse(await resp.text()) as GoogleTokenResponse;
-    if (resp.status === 400 || resp.status === 401 || !parsed.access_token) {
+    const rawText = await resp.text();
+    let parsed: GoogleTokenResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as GoogleTokenResponse;
+    } catch {
+      parsed = null;
+    }
+    if (resp.status >= 500 || resp.status === 429) {
+      throw new MiniPodError(
+        'network',
+        parsed?.error_description || parsed?.error || `Token refresh temporarily unavailable (HTTP ${resp.status})`,
+      );
+    }
+    if (resp.status === 400 || resp.status === 401) {
       throw new MiniPodError(
         'sync-auth',
-        parsed.error_description || parsed.error || `Token refresh rejected (HTTP ${resp.status})`,
+        parsed?.error_description || parsed?.error || `Token refresh rejected (HTTP ${resp.status})`,
+      );
+    }
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new MiniPodError(
+        'network',
+        parsed?.error_description || parsed?.error || `Token refresh failed (HTTP ${resp.status})`,
+      );
+    }
+    if (!parsed?.access_token) {
+      throw new MiniPodError(
+        'sync-auth',
+        parsed?.error_description || parsed?.error || `Token refresh returned no access token (HTTP ${resp.status})`,
       );
     }
 

@@ -138,25 +138,68 @@ describe('Player Controls, Chapters, Sleep Timer, Cross-Device Resume Undo & Htm
     const loadedKey = engine.getSnapshot().episodeKey!;
     const localPos = engine.getSnapshot().positionMs;
 
-    // 1. Cross-device resume hint ("Resumed from Pixel 9 at 15:00 — Undo")
+    // 1a. While actively playing, cross-device resume hint MUST NOT interrupt playback with `seekTo`;
+    // instead it offers a manual Jump snackbar button (SYNC-P1-05).
+    const savesBeforePlayingSync = host.progressSaves.length;
+    act(() => {
+      host.simulateRemoteProgress(loadedKey, 900_000, 'Pixel 9');
+    });
+    expect(engine.getSnapshot().positionMs).toBe(localPos);
+    expect(host.progressSaves.length).toBe(savesBeforePlayingSync);
+    const playingSnackbar = await screen.findByTestId('snackbar');
+    expect(playingSnackbar).toHaveTextContent('Pixel 9 is at 15:00');
+    expect(screen.getByTestId('snackbar-action')).toHaveTextContent('Jump');
+
+    // 1b. While paused, cross-device resume hint auto-seeks WITHOUT echoing `host.progress.save`
+    // (zero ping-pong, SYNC-P1-05) and shows Undo snackbar.
+    act(() => {
+      engine.pause();
+    });
+    await waitFor(() => expect(engine.getSnapshot().playing).toBe(false));
+    const pausedPos = engine.getSnapshot().positionMs;
+    const savesBeforePausedSync = host.progressSaves.length;
+
     act(() => {
       host.simulateRemoteProgress(loadedKey, 900_000, 'Pixel 9');
     });
 
     expect(engine.getSnapshot().positionMs).toBe(900_000);
+    expect(host.progressSaves.length).toBe(savesBeforePausedSync);
     const snackbar = await screen.findByTestId('snackbar');
     expect(snackbar).toHaveTextContent('Resumed from Pixel 9 at 15:00');
 
-    // Clicking Undo seeks back to localPos and invokes `host.sync.undoResume`
+    // Clicking Undo seeks back to pausedPos and invokes `host.sync.undoResume` (and NOT plain `progress.save`)
     fireEvent.click(screen.getByTestId('snackbar-action'));
-    expect(engine.getSnapshot().positionMs).toBe(localPos);
+    expect(engine.getSnapshot().positionMs).toBe(pausedPos);
     await waitFor(() => {
       expect(
         host.progressSaves.some(
-          (s) => s.episodeKey === loadedKey && s.positionMs === localPos && s.flush === true,
+          (s) => s.episodeKey === loadedKey && s.positionMs === pausedPos && s.flush === true,
         ),
       ).toBe(true);
     });
+    // Only the single undoResume call was recorded (no extra non-flush progress.save echo)
+    expect(host.progressSaves.length).toBe(savesBeforePausedSync + 1);
+
+    // 1c. Receiving `fromSync` PLAYED while paused suppresses `pagehide` IN_PROGRESS flush (SYNC-P1-06)
+    const savesBeforePlayedSync = host.progressSaves.length;
+    act(() => {
+      host.emit({
+        type: 'progress-changed',
+        episodeKey: loadedKey,
+        fromSync: { deviceName: 'Pixel 9', positionMs: 0, state: 'PLAYED' },
+      });
+    });
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+    expect(host.progressSaves.length).toBe(savesBeforePlayedSync);
+
+    // Resume playback for sleep timer assertions below
+    await act(async () => {
+      await engine.play();
+    });
+    await waitFor(() => expect(engine.getSnapshot().playing).toBe(true));
 
     // 2. Sleep timer 15 min: fades volume in final 60s and pauses at 0s
     fireEvent.click(screen.getByTestId('desktop-sleep-btn'));

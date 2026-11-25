@@ -175,6 +175,8 @@ export const en: Messages = {
   'player.shownotes': 'Shownotes',
   'player.noShownotes': 'No episode notes available',
   'player.resumedFrom': 'Resumed from {device} at {time}',
+  'player.syncPositionAvailable': '{device} is at {time}',
+  'player.jumpToSync': 'Jump',
 
   'sleep.title': 'Sleep timer',
   'sleep.off': 'Off',

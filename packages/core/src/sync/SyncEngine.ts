@@ -8,6 +8,7 @@ import type {
   HlcMs,
   LocalSyncSnapshot,
   MiniPodErrorShape,
+  SyncDevice,
   SyncDocument,
   SyncReason,
   SyncState,
@@ -28,6 +29,7 @@ import {
 const MAX_CONFLICT_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 60_000;
 const BACKOFF_MAX_MS = 60 * 60_000;
+const DEVICE_HEARTBEAT_MS = 24 * 60 * 60_000;
 
 export interface SyncEngineDeps {
   readonly store: SyncStore;
@@ -79,6 +81,18 @@ function hasDirtyBelowFloors(
   return false;
 }
 
+function shouldNotifyDecisions(decisions: ApplyDecisions): boolean {
+  return (
+    decisions.resumeHints.length > 0 ||
+    decisions.feedsToRefresh.length > 0 ||
+    Boolean(
+      decisions.changed?.subscriptions ||
+        decisions.changed?.queue ||
+        decisions.changed?.progress,
+    )
+  );
+}
+
 function buildLocalSyncDocument(
   snap: LocalSyncSnapshot,
   state: SyncState,
@@ -86,12 +100,14 @@ function buildLocalSyncDocument(
   lastSeenAt: EpochMs,
 ): SyncDocument {
   const deviceName = state.deviceName || snap.device.name;
-  const deviceEntry = {
+  const deviceEntry: SyncDevice = {
     name: deviceName,
     app: snap.device.app,
     lastSeenAt,
   };
-  const devices: Record<DeviceId, typeof deviceEntry> = {
+  // Preserve known remote devices so 304 + dirty uploads never wipe other devices' GC watermarks (SYNC-P0-04).
+  const devices: Record<DeviceId, SyncDevice> = {
+    ...(state.remoteDevices ?? {}),
     [state.deviceId]: deviceEntry,
   };
   const entityHlc = computeEntityMapsHlcMax(snap.maps);
@@ -112,7 +128,10 @@ function buildLocalSyncDocument(
 }
 
 function extractProviderFileId(provider: CloudFileProvider): string | null {
-  const candidate = provider as unknown as { getFileId?: () => string | null; getGistId?: () => string | undefined };
+  const candidate = provider as unknown as {
+    getFileId?: () => string | null;
+    getGistId?: () => string | undefined;
+  };
   if (typeof candidate.getFileId === 'function') {
     return candidate.getFileId();
   }
@@ -120,6 +139,19 @@ function extractProviderFileId(provider: CloudFileProvider): string | null {
     return candidate.getGistId() ?? null;
   }
   return null;
+}
+
+function computeDriveFingerprintPatch(
+  provider: CloudFileProvider,
+  providerFileId: string | null,
+): Partial<SyncState> {
+  if (
+    providerFileId &&
+    (provider.id === 'drive-appdata' || provider.id === 'drive-file')
+  ) {
+    return { lastRemoteFingerprint: `${provider.id}:${providerFileId}` };
+  }
+  return {};
 }
 
 /**
@@ -154,10 +186,14 @@ export class SyncEngine {
   private readonly onCorruptRemote?: (bytes: Uint8Array, error: MiniPodError) => void | Promise<void>;
 
   private syncing = false;
+  private providerEpoch = 0;
+  private activeAbort: AbortController | null = null;
   private activeCycle: Promise<SyncRunResult> | null = null;
   private rerunRequested = false;
   private rerunBypassBackoff = false;
   private rerunReason: SyncReason = 'manual';
+  private rerunSignal: AbortSignal | undefined;
+  private rerunOnCycleStart: (() => void) | undefined;
 
   private consecutiveFailures = 0;
   private needsAttention = false;
@@ -188,10 +224,36 @@ export class SyncEngine {
   }
 
   setProvider(provider: CloudFileProvider | null): void {
+    this.providerEpoch += 1;
+    this.activeAbort?.abort();
+    this.activeAbort = null;
+    this.rerunRequested = false;
+    this.rerunBypassBackoff = false;
+    this.rerunSignal = undefined;
+    this.rerunOnCycleStart = undefined;
+
     this.provider = provider;
     this.consecutiveFailures = 0;
     this.needsAttention = false;
     this.errorClearedSinceLoad = provider !== null;
+  }
+
+  /**
+   * Waits for any in-flight sync cycle to finish unwinding (used by `configure`, `disconnect`,
+   * and `dispose` so stale cycles never mutate freshly configured state or a closing DB).
+   */
+  async drainActiveCycle(): Promise<void> {
+    while (this.activeCycle) {
+      const current = this.activeCycle;
+      try {
+        await current;
+      } catch {
+        // Ignore errors from aborted/draining cycle
+      }
+      if (this.activeCycle === current) {
+        break;
+      }
+    }
   }
 
   isSyncing(): boolean {
@@ -199,16 +261,19 @@ export class SyncEngine {
   }
 
   async getDirtyCount(): Promise<number> {
+    if (this.store.getDirtyCount) {
+      return this.store.getDirtyCount();
+    }
     const snap = await this.store.loadLocalDoc();
     return countDirty(snap);
   }
 
   async getStatus(): Promise<SyncStatus> {
-    const [state, snap] = await Promise.all([
+    const [state, dirtyCount] = await Promise.all([
       this.store.getSyncState(),
-      this.store.loadLocalDoc(),
+      this.getDirtyCount(),
     ]);
-    return this.computeStatus(state, countDirty(snap));
+    return this.computeStatus(state, dirtyCount);
   }
 
   private computeStatus(state: SyncState, dirtyCount: number): SyncStatus {
@@ -284,15 +349,16 @@ export class SyncEngine {
       if (bypass) {
         this.rerunBypassBackoff = true;
       }
+      this.rerunSignal = options?.signal;
+      if (options?.onCycleStart) {
+        this.rerunOnCycleStart = options.onCycleStart;
+      }
       return this.activeCycle;
     }
 
-    this.activeCycle = this.runLoop(reason, bypass, options);
-    try {
-      return await this.activeCycle;
-    } finally {
-      this.activeCycle = null;
-    }
+    const cyclePromise = this.runLoop(reason, bypass, options);
+    this.activeCycle = cyclePromise;
+    return await cyclePromise;
   }
 
   private async runLoop(
@@ -302,20 +368,35 @@ export class SyncEngine {
   ): Promise<SyncRunResult> {
     let reason = initialReason;
     let bypass = initialBypass;
+    let signal = options?.signal;
+    let onCycleStart = options?.onCycleStart;
     let lastResult: SyncRunResult | undefined;
 
-    // Loop while a mid-cycle caller set `rerunRequested`
-    for (;;) {
-      this.rerunRequested = false;
-      this.rerunBypassBackoff = false;
-      options?.onCycleStart?.();
-      lastResult = await this.executeSingleCycle(reason, bypass, options?.signal);
+    try {
+      // Loop while a mid-cycle caller set `rerunRequested`
+      for (;;) {
+        this.rerunRequested = false;
+        this.rerunBypassBackoff = false;
+        this.rerunSignal = undefined;
+        this.rerunOnCycleStart = undefined;
 
-      if (!this.rerunRequested || options?.signal?.aborted) {
-        return lastResult;
+        onCycleStart?.();
+        lastResult = await this.executeSingleCycle(reason, bypass, signal);
+
+        const nextSignal = this.rerunSignal as AbortSignal | undefined;
+        if (!this.rerunRequested || nextSignal?.aborted) {
+          // Clear `activeCycle` synchronously before resolving so callers queued in the
+          // microtask gap start a fresh cycle rather than attaching to an already-ending one (SYNC-P2-02).
+          this.activeCycle = null;
+          return lastResult;
+        }
+        reason = this.rerunReason;
+        bypass = this.rerunBypassBackoff;
+        signal = nextSignal;
+        onCycleStart = (this.rerunOnCycleStart as (() => void) | undefined) ?? options?.onCycleStart;
       }
-      reason = this.rerunReason;
-      bypass = this.rerunBypassBackoff;
+    } finally {
+      this.activeCycle = null;
     }
   }
 
@@ -324,75 +405,110 @@ export class SyncEngine {
     bypassBackoff: boolean,
     signal?: AbortSignal,
   ): Promise<SyncRunResult> {
+    const epoch = this.providerEpoch;
+    const isStale = (): boolean => epoch !== this.providerEpoch;
+
     const provider = this.provider;
     if (!provider) {
       const status = await this.getStatus();
       return { status, pulled: false, uploaded: false, skipped: true };
     }
 
-    const initialState = await this.store.getSyncState();
-    if (initialState.hlcLast > this.hlc.current()) {
-      this.hlc.observe(initialState.hlcLast);
-    }
-
-    const nowMs = this.now();
-    const initialSnap = await this.store.loadLocalDoc();
-    const initialDirty = countDirty(initialSnap);
-
-    // Respect needs-attention and exponential backoff for automatic triggers (§9.3)
-    if (!bypassBackoff) {
-      const effectiveError = this.errorClearedSinceLoad ? undefined : initialState.lastError;
-      const inNeedsAttention =
-        this.needsAttention ||
-        (effectiveError !== undefined &&
-          (effectiveError.code === 'sync-auth' || effectiveError.code === 'sync-schema'));
-      if (inNeedsAttention) {
-        const status = this.computeStatus(initialState, initialDirty);
-        return { status, pulled: false, uploaded: false, skipped: true };
-      }
-
-      if (
-        !this.errorClearedSinceLoad &&
-        initialState.backoffUntil !== undefined &&
-        initialState.backoffUntil > nowMs
-      ) {
-        const status = this.computeStatus(initialState, initialDirty);
-        return { status, pulled: false, uploaded: false, skipped: true };
-      }
-
-      // `'hidden'` trigger only pushes when dirty rows exist (§9.2)
-      if (reason === 'hidden' && initialDirty === 0) {
-        const status = this.computeStatus(initialState, initialDirty);
-        return { status, pulled: false, uploaded: false, skipped: true };
+    const cycleAbort = new AbortController();
+    this.activeAbort = cycleAbort;
+    const onExternalAbort = () => cycleAbort.abort();
+    if (signal) {
+      if (signal.aborted) {
+        cycleAbort.abort();
+      } else {
+        signal.addEventListener('abort', onExternalAbort, { once: true });
       }
     }
-
-    this.syncing = true;
-    this.emitStatus(this.computeStatus(initialState, initialDirty));
 
     let pulled = false;
     let uploaded = false;
 
+    const returnStale = async (): Promise<SyncRunResult> => {
+      const status = await this.getStatus();
+      return { status, pulled, uploaded, skipped: true };
+    };
+
     try {
+      const initialState = await this.store.getSyncState();
+      if (isStale()) return await returnStale();
+
+      // Restore persisted local HLC without +5m forward-skew clamping (SYNC-P2-01).
+      if (initialState.hlcLast > this.hlc.current()) {
+        this.hlc.restore(initialState.hlcLast);
+      }
+
+      const nowMs = this.now();
+      const initialSnap = await this.store.loadLocalDoc();
+      if (isStale()) return await returnStale();
+      const initialDirty = countDirty(initialSnap);
+
+      // Respect needs-attention and exponential backoff for automatic triggers (§9.3)
+      if (!bypassBackoff) {
+        const effectiveError = this.errorClearedSinceLoad ? undefined : initialState.lastError;
+        const inNeedsAttention =
+          this.needsAttention ||
+          (effectiveError !== undefined &&
+            (effectiveError.code === 'sync-auth' || effectiveError.code === 'sync-schema'));
+        if (inNeedsAttention) {
+          const status = this.computeStatus(initialState, initialDirty);
+          return { status, pulled: false, uploaded: false, skipped: true };
+        }
+
+        if (
+          !this.errorClearedSinceLoad &&
+          initialState.backoffUntil !== undefined &&
+          initialState.backoffUntil > nowMs
+        ) {
+          const status = this.computeStatus(initialState, initialDirty);
+          return { status, pulled: false, uploaded: false, skipped: true };
+        }
+
+        // `'hidden'` trigger only pushes when dirty rows exist (§9.2)
+        if (reason === 'hidden' && initialDirty === 0) {
+          const status = this.computeStatus(initialState, initialDirty);
+          return { status, pulled: false, uploaded: false, skipped: true };
+        }
+      }
+
+      this.syncing = true;
+      this.emitStatus(this.computeStatus(initialState, initialDirty));
+
       for (let attempt = 0; attempt < MAX_CONFLICT_ATTEMPTS; attempt++) {
-        if (signal?.aborted) {
+        if (isStale()) return await returnStale();
+        if (cycleAbort.signal.aborted) {
           throw new MiniPodError('cancelled', 'Sync cancelled');
         }
 
         const attemptNow = this.now();
         const state = attempt === 0 ? initialState : await this.store.getSyncState();
+        if (isStale()) return await returnStale();
         let localSnap = attempt === 0 ? initialSnap : await this.store.loadLocalDoc();
+        if (isStale()) return await returnStale();
         const dirtyTotal = countDirty(localSnap);
 
+        // If dirty and we have not yet cached remote `devices` (or a lineage reset is pending),
+        // force a full `blob` read instead of 304 so `devices` and `newLineage` are accurate (SYNC-P0-04, SYNC-P0-05).
+        const hasCachedRemoteDevices =
+          state.remoteDevices !== undefined && Object.keys(state.remoteDevices).length > 0;
+        const mustReadBlob =
+          (dirtyTotal > 0 && !hasCachedRemoteDevices) || state.pendingLineageReset === true;
+
         // On conflict retry (`attempt > 0`), pass `null` for `ifNoneMatch` so we always read fresh remote bytes
-        const ifNoneMatch = attempt === 0 ? state.remoteEtag : null;
-        const readResult = await provider.read(ifNoneMatch, signal);
+        const ifNoneMatch = attempt === 0 && !mustReadBlob ? state.remoteEtag : null;
+        const readResult = await provider.read(ifNoneMatch, cycleAbort.signal);
+        if (isStale()) return await returnStale();
 
         let remoteDoc: SyncDocument | null = null;
         let remoteMissing = false;
         let currentEtag: string | null = state.remoteEtag;
         let merged: SyncDocument;
         let shouldUpload = false;
+        let clearPendingLineageReset = false;
 
         if (readResult.kind === 'not-modified') {
           pulled = true;
@@ -407,18 +523,36 @@ export class SyncEngine {
                 hlcLast: this.hlc.current(),
               }),
             );
+            if (isStale()) return await returnStale();
             this.syncing = false;
             const finalStatus = await this.getStatus();
             this.emitStatus(finalStatus);
             return { status: finalStatus, pulled: true, uploaded: false, skipped: false };
           }
-          // Dirty rows exist and remote hasn't changed since last sync
+
+          // Dirty rows exist and remote hasn't changed since last sync.
+          // Still guard against dirty rows stamped <= known remote floors (e.g. clock lagging >5m, SYNC-P0-04).
+          if (hasDirtyBelowFloors(localSnap, state.floors)) {
+            const maxKnownFloor = Math.max(
+              state.floors.subscriptions,
+              state.floors.queue,
+              state.floors.progress,
+            );
+            await this.store.restampDirtyBelowFloor(state.floors, () =>
+              Math.max(this.hlc.now(), maxKnownFloor + 1),
+            );
+            if (isStale()) return await returnStale();
+            localSnap = await this.store.loadLocalDoc();
+            if (isStale()) return await returnStale();
+          }
+
           merged = buildLocalSyncDocument(localSnap, state, this.hlc.current(), attemptNow);
           shouldUpload = true;
         } else if (readResult.kind === 'missing') {
           pulled = true;
           remoteMissing = true;
           currentEtag = null;
+          clearPendingLineageReset = state.pendingLineageReset === true;
           merged = buildLocalSyncDocument(localSnap, state, this.hlc.current(), attemptNow);
           shouldUpload = true;
         } else {
@@ -428,10 +562,10 @@ export class SyncEngine {
           } catch (parseErr) {
             const schemaErr = MiniPodError.wrap(parseErr, 'sync-schema');
             // Never overwrite a corrupt or newer-schema remote document (§9.3)
-            if (!schemaErr.details?.['newerSchemaVersion']) {
+            if (!schemaErr.details?.['newerSchemaVersion'] && !isStale()) {
               await this.onCorruptRemote?.(readResult.bytes, schemaErr);
             }
-            return await this.recordFailure(schemaErr, false);
+            return await this.recordFailure(schemaErr, false, pulled, epoch);
           }
 
           pulled = true;
@@ -440,30 +574,69 @@ export class SyncEngine {
           // Fast-forward local HLC (capped at +5m drift in `hlc.observe`)
           this.hlc.observe(remoteDoc.hlcMax);
 
-          // §7.6 Before merge: re-stamp any dirty local rows sitting at/below remote floors
           const remoteFloors = {
             subscriptions: remoteDoc.subscriptions.floor,
             queue: remoteDoc.queue.floor,
             progress: remoteDoc.progress.floor,
           };
-          if (dirtyTotal > 0 && hasDirtyBelowFloors(localSnap, remoteFloors)) {
-            const maxRemoteFloor = Math.max(
-              remoteFloors.subscriptions,
-              remoteFloors.queue,
-              remoteFloors.progress,
+          const remoteKeys = {
+            subscriptions: new Set(Object.keys(remoteDoc.subscriptions.items)),
+            queue: new Set(Object.keys(remoteDoc.queue.items)),
+            progress: new Set(Object.keys(remoteDoc.progress.items)),
+          };
+
+          // Determine whether this device is joining a brand-new remote lineage (SYNC-P0-05).
+          const providerFileId = extractProviderFileId(provider);
+          const neverSyncedBefore =
+            state.remoteRev === 0 &&
+            state.lastPullAt === undefined &&
+            state.lastPushAt === undefined;
+          const remoteIdentityChanged =
+            (providerFileId !== null &&
+              state.remoteFileId !== null &&
+              providerFileId !== state.remoteFileId) ||
+            state.pendingLineageReset === true;
+          const newLineage =
+            !remoteDoc.devices[state.deviceId] && (neverSyncedBefore || remoteIdentityChanged);
+
+          const maxRemoteFloor = Math.max(
+            remoteFloors.subscriptions,
+            remoteFloors.queue,
+            remoteFloors.progress,
+          );
+
+          if (newLineage) {
+            // Bypass `dirtyTotal > 0` gate: protect clean live local rows absent from the new remote
+            // against being dropped by the new remote's higher floors.
+            if (maxRemoteFloor > 0) {
+              await this.store.restampDirtyBelowFloor(
+                remoteFloors,
+                () => Math.max(this.hlc.now(), maxRemoteFloor + 1),
+                { excludeKeys: remoteKeys, includeCleanLive: true },
+              );
+              if (isStale()) return await returnStale();
+              localSnap = await this.store.loadLocalDoc();
+              if (isStale()) return await returnStale();
+            }
+          } else if (dirtyTotal > 0 && hasDirtyBelowFloors(localSnap, remoteFloors)) {
+            // §7.6 Before merge: re-stamp dirty local rows absent from remote sitting at/below remote floors.
+            await this.store.restampDirtyBelowFloor(
+              remoteFloors,
+              () => Math.max(this.hlc.now(), maxRemoteFloor + 1),
+              { excludeKeys: remoteKeys },
             );
-            await this.store.restampDirtyBelowFloor(remoteFloors, () =>
-              Math.max(this.hlc.now(), maxRemoteFloor + 1),
-            );
+            if (isStale()) return await returnStale();
             localSnap = await this.store.loadLocalDoc();
+            if (isStale()) return await returnStale();
           }
 
-          // Refresh `lastSeenAt` only when uploading or >= 24h stale (§9.1)
+          clearPendingLineageReset = state.pendingLineageReset === true;
+
+          // Refresh `lastSeenAt` and trigger heartbeat upload if unregistered or >= 24h stale (SYNC-P2-04).
           const prevRemoteDevice = remoteDoc.devices[state.deviceId];
-          const lastSeenAt =
-            prevRemoteDevice && attemptNow - prevRemoteDevice.lastSeenAt < 24 * 60 * 60_000
-              ? prevRemoteDevice.lastSeenAt
-              : attemptNow;
+          const deviceHeartbeatStale =
+            !prevRemoteDevice || attemptNow - prevRemoteDevice.lastSeenAt >= DEVICE_HEARTBEAT_MS;
+          const lastSeenAt = deviceHeartbeatStale ? attemptNow : prevRemoteDevice.lastSeenAt;
 
           const localDoc = buildLocalSyncDocument(
             localSnap,
@@ -477,23 +650,54 @@ export class SyncEngine {
             merged,
             this.getCurrentEpisodeKey?.(),
           );
-          if (decisions.resumeHints.length > 0 || decisions.feedsToRefresh.length > 0) {
+          if (isStale()) return await returnStale();
+          if (shouldNotifyDecisions(decisions)) {
             await this.onDecisions?.(decisions);
+            if (isStale()) return await returnStale();
           }
 
-          // Upload decision compares entity maps ONLY (§9.1)
-          shouldUpload = !entityMapsEqual(merged, remoteDoc);
+          // If local writes raced with `provider.read()`, re-load & re-merge once so concurrent
+          // local edits are included in this upload rather than dropped (SYNC-P0-01).
+          if (decisions.hasConcurrentLocalEdits) {
+            localSnap = await this.store.loadLocalDoc();
+            if (isStale()) return await returnStale();
+            const refreshedLocalDoc = buildLocalSyncDocument(
+              localSnap,
+              state,
+              this.hlc.current(),
+              lastSeenAt,
+            );
+            merged = mergeSyncDocuments(refreshedLocalDoc, remoteDoc);
+            const decisions2 = await this.store.applyMerged(
+              merged,
+              this.getCurrentEpisodeKey?.(),
+            );
+            if (isStale()) return await returnStale();
+            if (shouldNotifyDecisions(decisions2)) {
+              await this.onDecisions?.(decisions2);
+              if (isStale()) return await returnStale();
+            }
+            if (decisions2.hasConcurrentLocalEdits) {
+              this.rerunRequested = true;
+              this.rerunReason = 'manual';
+            }
+          }
+
+          // Upload decision compares entity maps OR 24h read-only device heartbeat (§9.1 + SYNC-P2-04)
+          shouldUpload = !entityMapsEqual(merged, remoteDoc) || deviceHeartbeatStale;
         }
 
         if (!shouldUpload && !remoteMissing && remoteDoc !== null) {
           // Local already equals remote entity maps -> clear dirty, store etag/rev/floors, skip upload
           await this.store.markClean(merged);
+          if (isStale()) return await returnStale();
           const mergedFloors = {
             subscriptions: merged.subscriptions.floor,
             queue: merged.queue.floor,
             progress: merged.progress.floor,
           };
           await this.store.purgeBelowFloors(mergedFloors);
+          if (isStale()) return await returnStale();
 
           this.consecutiveFailures = 0;
           this.needsAttention = false;
@@ -506,10 +710,15 @@ export class SyncEngine {
               remoteFileId: providerFileId ?? state.remoteFileId,
               remoteRev: Math.max(remoteDoc.rev, state.remoteRev),
               floors: mergedFloors,
-              hlcLast: Math.max(this.hlc.current(), merged.hlcMax),
+              // Persist bounded local HLC only; never poison with unbounded remote `hlcMax` (SYNC-P2-01).
+              hlcLast: this.hlc.current(),
               lastPullAt: attemptNow,
+              remoteDevices: merged.devices,
+              ...(clearPendingLineageReset ? { pendingLineageReset: false } : {}),
+              ...computeDriveFingerprintPatch(provider, providerFileId),
             }),
           );
+          if (isStale()) return await returnStale();
 
           this.syncing = false;
           const finalStatus = await this.getStatus();
@@ -518,7 +727,7 @@ export class SyncEngine {
         }
 
         // Upload path: refresh writer `lastSeenAt`, run writer-side GC (§7.7), stamp envelope (§9.1)
-        const writerDevice = {
+        const writerDevice: SyncDevice = {
           name: state.deviceName || localSnap.device.name,
           app: localSnap.device.app,
           lastSeenAt: attemptNow,
@@ -551,17 +760,22 @@ export class SyncEngine {
         };
 
         const payload = serializeSyncDocument(docToUpload);
-        const writeRes = await provider.write(payload, currentEtag, signal);
+        const writeRes = await provider.write(payload, currentEtag, cycleAbort.signal);
+        if (isStale()) return await returnStale();
 
         if (writeRes.kind === 'ok') {
           uploaded = true;
-          await this.store.markClean(docToUpload);
+          // Pass pre-GC `withFreshWriter` so expired dirty tombstones/PLAYED entries folded into
+          // `newFloors` by GC are marked clean before `purgeBelowFloors` deletes them (SYNC-P1-04).
+          await this.store.markClean(withFreshWriter);
+          if (isStale()) return await returnStale();
           const newFloors = {
             subscriptions: docToUpload.subscriptions.floor,
             queue: docToUpload.queue.floor,
             progress: docToUpload.progress.floor,
           };
           await this.store.purgeBelowFloors(newFloors);
+          if (isStale()) return await returnStale();
 
           this.consecutiveFailures = 0;
           this.needsAttention = false;
@@ -574,11 +788,16 @@ export class SyncEngine {
               remoteFileId: providerFileId ?? state.remoteFileId,
               remoteRev: nextRev,
               floors: newFloors,
-              hlcLast: Math.max(this.hlc.current(), nextHlcMax),
+              // Persist bounded local HLC only (SYNC-P2-01).
+              hlcLast: this.hlc.current(),
               ...(pulled ? { lastPullAt: attemptNow } : {}),
               lastPushAt: attemptNow,
+              remoteDevices: docToUpload.devices,
+              ...(clearPendingLineageReset ? { pendingLineageReset: false } : {}),
+              ...computeDriveFingerprintPatch(provider, providerFileId),
             }),
           );
+          if (isStale()) return await returnStale();
 
           this.syncing = false;
           const finalStatus = await this.getStatus();
@@ -597,15 +816,17 @@ export class SyncEngine {
               `Sync conflict persisted after ${MAX_CONFLICT_ATTEMPTS} attempts`,
             ),
             true,
+            pulled,
+            epoch,
           );
         }
 
-        // `writeRes.kind === 'failed'`
-        const writeErr = MiniPodError.wrap(
-          writeRes.cause,
-          writeRes.retryable ? 'network' : 'sync-auth',
-        );
-        return await this.recordFailure(writeErr, writeRes.retryable);
+        // `writeRes.kind === 'failed'` — preserve original MiniPodError code (SYNC-P1-14)
+        const writeErr =
+          writeRes.cause instanceof MiniPodError
+            ? writeRes.cause
+            : MiniPodError.wrap(writeRes.cause, writeRes.retryable ? 'network' : 'sync-auth');
+        return await this.recordFailure(writeErr, writeRes.retryable, pulled, epoch);
       }
 
       // Unreachable fallback
@@ -613,6 +834,9 @@ export class SyncEngine {
       const status = await this.getStatus();
       return { status, pulled, uploaded, skipped: false };
     } catch (err) {
+      if (isStale()) {
+        return await returnStale();
+      }
       const wrapped = MiniPodError.wrap(err, 'network');
       if (wrapped.code === 'cancelled') {
         this.syncing = false;
@@ -624,14 +848,29 @@ export class SyncEngine {
         wrapped.code !== 'sync-auth' &&
         wrapped.code !== 'sync-schema' &&
         wrapped.code !== 'invalid-argument';
-      return await this.recordFailure(wrapped, retryable);
+      return await this.recordFailure(wrapped, retryable, pulled, epoch);
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onExternalAbort);
+      }
+      if (this.activeAbort === cycleAbort) {
+        this.activeAbort = null;
+        this.syncing = false;
+      }
     }
   }
 
   private async recordFailure(
     error: MiniPodError,
     retryable: boolean,
+    pulled: boolean,
+    epoch: number,
   ): Promise<SyncRunResult> {
+    if (epoch !== this.providerEpoch) {
+      const status = await this.getStatus();
+      return { status, pulled, uploaded: false, skipped: true };
+    }
+
     this.syncing = false;
     this.errorClearedSinceLoad = false;
 
@@ -661,9 +900,14 @@ export class SyncEngine {
       });
     }
 
+    if (epoch !== this.providerEpoch) {
+      const status = await this.getStatus();
+      return { status, pulled, uploaded: false, skipped: true };
+    }
+
     const finalStatus = await this.getStatus();
     this.emitStatus(finalStatus);
-    return { status: finalStatus, pulled: false, uploaded: false, skipped: false };
+    return { status: finalStatus, pulled, uploaded: false, skipped: false };
   }
 
   /**
@@ -684,6 +928,8 @@ export class SyncEngine {
         remoteEtag: null,
         remoteFileId: null,
         remoteRev: 0,
+        remoteDevices: {},
+        pendingLineageReset: false,
         hlcLast: this.hlc.current(),
       }),
     );

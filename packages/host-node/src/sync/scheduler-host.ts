@@ -27,12 +27,35 @@ import {
   type SyncReason,
   type SyncSchedulerHost,
   type SyncSettings,
+  type SyncState,
   type SyncStatus,
 } from '@minipod/core';
+import { resolve } from 'node:path';
 import type { SqliteSyncStore } from '../db/SqliteSyncStore';
 import type { SettingsStore } from '../settings/store';
 import { DesktopDriveAuthManager } from './drive-oauth';
 import { createLocalFolderFileProvider, type LocalFolderCloudProvider } from './LocalFolderFileProvider';
+
+export function computeDesktopRemoteFingerprint(
+  config: SyncProviderConfig,
+  settingsStore: SettingsStore,
+): string {
+  switch (config.id) {
+    case 'local-folder':
+      return `local-folder:${resolve(config.folderPath)}`;
+    case 'webdav':
+      return `webdav:${config.fileUrl.trim()}`;
+    case 'gist':
+      return `gist:${config.gistId?.trim() ?? ''}`;
+    case 'saf':
+      return `saf:${config.documentUri}`;
+    case 'drive-appdata':
+    case 'drive-file': {
+      const scope = settingsStore.getDriveTokens()?.scope ?? config.id;
+      return `${config.id}:${scope}`;
+    }
+  }
+}
 
 export function createNodeSyncSchedulerHost(): SyncSchedulerHost {
   return {
@@ -124,18 +147,31 @@ export class NodeSyncService {
 
     // Instantiate configured provider if present on startup
     if (initialSettings.sync.provider) {
-      const provider = this.instantiateProvider(initialSettings.sync.provider);
-      this.engine.setProvider(provider);
+      const built = this.buildProvider(initialSettings.sync.provider);
+      this.activeLocalProvider = built.localProvider;
+      this.engine.setProvider(built.provider);
     }
 
     this.scheduler.start();
+
+    // Perform an initial foreground pull on desktop startup when a provider is configured (SYNC-P2-02)
+    if (initialSettings.sync.provider) {
+      this.scheduler.request('foreground');
+    }
   }
 
   private handleDecisions(decisions: ApplyDecisions): void {
-    this.emit({ type: 'feeds-changed' });
-    this.emit({ type: 'queue-changed' });
+    const changed = decisions.changed;
+    if (!changed || changed.subscriptions || decisions.feedsToRefresh.length > 0) {
+      this.emit({ type: 'feeds-changed' });
+    }
+    if (!changed || changed.queue) {
+      this.emit({ type: 'queue-changed' });
+    }
 
+    const hintKeys = new Set<EpisodeKey>();
     for (const hint of decisions.resumeHints) {
+      hintKeys.add(hint.episodeKey);
       this.emit({
         type: 'progress-changed',
         episodeKey: hint.episodeKey,
@@ -147,67 +183,100 @@ export class NodeSyncService {
       });
     }
 
+    // Emit plain `progress-changed` ONLY for episodes NOT already covered by `resumeHints`
+    // so paused active playback does not receive an unintended silent seek without Undo (SYNC-P1-07).
+    if (changed?.progressEpisodeKeys) {
+      for (const epKey of changed.progressEpisodeKeys) {
+        if (!hintKeys.has(epKey)) {
+          this.emit({ type: 'progress-changed', episodeKey: epKey });
+        }
+      }
+    }
+
     if (decisions.feedsToRefresh.length > 0) {
       this.onRefreshFeeds(decisions.feedsToRefresh);
     }
   }
 
-  private instantiateProvider(config: SyncProviderConfig): CloudFileProvider | null {
-    this.activeLocalProvider = null;
-
+  private buildProvider(
+    config: SyncProviderConfig,
+    options?: {
+      readonly secretOverride?: SyncProviderSecret | undefined;
+      readonly ignoreStoredFileId?: boolean | undefined;
+    },
+  ): {
+    readonly provider: CloudFileProvider | null;
+    readonly localProvider: LocalFolderCloudProvider | null;
+  } {
     switch (config.id) {
       case 'local-folder': {
         const p = createLocalFolderFileProvider(config.folderPath);
-        this.activeLocalProvider = p;
-        return p;
+        return { provider: p, localProvider: p };
       }
 
       case 'drive-appdata':
       case 'drive-file': {
         const state = this.store.getSyncStateSync();
-        return new GoogleDriveProvider({
-          mode: config.id === 'drive-appdata' ? 'appdata' : 'file',
-          http: this.http,
-          getToken: this.driveAuth.createTokenProvider(),
-          initialFileId: state.remoteFileId,
-          userAgent: this.userAgent,
-          ...(config.id === 'drive-file' && config.folderName ? { folderName: config.folderName } : {}),
-        });
+        const initialFileId = options?.ignoreStoredFileId ? null : state.remoteFileId;
+        return {
+          provider: new GoogleDriveProvider({
+            mode: config.id === 'drive-appdata' ? 'appdata' : 'file',
+            http: this.http,
+            getToken: this.driveAuth.createTokenProvider(),
+            initialFileId,
+            userAgent: this.userAgent,
+            ...(config.id === 'drive-file' && config.folderName ? { folderName: config.folderName } : {}),
+          }),
+          localProvider: null,
+        };
       }
 
       case 'webdav': {
-        const password = this.settingsStore.getWebDavPassword() ?? '';
-        return new WebDavProvider({
-          fileUrl: config.fileUrl,
-          username: config.username,
-          password,
-          http: this.http,
-          userAgent: this.userAgent,
-        });
+        const password =
+          options?.secretOverride?.id === 'webdav'
+            ? options.secretOverride.password
+            : (this.settingsStore.getWebDavPassword() ?? '');
+        return {
+          provider: new WebDavProvider({
+            fileUrl: config.fileUrl,
+            username: config.username,
+            password,
+            http: this.http,
+            userAgent: this.userAgent,
+          }),
+          localProvider: null,
+        };
       }
 
       case 'gist': {
-        const token = this.settingsStore.getGistToken() ?? '';
+        const token =
+          options?.secretOverride?.id === 'gist'
+            ? options.secretOverride.token
+            : (this.settingsStore.getGistToken() ?? '');
         const state = this.store.getSyncStateSync();
-        const initialGistId = config.gistId ?? state.remoteFileId ?? undefined;
-        return new GitHubGistProvider({
-          token,
-          http: this.http,
-          userAgent: this.userAgent,
-          ...(initialGistId ? { gistId: initialGistId } : {}),
-          onGistCreated: (newGistId) => {
-            const cur = this.settingsStore.get();
-            if (cur.sync.provider?.id === 'gist') {
-              const updated = this.settingsStore.update({
-                sync: {
-                  ...cur.sync,
-                  provider: { id: 'gist', gistId: newGistId },
-                },
-              });
-              this.emit({ type: 'settings-changed', settings: updated });
-            }
-          },
-        });
+        const initialGistId =
+          config.gistId ?? (options?.ignoreStoredFileId ? undefined : (state.remoteFileId ?? undefined));
+        return {
+          provider: new GitHubGistProvider({
+            token,
+            http: this.http,
+            userAgent: this.userAgent,
+            ...(initialGistId ? { gistId: initialGistId } : {}),
+            onGistCreated: (newGistId) => {
+              const cur = this.settingsStore.get();
+              if (cur.sync.provider?.id === 'gist') {
+                const updated = this.settingsStore.update({
+                  sync: {
+                    ...cur.sync,
+                    provider: { id: 'gist', gistId: newGistId },
+                  },
+                });
+                this.emit({ type: 'settings-changed', settings: updated });
+              }
+            },
+          }),
+          localProvider: null,
+        };
       }
 
       case 'saf':
@@ -216,32 +285,12 @@ export class NodeSyncService {
   }
 
   async configure(settings: SyncSettings, secret?: SyncProviderSecret): Promise<SyncStatus> {
-    if (secret) {
-      this.settingsStore.saveSyncSecret(secret);
-    }
-
-    const prevSettings = this.settingsStore.get();
-    const providerChanged =
-      JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(settings.provider);
-
-    if (providerChanged && settings.provider !== null) {
-      await this.store.markAllDirty();
-    }
-
-    await this.store.setSyncState({
-      deviceName: settings.deviceName,
-      ...(providerChanged
-        ? {
-            remoteEtag: null,
-            remoteFileId: null,
-            remoteRev: 0,
-            floors: { subscriptions: 0, queue: 0, progress: 0 },
-          }
-        : {}),
-    });
-
+    // Disabling sync: stop active cycle first, preserve remote fingerprint for clean reconnect
     if (!settings.provider) {
       this.engine.setProvider(null);
+      await this.engine.drainActiveCycle();
+      this.activeLocalProvider = null;
+      await this.store.setSyncState({ deviceName: settings.deviceName });
       const updated = this.settingsStore.update({ sync: settings });
       this.scheduler.setWifiOnly(updated.sync.wifiOnly);
       this.scheduler.rebindProviderWatcher();
@@ -251,22 +300,71 @@ export class NodeSyncService {
       return status;
     }
 
-    const candidateProvider = this.instantiateProvider(settings.provider);
-    if (!candidateProvider) {
+    // Determine whether this targets a new remote lineage BEFORE mutating secrets/state (SYNC-P0-05, SYNC-P1-10)
+    const state = this.store.getSyncStateSync();
+    const nextFingerprint = computeDesktopRemoteFingerprint(settings.provider, this.settingsStore);
+    const isDrive =
+      settings.provider.id === 'drive-appdata' || settings.provider.id === 'drive-file';
+    const sameDriveWithoutReauth =
+      isDrive &&
+      !state.pendingLineageReset &&
+      typeof state.lastRemoteFingerprint === 'string' &&
+      state.lastRemoteFingerprint.startsWith(`${settings.provider.id}:`);
+    const fingerprintChanged =
+      state.lastRemoteFingerprint !== undefined &&
+      state.lastRemoteFingerprint !== null &&
+      state.lastRemoteFingerprint !== nextFingerprint &&
+      !sameDriveWithoutReauth;
+    const needLineageReset = fingerprintChanged || state.pendingLineageReset === true;
+
+    // Phase 1: construct candidate using ephemeral secret and probe BEFORE mutating any persisted state (SYNC-P1-10)
+    const candidate = this.buildProvider(settings.provider, {
+      secretOverride: secret,
+      ignoreStoredFileId: needLineageReset,
+    });
+    if (!candidate.provider) {
       throw new MiniPodError('invalid-argument', 'Unable to initialize sync provider');
     }
 
-    // Probe target before committing active sync cycle (`ARCHITECTURE.md §8.1`)
-    const probe = await candidateProvider.probe();
+    const probe = await candidate.provider.probe();
     if (!probe.ok) {
       throw probe.error
         ? MiniPodError.fromShape(probe.error)
         : new MiniPodError('sync-auth', 'Sync provider probe failed');
     }
 
+    // Phase 2: probe succeeded -> drain any in-flight cycle, then atomically commit secrets/state/provider
+    this.engine.setProvider(null);
+    await this.engine.drainActiveCycle();
+
+    if (secret) {
+      this.settingsStore.saveSyncSecret(secret);
+    }
+
+    // Never call `markAllDirty()` on configure; use explicit lineage-reset flag only when remote identity changed (SYNC-P0-05).
+    const statePatch: Partial<SyncState> = needLineageReset
+      ? ({
+          deviceName: settings.deviceName,
+          remoteEtag: null,
+          remoteFileId: null,
+          remoteRev: 0,
+          floors: { subscriptions: 0, queue: 0, progress: 0 },
+          lastPullAt: undefined,
+          lastPushAt: undefined,
+          remoteDevices: {},
+          lastRemoteFingerprint: nextFingerprint,
+          pendingLineageReset: true,
+        } as unknown as Partial<SyncState>)
+      : {
+          deviceName: settings.deviceName,
+          ...(state.lastRemoteFingerprint == null ? { lastRemoteFingerprint: nextFingerprint } : {}),
+        };
+    await this.store.setSyncState(statePatch);
+
+    this.activeLocalProvider = candidate.localProvider;
     const updated = this.settingsStore.update({ sync: settings });
     this.scheduler.setWifiOnly(updated.sync.wifiOnly);
-    this.engine.setProvider(candidateProvider);
+    this.engine.setProvider(candidate.provider);
     this.scheduler.rebindProviderWatcher();
     this.emit({ type: 'settings-changed', settings: updated });
 
@@ -276,6 +374,8 @@ export class NodeSyncService {
 
   async authorize(provider: 'drive-appdata' | 'drive-file'): Promise<void> {
     await this.driveAuth.authorizeInteractive(provider);
+    // Re-authorization may target a different Google account -> flag lineage reset for next pull (SYNC-P0-05).
+    await this.store.setSyncState({ pendingLineageReset: true });
   }
 
   async syncNow(): Promise<SyncStatus> {
@@ -289,17 +389,18 @@ export class NodeSyncService {
   async disconnect(): Promise<void> {
     const cur = this.settingsStore.get();
     this.engine.setProvider(null);
+    await this.engine.drainActiveCycle();
     this.activeLocalProvider = null;
     this.scheduler.rebindProviderWatcher();
     this.settingsStore.clearSyncSecrets();
 
+    // Preserve `lastRemoteFingerprint`, `remoteRev`, `floors`, and `lastPullAt`/`lastPushAt` across disconnect
+    // so reconnecting the SAME remote does not masquerade as a new lineage or resurrect deleted items (SYNC-P0-05).
     await this.store.setSyncState({
       remoteEtag: null,
-      remoteFileId: null,
-      remoteRev: 0,
       lastError: undefined,
       backoffUntil: 0,
-    } as unknown as Partial<import('@minipod/core').SyncState>);
+    } as unknown as Partial<SyncState>);
 
     const updated = this.settingsStore.update({
       sync: {
@@ -324,7 +425,27 @@ export class NodeSyncService {
     await this.scheduler.requestAsync('hidden');
   }
 
-  dispose(): void {
+  async dispose(flushTimeoutMs: number = 3_000): Promise<void> {
+    if (this.engine.getProvider() && flushTimeoutMs > 0) {
+      try {
+        const dirty = await this.engine.getDirtyCount();
+        if (dirty > 0) {
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          await Promise.race([
+            this.scheduler.requestAsync('hidden').catch(() => undefined),
+            new Promise<void>((resolveTimer) => {
+              timer = setTimeout(resolveTimer, flushTimeoutMs);
+              timer.unref?.();
+            }),
+          ]);
+          if (timer !== null) clearTimeout(timer);
+        }
+      } catch {
+        // Best-effort shutdown flush
+      }
+    }
     this.scheduler.dispose();
+    this.engine.setProvider(null);
+    await this.engine.drainActiveCycle();
   }
 }

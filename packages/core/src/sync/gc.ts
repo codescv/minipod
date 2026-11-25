@@ -75,9 +75,16 @@ export function gcSyncDocument(doc: SyncDocument, options: SyncGcOptions): SyncD
     }
   }
 
-  // If still above hard cap (5,000), evict oldest tombstones first
+  // If still above hard cap (5,000), prefer tombstones already seen by all active devices first
   if (retainedSubs.length > maxSubs) {
-    const tombstones = retainedSubs.filter(([, s]) => s.deleted).sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    const tombstones = retainedSubs
+      .filter(([, s]) => s.deleted)
+      .sort((a, b) => {
+        const seenA = allDevicesHaveSeen(a[1].updatedAt) ? 0 : 1;
+        const seenB = allDevicesHaveSeen(b[1].updatedAt) ? 0 : 1;
+        if (seenA !== seenB) return seenA - seenB;
+        return a[1].updatedAt - b[1].updatedAt;
+      });
     const excess = retainedSubs.length - maxSubs;
     const toDrop = new Set(tombstones.slice(0, excess).map(([k]) => k));
     const filtered: [string, SyncSubscription][] = [];
@@ -114,7 +121,14 @@ export function gcSyncDocument(doc: SyncDocument, options: SyncGcOptions): SyncD
   }
 
   if (retainedQueue.length > maxQueue) {
-    const tombstones = retainedQueue.filter(([, q]) => q.removed).sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    const tombstones = retainedQueue
+      .filter(([, q]) => q.removed)
+      .sort((a, b) => {
+        const seenA = allDevicesHaveSeen(a[1].updatedAt) ? 0 : 1;
+        const seenB = allDevicesHaveSeen(b[1].updatedAt) ? 0 : 1;
+        if (seenA !== seenB) return seenA - seenB;
+        return a[1].updatedAt - b[1].updatedAt;
+      });
     const excess = retainedQueue.length - maxQueue;
     const toDrop = new Set(tombstones.slice(0, excess).map(([k]) => k));
     const filtered: [string, SyncQueueEntry][] = [];
@@ -134,15 +148,25 @@ export function gcSyncDocument(doc: SyncDocument, options: SyncGcOptions): SyncD
     queueItems[k] = v;
   }
 
-  // 4. Progress cap eviction (50,000 entries; oldest PLAYED evicted first, preserving IN_PROGRESS/NEW above floor)
+  // 4. Progress soft-cap eviction (50,000 entries):
+  // Pure prefix eviction — only evict `PLAYED` entries strictly older than the oldest retained
+  // non-`PLAYED` (`IN_PROGRESS`/`NEW`) entry, keeping whole timestamp buckets intact so every
+  // evicted entry satisfies `evicted.updatedAt <= newFloor < retained.updatedAt` (zero ping-pong).
   let progressFloor = doc.progress.floor;
   const allProgress = Object.entries(doc.progress.items);
   let retainedProgress = allProgress;
 
   if (allProgress.length > maxProgress) {
     const excessCount = allProgress.length - maxProgress;
-    const playedSorted = allProgress
-      .filter(([, p]) => p.state === 'PLAYED')
+    let oldestNonPlayed = Number.POSITIVE_INFINITY;
+    for (const [, p] of allProgress) {
+      if (p.state !== 'PLAYED' && p.updatedAt < oldestNonPlayed) {
+        oldestNonPlayed = p.updatedAt;
+      }
+    }
+
+    const eligiblePlayed = allProgress
+      .filter(([, p]) => p.state === 'PLAYED' && p.updatedAt < oldestNonPlayed)
       .sort((a, b) =>
         a[1].updatedAt !== b[1].updatedAt
           ? a[1].updatedAt - b[1].updatedAt
@@ -151,37 +175,34 @@ export function gcSyncDocument(doc: SyncDocument, options: SyncGcOptions): SyncD
             : 1,
       );
 
-    const evictedKeys = new Set<string>();
-    let maxEvictedUpdatedAt = 0;
-
-    for (let i = 0; i < playedSorted.length && evictedKeys.size < excessCount; i++) {
-      const [k, p] = playedSorted[i]!;
-      evictedKeys.add(k);
-      if (p.updatedAt > maxEvictedUpdatedAt) {
-        maxEvictedUpdatedAt = p.updatedAt;
+    // Determine largest eviction prefix <= excessCount whose boundary timestamp does not split
+    // a bucket with a retained `PLAYED` entry (ensuring `maxEvicted < oldestRetained`).
+    let cutCount = Math.min(excessCount, eligiblePlayed.length);
+    if (cutCount > 0 && cutCount < eligiblePlayed.length) {
+      const boundaryTs = eligiblePlayed[cutCount - 1]![1].updatedAt;
+      const nextRetainedTs = eligiblePlayed[cutCount]![1].updatedAt;
+      if (boundaryTs === nextRetainedTs) {
+        while (cutCount > 0 && eligiblePlayed[cutCount - 1]![1].updatedAt === boundaryTs) {
+          cutCount -= 1;
+        }
       }
     }
 
-    retainedProgress = allProgress.filter(([k]) => !evictedKeys.has(k));
-
-    if (evictedKeys.size > 0) {
-      let oldestRetainedActive = Number.POSITIVE_INFINITY;
-      for (const [, p] of retainedProgress) {
-        if (p.state !== 'PLAYED' && p.updatedAt < oldestRetainedActive) {
-          oldestRetainedActive = p.updatedAt;
-        }
-        // Also ensure no retained PLAYED entry sits <= new floor
-        if (p.updatedAt < oldestRetainedActive) {
-          oldestRetainedActive = p.updatedAt;
+    if (cutCount > 0) {
+      const evictedKeys = new Set<string>();
+      let maxEvictedUpdatedAt = 0;
+      for (let i = 0; i < cutCount; i++) {
+        const [k, p] = eligiblePlayed[i]!;
+        evictedKeys.add(k);
+        if (p.updatedAt > maxEvictedUpdatedAt) {
+          maxEvictedUpdatedAt = p.updatedAt;
         }
       }
 
-      const ceiling = Number.isFinite(oldestRetainedActive)
-        ? Math.max(0, oldestRetainedActive - 1)
-        : maxEvictedUpdatedAt;
-      const candidateFloor = Math.min(maxEvictedUpdatedAt, ceiling);
-      if (candidateFloor > progressFloor) {
-        progressFloor = candidateFloor;
+      retainedProgress = allProgress.filter(([k]) => !evictedKeys.has(k));
+
+      if (maxEvictedUpdatedAt > progressFloor) {
+        progressFloor = maxEvictedUpdatedAt;
       }
     }
   }

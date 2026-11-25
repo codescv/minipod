@@ -49,25 +49,37 @@ export class ProgressRepository {
 
   upsert(
     record: ProgressRecord,
-    options?: { readonly syncDirty?: boolean; readonly identity?: string | undefined },
+    options?: {
+      readonly syncDirty?: boolean;
+      readonly identity?: string | undefined;
+      readonly fromSync?: boolean;
+    },
   ): void {
     const dirty = options?.syncDirty ?? true ? 1 : 0;
-    const existing = this.getRaw(record.episodeKey);
-    const identity =
-      options?.identity ??
-      existing?.identity ??
-      ((
-        this.db
-          .prepare('SELECT identity FROM episodes WHERE episode_key = ?')
-          .get(record.episodeKey) as { identity?: string } | undefined
-      )?.identity ?? null);
+    const fromSync = options?.fromSync === true;
+    const existing = fromSync ? undefined : this.getRaw(record.episodeKey);
+    const identity = fromSync
+      ? (options?.identity ?? null)
+      : (options?.identity ??
+        existing?.identity ??
+        ((
+          this.db
+            .prepare('SELECT identity FROM episodes WHERE episode_key = ?')
+            .get(record.episodeKey) as { identity?: string } | undefined
+        )?.identity ?? null));
 
-    this.db
-      .prepare(
-        `INSERT INTO progress
-         (episode_key, feed_key, identity, position_ms, duration_ms, state, played_at, updated_at, device_id, sync_dirty)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(episode_key) DO UPDATE SET
+    const conflictClause = fromSync
+      ? `ON CONFLICT(episode_key) DO UPDATE SET
+           feed_key = excluded.feed_key,
+           identity = excluded.identity,
+           position_ms = excluded.position_ms,
+           duration_ms = excluded.duration_ms,
+           state = excluded.state,
+           played_at = excluded.played_at,
+           updated_at = excluded.updated_at,
+           device_id = excluded.device_id,
+           sync_dirty = excluded.sync_dirty`
+      : `ON CONFLICT(episode_key) DO UPDATE SET
            feed_key = excluded.feed_key,
            identity = COALESCE(excluded.identity, progress.identity),
            position_ms = excluded.position_ms,
@@ -76,7 +88,14 @@ export class ProgressRepository {
            played_at = excluded.played_at,
            updated_at = excluded.updated_at,
            device_id = excluded.device_id,
-           sync_dirty = excluded.sync_dirty`,
+           sync_dirty = excluded.sync_dirty`;
+
+    this.db
+      .prepare(
+        `INSERT INTO progress
+         (episode_key, feed_key, identity, position_ms, duration_ms, state, played_at, updated_at, device_id, sync_dirty)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ${conflictClause}`,
       )
       .run(
         record.episodeKey,
@@ -101,13 +120,19 @@ export class ProgressRepository {
       .prepare('SELECT * FROM progress WHERE feed_key = ?')
       .all(oldFeedKey) as unknown as ProgressDbRow[];
     for (const row of rows) {
-      if (!row.identity) {
-        this.db
-          .prepare('UPDATE progress SET feed_key = ?, sync_dirty = 1 WHERE episode_key = ?')
-          .run(newFeedKey, row.episode_key);
+      const resolvedIdentity =
+        row.identity ??
+        ((
+          this.db
+            .prepare('SELECT identity FROM episodes WHERE episode_key = ?')
+            .get(row.episode_key) as { identity?: string } | undefined
+        )?.identity ?? null);
+      if (!resolvedIdentity) {
+        // Without episode identity we cannot compute the new episodeKey hash; leave untouched
+        // rather than rewriting feed_key on an old-feed-hashed episode_key (SYNC-P1-03).
         continue;
       }
-      const newEpKey = rekeyEpisode(row.identity);
+      const newEpKey = rekeyEpisode(resolvedIdentity);
       const targetExisting = this.getRaw(newEpKey);
       this.delete(row.episode_key);
       if (!targetExisting || row.updated_at > targetExisting.updated_at) {
@@ -122,7 +147,7 @@ export class ProgressRepository {
             ...(row.duration_ms !== null ? { durationMs: row.duration_ms } : {}),
             ...(row.played_at !== null ? { playedAt: row.played_at } : {}),
           },
-          { syncDirty: true, identity: row.identity },
+          { syncDirty: true, identity: resolvedIdentity },
         );
       }
     }

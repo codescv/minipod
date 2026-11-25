@@ -25,7 +25,6 @@ import {
   queueMove,
   queuePlayNext,
   queueRemove,
-  rebalanceQueueIfNeeded,
   stampMarkPlayed,
   stampProgressSave,
   stampUndoResume,
@@ -212,12 +211,14 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
   };
 
   let downloaderRef: EpisodeDownloader | null = null;
+  let currentPlayingEpisodeKey: EpisodeKey | undefined;
 
   const syncStore = new SqliteSyncStore({
     db,
     hlc,
     appVersion: effectiveVersion,
     ...(options?.deviceName ? { defaultDeviceName: options.deviceName } : {}),
+    getCurrentEpisodeKey: () => currentPlayingEpisodeKey,
     onDeleteDownloads: (paths) => {
       downloaderRef?.deleteFilesByPaths(paths);
     },
@@ -244,7 +245,6 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
 
   const openExternal = options?.openExternalImpl ?? defaultOpenExternal;
 
-  let currentPlayingEpisodeKey: EpisodeKey | undefined;
   let lastProgressTickAt = 0;
   let lastProgressTickPosMs = 0;
   let lastProgressTickKey: EpisodeKey | undefined;
@@ -459,11 +459,13 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
       settingsStore.setFeedCredentials(preview.feedKey, effectiveCreds);
     }
 
+    const st = syncStore.getSyncStateSync();
     const { feed } = feedsRepo.upsertParsedFeed({
       feedKey: preview.feedKey,
       kind: 'RSS',
       url: preview.url,
       subscribed: true,
+      deviceId: st.deviceId,
       parsed: preview.parsed,
       hlc,
       nowWallMs: Date.now(),
@@ -607,7 +609,8 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
       ): Promise<void> {
         feedsRepo.get(feedKey); // assert exists
         settingsStore.setFeedCredentials(feedKey, credentials);
-        feedsRepo.setHasCredentials(feedKey, credentials !== null, hlc);
+        const st = syncStore.getSyncStateSync();
+        feedsRepo.setHasCredentials(feedKey, credentials !== null, hlc, st.deviceId);
         emit({ type: 'feeds-changed' });
         if (!feedKey.startsWith('l_')) {
           syncService.request('subscriptions-changed');
@@ -770,13 +773,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
 
     queue: {
       async list(): Promise<readonly QueueRow[]> {
-        const all = queueRepo.listAllEntries();
-        const st = syncStore.getSyncStateSync();
-        const rebalanced = rebalanceQueueIfNeeded(all, { hlc, deviceId: st.deviceId });
-        if (rebalanced.length > 0) {
-          queueRepo.upsertEntries(rebalanced, true);
-          syncService.request('queue-changed');
-        }
+        // Pure read: never re-stamp/rebalance queue on read (SYNC-P1-11).
         return queueRepo.listActiveRows();
       },
 
@@ -796,9 +793,12 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
           { hlc, deviceId: st.deviceId },
         );
         if (mutated.length > 0) {
-          queueRepo.upsertEntries(mutated, !isLocal);
+          const nonLocal = mutated.filter((m) => !m.feedKey.startsWith('l_'));
+          const localOnly = mutated.filter((m) => m.feedKey.startsWith('l_'));
+          if (nonLocal.length > 0) queueRepo.upsertEntries(nonLocal, true);
+          if (localOnly.length > 0) queueRepo.upsertEntries(localOnly, false);
           emit({ type: 'queue-changed' });
-          if (!isLocal) syncService.request('queue-changed');
+          if (nonLocal.length > 0) syncService.request('queue-changed');
         }
       },
 
@@ -819,9 +819,12 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
           currentPlayingEpisodeKey,
         );
         if (mutated.length > 0) {
-          queueRepo.upsertEntries(mutated, !isLocal);
+          const nonLocal = mutated.filter((m) => !m.feedKey.startsWith('l_'));
+          const localOnly = mutated.filter((m) => m.feedKey.startsWith('l_'));
+          if (nonLocal.length > 0) queueRepo.upsertEntries(nonLocal, true);
+          if (localOnly.length > 0) queueRepo.upsertEntries(localOnly, false);
           emit({ type: 'queue-changed' });
-          if (!isLocal) syncService.request('queue-changed');
+          if (nonLocal.length > 0) syncService.request('queue-changed');
         }
       },
 
@@ -1240,7 +1243,7 @@ export function createNodePlatformHost(options?: NodeHostOptions): NodeHostBundl
       }
       refresher.dispose();
       downloader.dispose();
-      syncService.dispose();
+      await syncService.dispose();
       mediaProxy.clearCache();
       listeners.clear();
       try {

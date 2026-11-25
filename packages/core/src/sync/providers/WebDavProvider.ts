@@ -101,6 +101,22 @@ export function md5Hex(input: string): string {
   return bytesToHex(out);
 }
 
+function extractDigestChallenge(header: string): string | undefined {
+  const match = /(?:^|,\s*)(Digest\s+[\s\S]*)$/i.exec(header);
+  if (!match) return undefined;
+  let segment = match[1]!;
+  // Stop before any subsequent auth scheme challenge (e.g. `, Basic realm=...` or `, Bearer ...`)
+  const nextScheme = /,\s*(?:Basic|Bearer|Negotiate|NTLM|HOBA|Mutual|SCRAM-[A-Z0-9-]+)\b/i.exec(segment);
+  if (nextScheme && nextScheme.index > 0) {
+    segment = segment.slice(0, nextScheme.index);
+  }
+  return segment.trim();
+}
+
+function isWeakEtag(etag: string | null): boolean {
+  return etag !== null && /^W\//i.test(etag.trim());
+}
+
 function buildDigestAuthorization(
   challengeHeader: string,
   method: HttpMethod,
@@ -108,11 +124,12 @@ function buildDigestAuthorization(
   creds: HttpBasicCredentials,
   ncCounter: number,
 ): string | undefined {
-  if (!/^Digest\s+/i.test(challengeHeader.trim())) return undefined;
+  const digestPart = extractDigestChallenge(challengeHeader);
+  if (!digestPart) return undefined;
   const params: Record<string, string> = {};
   const paramRe = /([a-zA-Z0-9_-]+)\s*=\s*(?:"([^"]*)"|([^\s,]+))/g;
   let m: RegExpExecArray | null;
-  while ((m = paramRe.exec(challengeHeader)) !== null) {
+  while ((m = paramRe.exec(digestPart)) !== null) {
     params[m[1]!.toLowerCase()] = m[2] ?? m[3] ?? '';
   }
 
@@ -176,6 +193,7 @@ export class WebDavProvider implements CloudFileProvider {
   private readonly http: HttpClient;
   private readonly userAgent: string;
   private digestNonceCount = 0;
+  private remoteExistedWithoutStrongEtag = false;
 
   constructor(deps: WebDavProviderDeps) {
     this.fileUrl = deps.fileUrl.trim();
@@ -210,9 +228,9 @@ export class WebDavProvider implements CloudFileProvider {
       return first;
     }
 
-    // Check Digest Auth challenge first if advertised
+    // Check Digest Auth challenge first if advertised (supports multi-challenge headers, SYNC-P2-08)
     const wwwAuth = first.headers['www-authenticate'];
-    if (wwwAuth && /^Digest\s+/i.test(wwwAuth.trim())) {
+    if (wwwAuth && /(?:^|,\s*)Digest\s+/i.test(wwwAuth)) {
       this.digestNonceCount += 1;
       const digestHeader = buildDigestAuthorization(
         wwwAuth,
@@ -308,6 +326,7 @@ export class WebDavProvider implements CloudFileProvider {
       return { kind: 'not-modified' };
     }
     if (resp.status === 404) {
+      this.remoteExistedWithoutStrongEtag = false;
       return { kind: 'missing' };
     }
     if (resp.status === 401 || resp.status === 403) {
@@ -318,12 +337,14 @@ export class WebDavProvider implements CloudFileProvider {
     }
 
     const bytes = await resp.bytes();
+    const rawEtag = resp.headers['etag'] ?? null;
+    this.remoteExistedWithoutStrongEtag = rawEtag === null || isWeakEtag(rawEtag);
     const lastModHeader = resp.headers['last-modified'];
     const lastModMs = lastModHeader ? Date.parse(lastModHeader) : Number.NaN;
     return {
       kind: 'blob',
       bytes,
-      etag: resp.headers['etag'] ?? null,
+      etag: rawEtag,
       ...(Number.isFinite(lastModMs) ? { lastModified: lastModMs } : {}),
     };
   }
@@ -334,8 +355,12 @@ export class WebDavProvider implements CloudFileProvider {
         'Content-Type': 'application/json; charset=utf-8',
       };
       if (ifMatch === null) {
-        headers['If-None-Match'] = '*';
-      } else {
+        // Avoid `If-None-Match: *` 412 deadlock when remote already exists without a strong ETag (SYNC-P1-14).
+        if (!this.remoteExistedWithoutStrongEtag) {
+          headers['If-None-Match'] = '*';
+        }
+      } else if (!isWeakEtag(ifMatch)) {
+        // RFC 7232 strong comparison in `If-Match` always rejects weak `W/"..."` ETags with 412 (SYNC-P1-14).
         headers['If-Match'] = ifMatch;
       }
 
@@ -351,10 +376,9 @@ export class WebDavProvider implements CloudFileProvider {
         };
       }
       if (resp.status >= 200 && resp.status < 300) {
-        let newEtag = resp.headers['etag'] ?? null;
-        if (!newEtag) {
-          newEtag = await this.head(signal).catch(() => null);
-        }
+        // Never follow up with a racy `head()` when PUT omits ETag; return `null` so next cycle pulls safely (SYNC-P1-14).
+        const newEtag = resp.headers['etag'] ?? null;
+        this.remoteExistedWithoutStrongEtag = newEtag === null || isWeakEtag(newEtag);
         return { kind: 'ok', newEtag };
       }
       return {
@@ -380,6 +404,7 @@ export class WebDavProvider implements CloudFileProvider {
       }
       throw new MiniPodError('network', `WebDAV DELETE failed (HTTP ${resp.status})`);
     }
+    this.remoteExistedWithoutStrongEtag = false;
   }
 }
 

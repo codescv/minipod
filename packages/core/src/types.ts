@@ -674,6 +674,12 @@ export interface SyncState {
   readonly lastPushAt?: EpochMs;
   readonly lastError?: MiniPodErrorShape;
   readonly backoffUntil?: EpochMs;
+  /** Last known `devices` map from the remote sync document so 304 uploads preserve the GC barrier. */
+  readonly remoteDevices?: Readonly<Record<DeviceId, SyncDevice>>;
+  /** Identity fingerprint of the last synced remote target (preserved across `disconnect()`). */
+  readonly lastRemoteFingerprint?: string | null;
+  /** Set when switching to a different remote target or re-authorizing an account; cleared once new-lineage restamp commits. */
+  readonly pendingLineageReset?: boolean;
 }
 
 /** Local document plus dirtiness, as produced by `SyncStore.loadLocalDoc()` (ARCHITECTURE.md §7.6). */
@@ -688,6 +694,26 @@ export interface ApplyDecisions {
   /** Progress of the currently loaded episode changed remotely → UI seeks and shows "Resumed from <device> — Undo". */
   readonly resumeHints: readonly { readonly episodeKey: EpisodeKey; readonly positionMs: number; readonly state: ProgressState; readonly deviceName: string }[];
   readonly feedsToRefresh: readonly FeedKey[];
+  /** Per-table change summary so hosts emit UI/native-queue refresh events even without resumeHints or new feeds. */
+  readonly changed?: {
+    readonly subscriptions: boolean;
+    readonly queue: boolean;
+    readonly progress: boolean;
+    readonly progressEpisodeKeys?: readonly EpisodeKey[];
+  };
+  /** True when `applyMerged` detected concurrent local dirty writes newer than `merged`. */
+  readonly hasConcurrentLocalEdits?: boolean;
+}
+
+export interface RestampBelowFloorOptions {
+  /** Keys already present in the remote document (must not be restamped so LWW resolves normally). */
+  readonly excludeKeys?: {
+    readonly subscriptions?: ReadonlySet<FeedKey>;
+    readonly queue?: ReadonlySet<EpisodeKey>;
+    readonly progress?: ReadonlySet<EpisodeKey>;
+  };
+  /** When true (new-lineage first sync), also restamp & mark dirty local clean live (non-tombstone) rows absent from remote and <= floor. */
+  readonly includeCleanLive?: boolean;
 }
 
 /**
@@ -698,8 +724,14 @@ export interface SyncStore {
   getSyncState(): Promise<SyncState>;
   setSyncState(patch: Partial<SyncState>): Promise<void>;
   loadLocalDoc(): Promise<LocalSyncSnapshot>;
-  /** Re-stamp dirty rows at/below the remote floor (ARCHITECTURE.md §7.6 "before merge"). */
-  restampDirtyBelowFloor(floors: SyncState['floors'], stamp: () => HlcMs): Promise<void>;
+  /** Optional fast O(log N) dirty row count without scanning all entity tables. */
+  getDirtyCount?(): Promise<number>;
+  /** Re-stamp dirty (and optionally new-lineage clean live) rows at/below the remote floor (ARCHITECTURE.md §7.6 "before merge"). */
+  restampDirtyBelowFloor(
+    floors: SyncState['floors'],
+    stamp: () => HlcMs,
+    options?: RestampBelowFloorOptions,
+  ): Promise<void>;
   applyMerged(merged: SyncDocument, currentEpisodeKey: EpisodeKey | undefined): Promise<ApplyDecisions>;
   /** Clear `sync_dirty` for rows whose value equals the pushed document. */
   markClean(pushed: SyncEntityMaps): Promise<void>;

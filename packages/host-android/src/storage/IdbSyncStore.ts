@@ -16,6 +16,7 @@ import {
   generateDeviceId,
   HybridLogicalClock,
   MiniPodError,
+  pickProgress,
   toSyncQueueEntry,
   type ApplyDecisions,
   type Chapter,
@@ -38,6 +39,7 @@ import {
   type QueueEntry,
   type QueueRow,
   type QueueStub,
+  type RestampBelowFloorOptions,
   type SyncDocument,
   type SyncEntityMaps,
   type SyncProgress,
@@ -63,6 +65,7 @@ export interface IdbSyncStoreDeps {
   readonly hlc: HybridLogicalClock;
   readonly appVersion: string;
   readonly defaultDeviceName?: string;
+  readonly getCurrentEpisodeKey?: () => EpisodeKey | undefined;
   readonly onDeleteDownloads?: (paths: readonly string[]) => void | Promise<void>;
 }
 
@@ -142,13 +145,40 @@ export function idbRecordToQueueEntry(r: IdbQueueRecord): QueueEntry {
   };
 }
 
-function subscriptionEquals(local: IdbFeedRecord, remote: SyncSubscription): boolean {
+function subscriptionCoreMatches(local: IdbFeedRecord, remote: SyncSubscription): boolean {
   const localDeleted = local.deletedAt != null || local.subscribedNum === 0;
   if (localDeleted !== remote.deleted) return false;
-  if (local.updatedAt !== remote.updatedAt) return false;
   const effectiveUrl = remote.movedTo || remote.url;
   if (!localDeleted && (local.movedTo || local.url) !== effectiveUrl) return false;
   return true;
+}
+
+function subscriptionFullyMatches(
+  local: IdbFeedRecord,
+  remote: SyncSubscription,
+  fallbackDeviceId: DeviceId,
+): boolean {
+  if (!subscriptionCoreMatches(local, remote)) return false;
+  if (local.updatedAt !== remote.updatedAt) return false;
+  if ((local.deviceId ?? fallbackDeviceId) !== remote.deviceId) return false;
+  if ((local.movedTo ?? null) !== (remote.movedTo ?? null)) return false;
+  if (Boolean(local.hasCredentials) !== Boolean(remote.hasCredentials)) return false;
+  if (remote.title !== undefined && local.title === undefined) return false;
+  if (remote.imageUrl !== undefined && local.imageUrl === undefined) return false;
+  return true;
+}
+
+function idbProgressToSyncProgress(p: IdbProgressRecord): SyncProgress {
+  return {
+    feedKey: p.feedKey,
+    positionMs: p.positionMs,
+    state: p.state,
+    playedAt: p.playedAt ?? null,
+    updatedAt: p.updatedAt,
+    deviceId: p.deviceId,
+    ...(p.identity !== undefined ? { identity: p.identity } : {}),
+    ...(p.durationMs !== undefined ? { durationMs: p.durationMs } : {}),
+  };
 }
 
 function toSyncStateModel(row: IdbSyncStateRecord): SyncState {
@@ -168,6 +198,9 @@ function toSyncStateModel(row: IdbSyncStateRecord): SyncState {
     ...(row.lastPushAt !== undefined ? { lastPushAt: row.lastPushAt } : {}),
     ...(row.lastError !== undefined ? { lastError: row.lastError } : {}),
     ...(row.backoffUntil !== undefined && row.backoffUntil > 0 ? { backoffUntil: row.backoffUntil } : {}),
+    ...(row.remoteDevices !== undefined ? { remoteDevices: row.remoteDevices } : {}),
+    ...(row.lastRemoteFingerprint !== undefined ? { lastRemoteFingerprint: row.lastRemoteFingerprint } : {}),
+    ...(row.pendingLineageReset ? { pendingLineageReset: true } : {}),
   };
 }
 
@@ -176,6 +209,7 @@ export class IdbSyncStore implements SyncStore {
   private readonly hlc: HybridLogicalClock;
   private readonly appVersion: string;
   private readonly defaultDeviceName: string;
+  private readonly getCurrentEpisodeKey?: () => EpisodeKey | undefined;
   private readonly onDeleteDownloads?: (paths: readonly string[]) => void | Promise<void>;
   private cachedSyncState: IdbSyncStateRecord | null = null;
 
@@ -184,16 +218,20 @@ export class IdbSyncStore implements SyncStore {
     this.hlc = deps.hlc;
     this.appVersion = deps.appVersion;
     this.defaultDeviceName = deps.defaultDeviceName ?? 'Android';
+    if (deps.getCurrentEpisodeKey !== undefined) {
+      this.getCurrentEpisodeKey = deps.getCurrentEpisodeKey;
+    }
     if (deps.onDeleteDownloads !== undefined) {
       this.onDeleteDownloads = deps.onDeleteDownloads;
     }
   }
 
   /**
-   * Ensures singleton rows in `syncState` (`id = 1`) and `settings` (`key = 'app'`) exist.
+   * Ensures singleton rows in `syncState` (`id = 1`) and `settings` (`key = 'app'`) exist,
+   * and restores the local HLC without +5m drift clamping from `MAX(hlcLast, ownEntityHlc)` (SYNC-P2-01).
    */
   async init(): Promise<SyncState> {
-    const tx = this.db.transaction(['syncState', 'settings'], 'readwrite');
+    const tx = this.db.transaction(['syncState', 'settings', 'feeds', 'queue', 'progress'], 'readwrite');
     const syncStore = tx.objectStore('syncState');
     const settingsStore = tx.objectStore('settings');
 
@@ -212,8 +250,31 @@ export class IdbSyncStore implements SyncStore {
         hlcLast: this.hlc.current(),
       };
       await syncStore.put(stateRow);
-    } else if (stateRow.hlcLast > this.hlc.current()) {
-      this.hlc.observe(stateRow.hlcLast);
+    } else {
+      const [allFeeds, allQueue, allProg] = await Promise.all([
+        tx.objectStore('feeds').getAll(),
+        tx.objectStore('queue').getAll(),
+        tx.objectStore('progress').getAll(),
+      ]);
+      let maxLocalHlc = stateRow.hlcLast;
+      for (const f of allFeeds) {
+        if (f.kind === 'RSS' && (!f.deviceId || f.deviceId === stateRow.deviceId)) {
+          if (f.updatedAt > maxLocalHlc) maxLocalHlc = f.updatedAt;
+        }
+      }
+      for (const q of allQueue) {
+        if (q.deviceId === stateRow.deviceId && q.updatedAt > maxLocalHlc) {
+          maxLocalHlc = q.updatedAt;
+        }
+      }
+      for (const p of allProg) {
+        if (p.deviceId === stateRow.deviceId && p.updatedAt > maxLocalHlc) {
+          maxLocalHlc = p.updatedAt;
+        }
+      }
+      if (maxLocalHlc > this.hlc.current()) {
+        this.hlc.restore(maxLocalHlc);
+      }
     }
 
     const existingSettings = await settingsStore.get('app');
@@ -258,7 +319,7 @@ export class IdbSyncStore implements SyncStore {
     const existing = await store.get(1);
     if (existing) {
       if (existing.hlcLast > this.hlc.current()) {
-        this.hlc.observe(existing.hlcLast);
+        this.hlc.restore(existing.hlcLast);
       }
       this.cachedSyncState = existing;
       return existing;
@@ -301,6 +362,16 @@ export class IdbSyncStore implements SyncStore {
           ? patch.backoffUntil
           : undefined
         : current.backoffUntil;
+    const remoteDevices =
+      'remoteDevices' in patch ? patch.remoteDevices : current.remoteDevices;
+    const lastRemoteFingerprint =
+      'lastRemoteFingerprint' in patch
+        ? patch.lastRemoteFingerprint
+        : current.lastRemoteFingerprint;
+    const pendingLineageReset =
+      'pendingLineageReset' in patch
+        ? Boolean(patch.pendingLineageReset)
+        : Boolean(current.pendingLineageReset);
 
     const updated: IdbSyncStateRecord = {
       id: 1,
@@ -317,6 +388,9 @@ export class IdbSyncStore implements SyncStore {
       ...(lastPushAt !== undefined ? { lastPushAt } : {}),
       ...(lastError !== undefined ? { lastError } : {}),
       ...(backoffUntil !== undefined ? { backoffUntil } : {}),
+      ...(remoteDevices !== undefined ? { remoteDevices } : {}),
+      ...(lastRemoteFingerprint !== undefined ? { lastRemoteFingerprint } : {}),
+      ...(pendingLineageReset ? { pendingLineageReset: true } : {}),
     };
 
     await store.put(updated);
@@ -324,13 +398,62 @@ export class IdbSyncStore implements SyncStore {
     this.cachedSyncState = updated;
   }
 
-  async loadLocalDoc(): Promise<LocalSyncSnapshot> {
-    const tx = this.db.transaction(['syncState', 'feeds', 'queue', 'progress'], 'readwrite');
-    const stateRow = await this.ensureStateInStore(tx.objectStore('syncState'));
-    const allFeeds = await tx.objectStore('feeds').getAll();
-    const allQueue = await tx.objectStore('queue').getAll();
-    const allProgress = await tx.objectStore('progress').getAll();
+  async getDirtyCount(): Promise<number> {
+    const tx = this.db.transaction(['feeds', 'queue', 'progress'], 'readonly');
+    const [allFeeds, dirtyQueueCount, dirtyProgCount] = await Promise.all([
+      tx.objectStore('feeds').getAll(),
+      tx.objectStore('queue').index('bySyncDirty').count(1),
+      tx.objectStore('progress').index('bySyncDirty').count(1),
+    ]);
     await tx.done;
+    let dirtySubsCount = 0;
+    for (const f of allFeeds) {
+      if (
+        f.kind === 'RSS' &&
+        !f.feedKey.startsWith('l_') &&
+        (f.subscribedNum === 1 || f.deletedAt != null) &&
+        f.syncDirty === 1
+      ) {
+        dirtySubsCount += 1;
+      }
+    }
+    return dirtySubsCount + dirtyQueueCount + dirtyProgCount;
+  }
+
+  async loadLocalDoc(): Promise<LocalSyncSnapshot> {
+    let stateRow: IdbSyncStateRecord | undefined;
+    let allFeeds: IdbFeedRecord[];
+    let allQueue: IdbQueueRecord[];
+    let allProgress: IdbProgressRecord[];
+
+    // Use a non-blocking `'readonly'` transaction whenever `syncState` is already initialized (SYNC-P2-09).
+    if (this.cachedSyncState) {
+      const tx = this.db.transaction(['syncState', 'feeds', 'queue', 'progress'], 'readonly');
+      [stateRow, allFeeds, allQueue, allProgress] = await Promise.all([
+        tx.objectStore('syncState').get(1),
+        tx.objectStore('feeds').getAll(),
+        tx.objectStore('queue').getAll(),
+        tx.objectStore('progress').getAll(),
+      ]);
+      await tx.done;
+    } else {
+      const tx = this.db.transaction(['syncState', 'feeds', 'queue', 'progress'], 'readwrite');
+      stateRow = await this.ensureStateInStore(tx.objectStore('syncState'));
+      [allFeeds, allQueue, allProgress] = await Promise.all([
+        tx.objectStore('feeds').getAll(),
+        tx.objectStore('queue').getAll(),
+        tx.objectStore('progress').getAll(),
+      ]);
+      await tx.done;
+    }
+
+    if (!stateRow) {
+      const rwTx = this.db.transaction(['syncState'], 'readwrite');
+      stateRow = await this.ensureStateInStore(rwTx.objectStore('syncState'));
+      await rwTx.done;
+    } else {
+      this.cachedSyncState = stateRow;
+    }
 
     const localFeedKeys = new Set<FeedKey>();
     const subItems: Record<FeedKey, SyncSubscription> = {};
@@ -351,7 +474,7 @@ export class IdbSyncStore implements SyncStore {
         movedTo: f.movedTo ?? null,
         updatedAt: f.updatedAt,
         deleted,
-        deviceId: stateRow.deviceId,
+        deviceId: f.deviceId ?? stateRow.deviceId,
         ...(f.title !== undefined ? { title: f.title } : {}),
         ...(f.imageUrl !== undefined ? { imageUrl: f.imageUrl } : {}),
         ...(f.hasCredentials ? { hasCredentials: true } : {}),
@@ -375,16 +498,7 @@ export class IdbSyncStore implements SyncStore {
     const dirtyProg = new Set<EpisodeKey>();
     for (const p of allProgress) {
       if (localFeedKeys.has(p.feedKey) || p.feedKey.startsWith('l_')) continue;
-      progItems[p.episodeKey] = {
-        feedKey: p.feedKey,
-        positionMs: p.positionMs,
-        state: p.state,
-        playedAt: p.playedAt ?? null,
-        updatedAt: p.updatedAt,
-        deviceId: p.deviceId,
-        ...(p.identity !== undefined ? { identity: p.identity } : {}),
-        ...(p.durationMs !== undefined ? { durationMs: p.durationMs } : {}),
-      };
+      progItems[p.episodeKey] = idbProgressToSyncProgress(p);
       if (p.syncDirty === 1) {
         dirtyProg.add(p.episodeKey);
       }
@@ -412,8 +526,15 @@ export class IdbSyncStore implements SyncStore {
   async restampDirtyBelowFloor(
     floors: SyncState['floors'],
     stamp: () => HlcMs,
+    options?: RestampBelowFloorOptions,
   ): Promise<void> {
-    const tx = this.db.transaction(['feeds', 'queue', 'progress'], 'readwrite');
+    const excludeSubs = options?.excludeKeys?.subscriptions;
+    const excludeQueue = options?.excludeKeys?.queue;
+    const excludeProg = options?.excludeKeys?.progress;
+    const includeCleanLive = options?.includeCleanLive === true;
+
+    const tx = this.db.transaction(['syncState', 'feeds', 'queue', 'progress'], 'readwrite');
+    const stateRow = await this.ensureStateInStore(tx.objectStore('syncState'));
     const feedsStore = tx.objectStore('feeds');
     const queueStore = tx.objectStore('queue');
     const progStore = tx.objectStore('progress');
@@ -421,34 +542,47 @@ export class IdbSyncStore implements SyncStore {
     if (floors.subscriptions > 0) {
       const feeds = await feedsStore.getAll();
       for (const f of feeds) {
-        if (f.kind === 'RSS' && f.syncDirty === 1 && f.updatedAt <= floors.subscriptions) {
-          const next = Math.max(stamp(), floors.subscriptions + 1, f.updatedAt + 1);
-          await feedsStore.put({
-            ...f,
-            updatedAt: next,
-            ...(f.deletedAt != null ? { deletedAt: next } : {}),
-          });
-        }
+        if (f.kind !== 'RSS' || f.feedKey.startsWith('l_')) continue;
+        if (f.subscribedNum === 0 && f.deletedAt == null) continue; // stub
+        if (f.updatedAt > floors.subscriptions) continue;
+        if (excludeSubs?.has(f.feedKey)) continue;
+        const eligible =
+          f.syncDirty === 1 || (includeCleanLive && f.subscribedNum === 1 && f.deletedAt == null);
+        if (!eligible) continue;
+        const next = Math.max(stamp(), floors.subscriptions + 1, f.updatedAt + 1);
+        await feedsStore.put({
+          ...f,
+          updatedAt: next,
+          deviceId: stateRow.deviceId,
+          syncDirty: 1,
+          ...(f.deletedAt != null ? { deletedAt: next } : {}),
+        });
       }
     }
 
     if (floors.queue > 0) {
       const queue = await queueStore.getAll();
       for (const q of queue) {
-        if (q.syncDirty === 1 && q.updatedAt <= floors.queue) {
-          const next = Math.max(stamp(), floors.queue + 1, q.updatedAt + 1);
-          await queueStore.put({ ...q, updatedAt: next });
-        }
+        if (q.feedKey.startsWith('l_')) continue;
+        if (q.updatedAt > floors.queue) continue;
+        if (excludeQueue?.has(q.episodeKey)) continue;
+        const eligible = q.syncDirty === 1 || (includeCleanLive && q.removedNum === 0);
+        if (!eligible) continue;
+        const next = Math.max(stamp(), floors.queue + 1, q.updatedAt + 1);
+        await queueStore.put({ ...q, updatedAt: next, deviceId: stateRow.deviceId, syncDirty: 1 });
       }
     }
 
     if (floors.progress > 0) {
       const prog = await progStore.getAll();
       for (const p of prog) {
-        if (p.syncDirty === 1 && p.updatedAt <= floors.progress) {
-          const next = Math.max(stamp(), floors.progress + 1, p.updatedAt + 1);
-          await progStore.put({ ...p, updatedAt: next });
-        }
+        if (p.feedKey.startsWith('l_')) continue;
+        if (p.updatedAt > floors.progress) continue;
+        if (excludeProg?.has(p.episodeKey)) continue;
+        const eligible = p.syncDirty === 1 || includeCleanLive;
+        if (!eligible) continue;
+        const next = Math.max(stamp(), floors.progress + 1, p.updatedAt + 1);
+        await progStore.put({ ...p, updatedAt: next, deviceId: stateRow.deviceId, syncDirty: 1 });
       }
     }
 
@@ -471,13 +605,20 @@ export class IdbSyncStore implements SyncStore {
       readonly deviceName: string;
     }> = [];
     const feedsToRefresh: FeedKey[] = [];
+    let subsChanged = false;
+    let queueChanged = false;
+    let progressChanged = false;
+    const changedProgressKeys = new Set<EpisodeKey>();
+    let hasConcurrentLocalEdits = false;
+    const writeWallMs = Date.now();
 
     const tx = this.db.transaction(
-      ['feeds', 'episodes', 'progress', 'queue', 'syncState'],
+      ['feeds', 'episodes', 'chapters', 'progress', 'queue', 'syncState'],
       'readwrite',
     );
     const feedsStore = tx.objectStore('feeds');
     const episodesStore = tx.objectStore('episodes');
+    const chaptersStore = tx.objectStore('chapters');
     const progressStore = tx.objectStore('progress');
     const queueStore = tx.objectStore('queue');
     const syncStateStore = tx.objectStore('syncState');
@@ -491,11 +632,13 @@ export class IdbSyncStore implements SyncStore {
     ]);
 
     const localFeedKeys = new Set<FeedKey>();
+    const preFeedMap = new Map<FeedKey, IdbFeedRecord>();
     const feedMap = new Map<FeedKey, IdbFeedRecord>();
     for (const f of allFeeds) {
       if (f.kind === 'LOCAL' || f.feedKey.startsWith('l_')) {
         localFeedKeys.add(f.feedKey);
       } else {
+        preFeedMap.set(f.feedKey, f);
         feedMap.set(f.feedKey, f);
       }
     }
@@ -503,56 +646,85 @@ export class IdbSyncStore implements SyncStore {
     const episodeMap = new Map<EpisodeKey, IdbEpisodeRecord>(
       allEpisodes.map((e) => [e.episodeKey, e]),
     );
+    // Transaction-start pre-cascade snapshots for concurrent-edit detection (SYNC-P0-01)
+    const preQueueMap = new Map<EpisodeKey, IdbQueueRecord>(
+      allQueue.map((q) => [q.episodeKey, q]),
+    );
     const queueMap = new Map<EpisodeKey, IdbQueueRecord>(
       allQueue.map((q) => [q.episodeKey, q]),
+    );
+    const preProgressMap = new Map<EpisodeKey, IdbProgressRecord>(
+      allProgress.map((p) => [p.episodeKey, p]),
     );
     const progressMap = new Map<EpisodeKey, IdbProgressRecord>(
       allProgress.map((p) => [p.episodeKey, p]),
     );
 
+    const collectMergedPreserveQueueKeys = (
+      fk: FeedKey,
+      cutoff: HlcMs,
+    ): ReadonlySet<EpisodeKey> => {
+      const preserved = new Set<EpisodeKey>();
+      for (const [epKey, q] of Object.entries(merged.queue.items)) {
+        if (q.feedKey === fk && !q.removed && q.updatedAt > cutoff) {
+          preserved.add(epKey);
+        }
+      }
+      return preserved;
+    };
+
     const softDeleteFeedInTx = async (
       fk: FeedKey,
       stampHlc: HlcMs,
+      deviceId: DeviceId,
       markDirty: 0 | 1,
+      preserveQueueKeys: ReadonlySet<EpisodeKey>,
     ): Promise<void> => {
       const f = feedMap.get(fk);
       if (!f) return;
 
-      for (const q of queueMap.values()) {
-        if (q.feedKey === fk && q.removedNum === 0) {
-          const nextQ: IdbQueueRecord = {
-            episodeKey: q.episodeKey,
-            feedKey: q.feedKey,
-            pos: q.pos,
-            addedAt: q.addedAt,
-            updatedAt: stampHlc,
-            removedNum: 1,
-            deviceId: stateRow.deviceId,
-            syncDirty: markDirty,
-          };
-          queueMap.set(q.episodeKey, nextQ);
-          await queueStore.put(nextQ);
+      const protectedEpisodeKeys = new Set<EpisodeKey>();
+      if (currentEpisodeKey) protectedEpisodeKeys.add(currentEpisodeKey);
+      for (const k of preserveQueueKeys) protectedEpisodeKeys.add(k);
+
+      for (const q of [...queueMap.values()]) {
+        if (q.feedKey !== fk || q.removedNum !== 0) continue;
+        if (preserveQueueKeys.has(q.episodeKey)) {
+          protectedEpisodeKeys.add(q.episodeKey);
+          continue;
         }
+        // Concurrent local re-queue/edit strictly newer than remote unsubscribe -> protect! (SYNC-P0-01)
+        const preQ = preQueueMap.get(q.episodeKey);
+        if (markDirty === 0 && preQ && preQ.syncDirty === 1 && preQ.updatedAt > stampHlc) {
+          protectedEpisodeKeys.add(q.episodeKey);
+          continue;
+        }
+        const nextQ: IdbQueueRecord = {
+          episodeKey: q.episodeKey,
+          feedKey: q.feedKey,
+          pos: q.pos,
+          addedAt: q.addedAt,
+          updatedAt: stampHlc,
+          removedNum: 1,
+          deviceId,
+          syncDirty: markDirty,
+        };
+        queueMap.set(q.episodeKey, nextQ);
+        await queueStore.put(nextQ);
+        queueChanged = true;
       }
 
-      for (const ep of episodeMap.values()) {
+      for (const ep of [...episodeMap.values()]) {
         if (ep.feedKey !== fk) continue;
+        if (protectedEpisodeKeys.has(ep.episodeKey)) {
+          continue;
+        }
         if (ep.downloadPath) {
           downloadsToDelete.push(ep.downloadPath);
         }
-        const activeInQueue = queueMap.get(ep.episodeKey)?.removedNum === 0;
-        if (!activeInQueue && ep.episodeKey !== currentEpisodeKey) {
-          episodeMap.delete(ep.episodeKey);
-          await episodesStore.delete(ep.episodeKey);
-        } else if (ep.downloadState !== 'NONE') {
-          const clearedEp: IdbEpisodeRecord = {
-            ...ep,
-            downloadState: 'NONE',
-          };
-          delete (clearedEp as { downloadPath?: string }).downloadPath;
-          episodeMap.set(ep.episodeKey, clearedEp);
-          await episodesStore.put(clearedEp);
-        }
+        episodeMap.delete(ep.episodeKey);
+        await episodesStore.delete(ep.episodeKey);
+        await chaptersStore.delete(ep.episodeKey);
       }
 
       const nextFeed: IdbFeedRecord = {
@@ -560,20 +732,32 @@ export class IdbSyncStore implements SyncStore {
         subscribedNum: 0,
         updatedAt: stampHlc,
         deletedAt: stampHlc,
+        deviceId,
         syncDirty: markDirty,
       };
       feedMap.set(fk, nextFeed);
       await feedsStore.put(nextFeed);
     };
 
-    // 1. Subscriptions
+    const canHardDeleteFeedInTx = (fk: FeedKey): boolean => {
+      for (const q of queueMap.values()) {
+        if (q.feedKey === fk && q.removedNum === 0) return false;
+      }
+      if (currentEpisodeKey) {
+        const playingEp = episodeMap.get(currentEpisodeKey);
+        if (playingEp && playingEp.feedKey === fk) return false;
+      }
+      return true;
+    };
+
+    // 1. Subscriptions (4-state updatedAt-first guard, SYNC-P0-01)
     for (const [fk, winSub] of Object.entries(merged.subscriptions.items)) {
       if (localFeedKeys.has(fk) || fk.startsWith('l_')) continue;
-      const localRow = feedMap.get(fk);
+      const localRow = preFeedMap.get(fk);
       const effectiveUrl = winSub.movedTo || winSub.url;
 
-      if (!winSub.deleted) {
-        if (!localRow) {
+      if (!localRow) {
+        if (!winSub.deleted) {
           const created: IdbFeedRecord = {
             feedKey: fk,
             kind: 'RSS',
@@ -585,6 +769,7 @@ export class IdbSyncStore implements SyncStore {
             addedAt: winSub.updatedAt,
             updatedAt: winSub.updatedAt,
             deletedAt: null,
+            deviceId: winSub.deviceId,
             syncDirty: 0,
             ...(winSub.title !== undefined ? { title: winSub.title } : {}),
             ...(winSub.imageUrl !== undefined ? { imageUrl: winSub.imageUrl } : {}),
@@ -593,38 +778,6 @@ export class IdbSyncStore implements SyncStore {
           await feedsStore.put(created);
           feedsToRefresh.push(fk);
         } else {
-          const wasUnsubscribed = localRow.subscribedNum === 0 || localRow.deletedAt != null;
-          const localWon =
-            localRow.syncDirty === 1 &&
-            localRow.subscribedNum === 1 &&
-            localRow.deletedAt == null &&
-            localRow.updatedAt >= winSub.updatedAt &&
-            subscriptionEquals(localRow, winSub);
-
-          const updated: IdbFeedRecord = {
-            ...localRow,
-            subscribedNum: 1,
-            url: effectiveUrl,
-            movedTo: winSub.movedTo ?? localRow.movedTo ?? null,
-            hasCredentials: localRow.hasCredentials || Boolean(winSub.hasCredentials),
-            updatedAt: winSub.updatedAt,
-            deletedAt: null,
-            syncDirty: localWon ? 1 : 0,
-            ...(localRow.title === undefined && winSub.title !== undefined
-              ? { title: winSub.title }
-              : {}),
-            ...(localRow.imageUrl === undefined && winSub.imageUrl !== undefined
-              ? { imageUrl: winSub.imageUrl }
-              : {}),
-          };
-          feedMap.set(fk, updated);
-          await feedsStore.put(updated);
-          if (wasUnsubscribed) {
-            feedsToRefresh.push(fk);
-          }
-        }
-      } else {
-        if (!localRow) {
           const tomb: IdbFeedRecord = {
             feedKey: fk,
             kind: 'RSS',
@@ -636,45 +789,144 @@ export class IdbSyncStore implements SyncStore {
             addedAt: winSub.updatedAt,
             updatedAt: winSub.updatedAt,
             deletedAt: winSub.updatedAt,
+            deviceId: winSub.deviceId,
             syncDirty: 0,
             ...(winSub.title !== undefined ? { title: winSub.title } : {}),
             ...(winSub.imageUrl !== undefined ? { imageUrl: winSub.imageUrl } : {}),
           };
           feedMap.set(fk, tomb);
           await feedsStore.put(tomb);
-        } else if (localRow.subscribedNum === 1 || localRow.deletedAt == null) {
-          await softDeleteFeedInTx(fk, winSub.updatedAt, 0);
+        }
+        subsChanged = true;
+        continue;
+      }
+
+      if (localRow.syncDirty === 1 && localRow.updatedAt > winSub.updatedAt) {
+        hasConcurrentLocalEdits = true;
+        continue;
+      }
+
+      if (localRow.updatedAt === winSub.updatedAt) {
+        if (localRow.syncDirty === 1 && subscriptionCoreMatches(localRow, winSub)) {
+          continue;
+        }
+        if (localRow.syncDirty === 0 && subscriptionFullyMatches(localRow, winSub, stateRow.deviceId)) {
+          continue;
+        }
+      }
+
+      if (!winSub.deleted) {
+        const wasUnsubscribed = localRow.subscribedNum === 0 || localRow.deletedAt != null;
+        const updated: IdbFeedRecord = {
+          ...localRow,
+          subscribedNum: 1,
+          url: effectiveUrl,
+          movedTo: winSub.movedTo ?? localRow.movedTo ?? null,
+          hasCredentials: localRow.hasCredentials || Boolean(winSub.hasCredentials),
+          updatedAt: winSub.updatedAt,
+          deletedAt: null,
+          deviceId: winSub.deviceId,
+          syncDirty: 0,
+          ...(localRow.title === undefined && winSub.title !== undefined
+            ? { title: winSub.title }
+            : {}),
+          ...(localRow.imageUrl === undefined && winSub.imageUrl !== undefined
+            ? { imageUrl: winSub.imageUrl }
+            : {}),
+        };
+        feedMap.set(fk, updated);
+        await feedsStore.put(updated);
+        subsChanged = true;
+        if (wasUnsubscribed) {
+          feedsToRefresh.push(fk);
+        }
+      } else {
+        if (localRow.subscribedNum === 1 || localRow.deletedAt == null) {
+          const preserveQueueKeys = collectMergedPreserveQueueKeys(fk, winSub.updatedAt);
+          await softDeleteFeedInTx(fk, winSub.updatedAt, winSub.deviceId, 0, preserveQueueKeys);
+          subsChanged = true;
         } else {
-          const localWon = localRow.syncDirty === 1 && localRow.updatedAt >= winSub.updatedAt;
           const updatedTomb: IdbFeedRecord = {
             ...localRow,
             updatedAt: winSub.updatedAt,
             deletedAt: winSub.updatedAt,
-            syncDirty: localWon ? 1 : 0,
+            deviceId: winSub.deviceId,
+            syncDirty: 0,
           };
           feedMap.set(fk, updatedTomb);
           await feedsStore.put(updatedTomb);
+          subsChanged = true;
         }
       }
     }
 
     // Clean (`syncDirty === 0`) RSS subscriptions absent from merged fell under remote floor
-    for (const localRow of [...feedMap.values()]) {
+    for (const localRow of [...preFeedMap.values()]) {
       if (localRow.syncDirty !== 0) continue;
       if (localRow.subscribedNum === 0 && localRow.deletedAt == null) continue; // stub
       if (!(localRow.feedKey in merged.subscriptions.items)) {
+        const floorStamp = Math.max(merged.subscriptions.floor, localRow.updatedAt);
+        const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feedKey, floorStamp);
         if (localRow.subscribedNum === 1) {
-          await softDeleteFeedInTx(localRow.feedKey, this.hlc.now(), 0);
+          await softDeleteFeedInTx(
+            localRow.feedKey,
+            floorStamp,
+            stateRow.deviceId,
+            0,
+            preserveQueueKeys,
+          );
+          subsChanged = true;
         }
-        feedMap.delete(localRow.feedKey);
-        await feedsStore.delete(localRow.feedKey);
+        // Clean orphan episodes/chapters & downloads before deleting feed (SYNC-P2-05)
+        if (preserveQueueKeys.size === 0 && canHardDeleteFeedInTx(localRow.feedKey)) {
+          for (const ep of [...episodeMap.values()]) {
+            if (ep.feedKey !== localRow.feedKey) continue;
+            if (ep.downloadPath) {
+              downloadsToDelete.push(ep.downloadPath);
+            }
+            episodeMap.delete(ep.episodeKey);
+            await episodesStore.delete(ep.episodeKey);
+            await chaptersStore.delete(ep.episodeKey);
+          }
+          feedMap.delete(localRow.feedKey);
+          await feedsStore.delete(localRow.feedKey);
+          subsChanged = true;
+        }
       }
     }
 
-    // 2. Queue
+    // 2. Queue (using pre-cascade `preQueueMap` snapshot, SYNC-P0-01)
     for (const [epKey, winQ] of Object.entries(merged.queue.items)) {
       if (localFeedKeys.has(winQ.feedKey) || winQ.feedKey.startsWith('l_')) continue;
-      const localQ = queueMap.get(epKey);
+      const preQ = preQueueMap.get(epKey);
+
+      if (preQ) {
+        if (preQ.syncDirty === 1 && preQ.updatedAt > winQ.updatedAt) {
+          hasConcurrentLocalEdits = true;
+          continue;
+        }
+        if (preQ.updatedAt === winQ.updatedAt) {
+          const coreMatch = (preQ.removedNum === 1) === winQ.removed && preQ.pos === winQ.pos;
+          if (preQ.syncDirty === 1 && coreMatch) {
+            continue;
+          }
+          if (preQ.syncDirty === 0) {
+            const curQ = queueMap.get(epKey);
+            if (
+              curQ &&
+              curQ.updatedAt === winQ.updatedAt &&
+              (curQ.removedNum === 1) === winQ.removed &&
+              curQ.pos === winQ.pos &&
+              curQ.deviceId === winQ.deviceId &&
+              curQ.addedAt === winQ.addedAt &&
+              curQ.feedKey === winQ.feedKey &&
+              curQ.syncDirty === 0
+            ) {
+              continue;
+            }
+          }
+        }
+      }
 
       if (!winQ.removed) {
         if (!feedMap.has(winQ.feedKey)) {
@@ -723,14 +975,6 @@ export class IdbSyncStore implements SyncStore {
         }
       }
 
-      const localWon =
-        localQ !== undefined &&
-        localQ.syncDirty === 1 &&
-        localQ.updatedAt >= winQ.updatedAt &&
-        localQ.deviceId === winQ.deviceId &&
-        (localQ.removedNum === 1) === winQ.removed &&
-        localQ.pos === winQ.pos;
-
       const entry = fromSyncQueueEntry(epKey, winQ);
       const nextQ: IdbQueueRecord = {
         episodeKey: entry.episodeKey,
@@ -740,42 +984,59 @@ export class IdbSyncStore implements SyncStore {
         updatedAt: entry.updatedAt,
         removedNum: entry.removed ? 1 : 0,
         deviceId: entry.deviceId,
-        syncDirty: localWon ? 1 : 0,
+        syncDirty: 0,
         ...(entry.stub !== undefined ? { stub: entry.stub } : {}),
       };
       queueMap.set(epKey, nextQ);
       await queueStore.put(nextQ);
+      queueChanged = true;
     }
 
-    for (const localQ of [...queueMap.values()]) {
+    for (const localQ of [...preQueueMap.values()]) {
       if (localFeedKeys.has(localQ.feedKey) || localQ.feedKey.startsWith('l_')) continue;
       if (localQ.syncDirty === 0 && !(localQ.episodeKey in merged.queue.items)) {
         queueMap.delete(localQ.episodeKey);
         await queueStore.delete(localQ.episodeKey);
+        queueChanged = true;
       }
     }
 
-    // 3. Progress
+    // 3. Progress (using pre-cascade `preProgressMap`, setting `localWrittenAt`, SYNC-P0-01, SYNC-P0-03)
     for (const [epKey, winP] of Object.entries(merged.progress.items)) {
       if (localFeedKeys.has(winP.feedKey) || winP.feedKey.startsWith('l_')) continue;
-      const localP = progressMap.get(epKey);
+      const preP = preProgressMap.get(epKey);
+
+      if (preP) {
+        if (preP.syncDirty === 1 && preP.updatedAt > winP.updatedAt) {
+          hasConcurrentLocalEdits = true;
+          continue;
+        }
+        if (preP.updatedAt === winP.updatedAt) {
+          const coreMatch = preP.state === winP.state && preP.positionMs === winP.positionMs;
+          if (preP.syncDirty === 1 && coreMatch) {
+            continue;
+          }
+          if (
+            preP.syncDirty === 0 &&
+            coreMatch &&
+            preP.deviceId === winP.deviceId &&
+            preP.feedKey === winP.feedKey &&
+            preP.durationMs === winP.durationMs &&
+            (preP.playedAt ?? null) === (winP.playedAt ?? null) &&
+            preP.identity === winP.identity
+          ) {
+            continue;
+          }
+        }
+      }
 
       const changedRemotely =
         winP.deviceId !== stateRow.deviceId &&
-        (!localP ||
-          winP.updatedAt > localP.updatedAt ||
-          (winP.updatedAt === localP.updatedAt &&
-            (winP.positionMs !== localP.positionMs || winP.state !== localP.state)));
+        (!preP ||
+          winP.updatedAt > preP.updatedAt ||
+          (winP.updatedAt === preP.updatedAt &&
+            (winP.positionMs !== preP.positionMs || winP.state !== preP.state)));
 
-      const localWon =
-        localP !== undefined &&
-        localP.syncDirty === 1 &&
-        localP.updatedAt >= winP.updatedAt &&
-        localP.deviceId === winP.deviceId &&
-        localP.positionMs === winP.positionMs &&
-        localP.state === winP.state;
-
-      const identity = winP.identity ?? localP?.identity ?? episodeMap.get(epKey)?.identity;
       const nextP: IdbProgressRecord = {
         episodeKey: epKey,
         feedKey: winP.feedKey,
@@ -784,12 +1045,15 @@ export class IdbSyncStore implements SyncStore {
         playedAt: winP.playedAt ?? null,
         updatedAt: winP.updatedAt,
         deviceId: winP.deviceId,
-        syncDirty: localWon ? 1 : 0,
-        ...(identity !== undefined ? { identity } : {}),
+        localWrittenAt: writeWallMs,
+        syncDirty: 0,
+        ...(winP.identity !== undefined ? { identity: winP.identity } : {}),
         ...(winP.durationMs !== undefined ? { durationMs: winP.durationMs } : {}),
       };
       progressMap.set(epKey, nextP);
       await progressStore.put(nextP);
+      progressChanged = true;
+      changedProgressKeys.add(epKey);
 
       if (changedRemotely && currentEpisodeKey !== undefined && epKey === currentEpisodeKey) {
         const remoteDevName = merged.devices[winP.deviceId]?.name ?? 'another device';
@@ -802,11 +1066,13 @@ export class IdbSyncStore implements SyncStore {
       }
     }
 
-    for (const localP of [...progressMap.values()]) {
+    for (const localP of [...preProgressMap.values()]) {
       if (localFeedKeys.has(localP.feedKey) || localP.feedKey.startsWith('l_')) continue;
       if (localP.syncDirty === 0 && !(localP.episodeKey in merged.progress.items)) {
         progressMap.delete(localP.episodeKey);
         await progressStore.delete(localP.episodeKey);
+        progressChanged = true;
+        changedProgressKeys.add(localP.episodeKey);
       }
     }
 
@@ -827,7 +1093,17 @@ export class IdbSyncStore implements SyncStore {
       await this.onDeleteDownloads(downloadsToDelete);
     }
 
-    return { resumeHints, feedsToRefresh };
+    return {
+      resumeHints,
+      feedsToRefresh,
+      changed: {
+        subscriptions: subsChanged,
+        queue: queueChanged,
+        progress: progressChanged,
+        progressEpisodeKeys: [...changedProgressKeys],
+      },
+      hasConcurrentLocalEdits,
+    };
   }
 
   async markClean(pushed: SyncEntityMaps): Promise<void> {
@@ -861,13 +1137,22 @@ export class IdbSyncStore implements SyncStore {
   }
 
   async purgeBelowFloors(floors: SyncState['floors']): Promise<void> {
-    const tx = this.db.transaction(['feeds', 'queue', 'progress'], 'readwrite');
+    const downloadsToDelete: string[] = [];
+    const currentEpKey = this.getCurrentEpisodeKey?.();
+
+    const tx = this.db.transaction(['feeds', 'episodes', 'chapters', 'queue', 'progress'], 'readwrite');
     const feedsStore = tx.objectStore('feeds');
+    const episodesStore = tx.objectStore('episodes');
+    const chaptersStore = tx.objectStore('chapters');
     const queueStore = tx.objectStore('queue');
     const progStore = tx.objectStore('progress');
 
     if (floors.subscriptions > 0) {
-      const feeds = await feedsStore.getAll();
+      const [feeds, allQueue] = await Promise.all([feedsStore.getAll(), queueStore.getAll()]);
+      const activeQueueFeedKeys = new Set(
+        allQueue.filter((q) => q.removedNum === 0).map((q) => q.feedKey),
+      );
+
       for (const f of feeds) {
         if (
           f.kind === 'RSS' &&
@@ -876,6 +1161,19 @@ export class IdbSyncStore implements SyncStore {
           f.syncDirty === 0 &&
           f.updatedAt <= floors.subscriptions
         ) {
+          if (activeQueueFeedKeys.has(f.feedKey)) continue;
+          const feedEps = await episodesStore.index('byFeed').getAll(f.feedKey);
+          if (currentEpKey && feedEps.some((e) => e.episodeKey === currentEpKey)) {
+            continue;
+          }
+          // Clean orphan episodes, chapters, and downloads when purging feed (SYNC-P2-05)
+          for (const ep of feedEps) {
+            if (ep.downloadPath) {
+              downloadsToDelete.push(ep.downloadPath);
+            }
+            await episodesStore.delete(ep.episodeKey);
+            await chaptersStore.delete(ep.episodeKey);
+          }
           await feedsStore.delete(f.feedKey);
         }
       }
@@ -900,6 +1198,10 @@ export class IdbSyncStore implements SyncStore {
     }
 
     await tx.done;
+
+    if (downloadsToDelete.length > 0 && this.onDeleteDownloads) {
+      await this.onDeleteDownloads(downloadsToDelete);
+    }
   }
 
   /**
@@ -981,6 +1283,8 @@ export class IdbSyncStore implements SyncStore {
     readonly subscribed: boolean;
     readonly parsed: ParsedFeed;
     readonly nowWallMs: EpochMs;
+    readonly deviceId?: DeviceId;
+    readonly preserveSubscriptionState?: boolean;
     readonly hasCredentials?: boolean;
     readonly movedTo?: string;
     readonly etag?: string;
@@ -998,12 +1302,44 @@ export class IdbSyncStore implements SyncStore {
     const queueStore = tx.objectStore('queue');
 
     const existingFeed = await feedsStore.get(params.feedKey);
+
+    // Refresh guard (SYNC-P0-02): re-check live subscription status inside the write tx;
+    // abort write-back if unsubscribed/deleted/purged during the HTTP fetch.
+    if (params.preserveSubscriptionState) {
+      if (!existingFeed || existingFeed.subscribedNum === 0 || existingFeed.deletedAt != null) {
+        await tx.done;
+        if (existingFeed) {
+          return idbRecordToFeed(existingFeed);
+        }
+        return {
+          feedKey: params.feedKey,
+          kind: params.kind,
+          subscribed: false,
+          url: params.url,
+          hasCredentials: false,
+          addedAt: params.nowWallMs,
+          updatedAt: params.nowWallMs,
+        };
+      }
+    }
+
     const existingEps = await episodesStore.index('byFeed').getAll(params.feedKey);
     const existingEpByKey = new Map<EpisodeKey, IdbEpisodeRecord>(
       existingEps.map((e) => [e.episodeKey, e]),
     );
 
-    const stamp = this.hlc.stamp(existingFeed?.updatedAt);
+    const effectiveSubscribed = params.preserveSubscriptionState
+      ? existingFeed!.subscribedNum === 1
+      : params.subscribed;
+    const subscribingNow =
+      !params.preserveSubscriptionState &&
+      effectiveSubscribed &&
+      (!existingFeed || existingFeed.subscribedNum === 0 || existingFeed.deletedAt != null);
+    const urlMoved = params.movedTo !== undefined && params.movedTo !== existingFeed?.movedTo;
+    const stamp =
+      !existingFeed || subscribingNow || urlMoved || params.markSyncDirty
+        ? this.hlc.stamp(existingFeed?.updatedAt)
+        : existingFeed.updatedAt;
     const effectiveImage =
       params.overrideImageUrl?.trim() ||
       params.parsed.imageUrl?.trim() ||
@@ -1079,18 +1415,24 @@ export class IdbSyncStore implements SyncStore {
       }
     }
 
-    const markDirty =
+    const markDirty: 0 | 1 =
       params.kind === 'LOCAL'
         ? 0
-        : params.markSyncDirty
+        : params.markSyncDirty || subscribingNow || urlMoved
           ? 1
           : (existingFeed?.syncDirty ?? 0);
 
-    const nextSubscribedNum = params.subscribed
+    const nextSubscribedNum: 0 | 1 = effectiveSubscribed
       ? 1
       : existingFeed?.deletedAt == null
         ? (existingFeed?.subscribedNum ?? 0)
         : 0;
+
+    const effectiveDeviceId =
+      (subscribingNow || urlMoved || !existingFeed) &&
+      (params.deviceId ?? this.cachedSyncState?.deviceId) !== undefined
+        ? (params.deviceId ?? this.cachedSyncState?.deviceId)
+        : (existingFeed?.deviceId ?? params.deviceId ?? this.cachedSyncState?.deviceId);
 
     const feedRec: IdbFeedRecord = {
       feedKey: params.feedKey,
@@ -1101,10 +1443,11 @@ export class IdbSyncStore implements SyncStore {
       hasCredentials: params.hasCredentials ?? existingFeed?.hasCredentials ?? false,
       lastRefreshedAt: params.nowWallMs,
       lastEpisodeAt: maxPubDate,
-      addedAt: existingFeed?.addedAt ?? stamp,
-      updatedAt: params.markSyncDirty || !existingFeed ? stamp : existingFeed.updatedAt,
-      deletedAt: params.subscribed ? null : (existingFeed?.deletedAt ?? null),
+      addedAt: subscribingNow ? stamp : (existingFeed?.addedAt ?? stamp),
+      updatedAt: stamp,
+      deletedAt: effectiveSubscribed ? null : (existingFeed?.deletedAt ?? null),
       syncDirty: markDirty,
+      ...(effectiveDeviceId !== undefined ? { deviceId: effectiveDeviceId } : {}),
       ...(params.parsed.title !== undefined
         ? { title: params.parsed.title }
         : existingFeed?.title !== undefined
@@ -1265,14 +1608,15 @@ export class IdbSyncStore implements SyncStore {
     deviceId: DeviceId,
   ): Promise<FeedKey> {
     const newFeedKey = deriveFeedKey(newUrl);
-    const tx = this.db.transaction(['feeds', 'episodes', 'queue', 'progress'], 'readwrite');
+    const tx = this.db.transaction(['feeds', 'episodes', 'chapters', 'queue', 'progress'], 'readwrite');
     const feedsStore = tx.objectStore('feeds');
     const episodesStore = tx.objectStore('episodes');
+    const chaptersStore = tx.objectStore('chapters');
     const queueStore = tx.objectStore('queue');
     const progStore = tx.objectStore('progress');
 
     const oldFeed = await feedsStore.get(oldFeedKey);
-    if (!oldFeed) {
+    if (!oldFeed || oldFeed.kind !== 'RSS') {
       await tx.done;
       return oldFeedKey;
     }
@@ -1280,70 +1624,134 @@ export class IdbSyncStore implements SyncStore {
     const stamp = this.hlc.stamp(oldFeed.updatedAt);
 
     if (newFeedKey === oldFeedKey) {
+      if (oldFeed.url !== newUrl || oldFeed.movedTo !== newUrl) {
+        await feedsStore.put({
+          ...oldFeed,
+          url: newUrl,
+          movedTo: newUrl,
+          updatedAt: stamp,
+          deviceId,
+          syncDirty: 1,
+        });
+      }
+      await tx.done;
+      return oldFeedKey;
+    }
+
+    const existingTarget = await feedsStore.get(newFeedKey);
+    if (!existingTarget) {
+      // Align with Node & §4.1.3: when target key does not exist locally, keep `oldFeedKey`
+      // and record `movedTo` + updated fetch `url` on the original key (SYNC-P1-03).
       await feedsStore.put({
         ...oldFeed,
         url: newUrl,
         movedTo: newUrl,
         updatedAt: stamp,
+        deviceId,
         syncDirty: 1,
       });
       await tx.done;
       return oldFeedKey;
     }
 
-    const existingTarget = await feedsStore.get(newFeedKey);
+    // Alias collision merge: tombstone `oldFeedKey` with `movedTo` and merge into `existingTarget` (§4.1.3)
+    const survivorStamp = this.hlc.stamp(existingTarget.updatedAt);
+    await feedsStore.put({
+      ...existingTarget,
+      url: newUrl,
+      subscribedNum: oldFeed.subscribedNum === 1 ? 1 : existingTarget.subscribedNum,
+      deletedAt: oldFeed.subscribedNum === 1 ? null : (existingTarget.deletedAt ?? null),
+      updatedAt: survivorStamp,
+      deviceId,
+      syncDirty: 1,
+    });
+
     await feedsStore.put({
       ...oldFeed,
       subscribedNum: 0,
       movedTo: newUrl,
       updatedAt: stamp,
       deletedAt: stamp,
-      syncDirty: 1,
-    });
-
-    await feedsStore.put({
-      ...(existingTarget ?? oldFeed),
-      feedKey: newFeedKey,
-      url: newUrl,
-      movedTo: null,
-      subscribedNum: oldFeed.subscribedNum,
-      updatedAt: stamp,
-      deletedAt: null,
+      deviceId,
       syncDirty: 1,
     });
 
     const oldEps = await episodesStore.index('byFeed').getAll(oldFeedKey);
+    const identityByOldEpKey = new Map<EpisodeKey, string>();
     for (const ep of oldEps) {
+      identityByOldEpKey.set(ep.episodeKey, ep.identity);
       const nextEpKey = deriveEpisodeKey(newFeedKey, ep.identity);
+      const existingTargetEp = await episodesStore.get(nextEpKey);
       await episodesStore.delete(ep.episodeKey);
-      await episodesStore.put({
-        ...ep,
-        episodeKey: nextEpKey,
-        feedKey: newFeedKey,
-      });
-
-      const q = await queueStore.get(ep.episodeKey);
-      if (q) {
-        await queueStore.delete(ep.episodeKey);
-        await queueStore.put({
-          ...q,
+      if (!existingTargetEp) {
+        await episodesStore.put({
+          ...ep,
           episodeKey: nextEpKey,
           feedKey: newFeedKey,
-          updatedAt: stamp,
-          deviceId,
-          syncDirty: 1,
         });
       }
+      const ch = await chaptersStore.get(ep.episodeKey);
+      if (ch) {
+        await chaptersStore.delete(ep.episodeKey);
+        if (!(await chaptersStore.get(nextEpKey))) {
+          await chaptersStore.put({ ...ch, episodeKey: nextEpKey });
+        }
+      }
+    }
 
-      const p = await progStore.get(ep.episodeKey);
-      if (p) {
-        await progStore.delete(ep.episodeKey);
+    // Re-key active queue rows: write a Tombstone on `oldEpKey` (NEVER hard delete!)
+    // so old keys never boomerang back as stubs after sync (SYNC-P1-03).
+    const oldQueue = await queueStore.index('byFeed').getAll(oldFeedKey);
+    for (const q of oldQueue) {
+      if (q.removedNum !== 0) continue;
+      const identity = q.stub?.identity ?? identityByOldEpKey.get(q.episodeKey);
+      if (!identity) continue;
+      const nextEpKey = deriveEpisodeKey(newFeedKey, identity);
+      const tombStamp = this.hlc.stamp(q.updatedAt);
+      const nextStamp = this.hlc.stamp(q.updatedAt);
+      const tombRec: IdbQueueRecord = {
+        episodeKey: q.episodeKey,
+        feedKey: q.feedKey,
+        pos: q.pos,
+        addedAt: q.addedAt,
+        updatedAt: tombStamp,
+        removedNum: 1,
+        deviceId,
+        syncDirty: 1,
+      };
+      await queueStore.put(tombRec);
+      await queueStore.put({
+        ...q,
+        episodeKey: nextEpKey,
+        feedKey: newFeedKey,
+        updatedAt: nextStamp,
+        removedNum: 0,
+        deviceId,
+        syncDirty: 1,
+      });
+    }
+
+    // Re-key progress rows: compare against existing target progress via `pickProgress`
+    // so newer progress on the target key is never overwritten (SYNC-P1-03).
+    const writeWallMs = Date.now();
+    const oldProgs = await progStore.index('byFeed').getAll(oldFeedKey);
+    for (const p of oldProgs) {
+      const identity = p.identity ?? identityByOldEpKey.get(p.episodeKey);
+      if (!identity) continue;
+      const nextEpKey = deriveEpisodeKey(newFeedKey, identity);
+      const targetP = await progStore.get(nextEpKey);
+      await progStore.delete(p.episodeKey);
+      const candidateSync = idbProgressToSyncProgress({ ...p, episodeKey: nextEpKey, feedKey: newFeedKey, identity });
+      const keepOld =
+        !targetP ||
+        pickProgress(candidateSync, idbProgressToSyncProgress(targetP)) === candidateSync;
+      if (keepOld) {
         await progStore.put({
           ...p,
           episodeKey: nextEpKey,
           feedKey: newFeedKey,
-          updatedAt: stamp,
-          deviceId,
+          identity,
+          localWrittenAt: writeWallMs,
           syncDirty: 1,
         });
       }
@@ -1388,7 +1796,8 @@ export class IdbSyncStore implements SyncStore {
           feedKey: q.feedKey,
           pos: q.pos,
           addedAt: q.addedAt,
-          updatedAt: stamp,
+          // Advance per-entry HLC causally beyond `q.updatedAt` instead of reusing feed `stamp` (SYNC-P2-05)
+          updatedAt: this.hlc.stamp(q.updatedAt),
           removedNum: 1,
           deviceId,
           syncDirty: 1,
@@ -1420,6 +1829,7 @@ export class IdbSyncStore implements SyncStore {
         hasCredentials: false,
         updatedAt: stamp,
         deletedAt: stamp,
+        deviceId,
         syncDirty: 1,
       });
     }
@@ -1428,7 +1838,11 @@ export class IdbSyncStore implements SyncStore {
     return downloadsToDelete;
   }
 
-  async setFeedHasCredentials(feedKey: FeedKey, hasCredentials: boolean): Promise<void> {
+  async setFeedHasCredentials(
+    feedKey: FeedKey,
+    hasCredentials: boolean,
+    deviceId?: DeviceId,
+  ): Promise<void> {
     const tx = this.db.transaction(['feeds'], 'readwrite');
     const store = tx.objectStore('feeds');
     const feed = await store.get(feedKey);
@@ -1437,11 +1851,13 @@ export class IdbSyncStore implements SyncStore {
     }
     const isLocal = feed.kind === 'LOCAL' || feedKey.startsWith('l_');
     const stamp = this.hlc.stamp(feed.updatedAt);
+    const effectiveDeviceId = deviceId ?? this.cachedSyncState?.deviceId ?? feed.deviceId;
     await store.put({
       ...feed,
       hasCredentials,
       updatedAt: stamp,
       syncDirty: isLocal ? 0 : 1,
+      ...(effectiveDeviceId !== undefined ? { deviceId: effectiveDeviceId } : {}),
     });
     await tx.done;
   }
@@ -1618,6 +2034,37 @@ export class IdbSyncStore implements SyncStore {
     return rows.map(idbRecordToQueueEntry);
   }
 
+  /**
+   * Atomically reads all queue entries, runs a pure queue mutation, and writes back
+   * only the mutated rows inside a single IDB `readwrite` transaction (preventing
+   * two-transaction races with `applyMerged`, SYNC-P1-11).
+   */
+  async mutateQueueAtomic(
+    mutator: (entries: readonly QueueEntry[]) => readonly QueueEntry[],
+  ): Promise<readonly QueueEntry[]> {
+    const tx = this.db.transaction(['queue'], 'readwrite');
+    const store = tx.objectStore('queue');
+    const allRows = await store.getAll();
+    const mutated = mutator(allRows.map(idbRecordToQueueEntry));
+    for (const entry of mutated) {
+      const isLocal = entry.feedKey.startsWith('l_');
+      const rec: IdbQueueRecord = {
+        episodeKey: entry.episodeKey,
+        feedKey: entry.feedKey,
+        pos: entry.pos,
+        addedAt: entry.addedAt,
+        updatedAt: entry.updatedAt,
+        removedNum: entry.removed ? 1 : 0,
+        deviceId: entry.deviceId,
+        syncDirty: isLocal ? 0 : 1,
+        ...(entry.stub !== undefined ? { stub: entry.stub } : {}),
+      };
+      await store.put(rec);
+    }
+    await tx.done;
+    return mutated;
+  }
+
   async upsertQueueEntries(entries: readonly QueueEntry[], syncDirty: boolean): Promise<void> {
     if (entries.length === 0) return;
     const tx = this.db.transaction(['queue'], 'readwrite');
@@ -1677,9 +2124,13 @@ export class IdbSyncStore implements SyncStore {
     return row ? idbRecordToProgress(row) : undefined;
   }
 
+  async getProgressRecord(episodeKey: EpisodeKey): Promise<IdbProgressRecord | undefined> {
+    return this.db.get('progress', episodeKey);
+  }
+
   async upsertProgress(
     record: ProgressRecord,
-    opts?: { syncDirty?: boolean; identity?: string | undefined },
+    opts?: { syncDirty?: boolean; identity?: string | undefined; localWrittenAt?: EpochMs },
   ): Promise<void> {
     const tx = this.db.transaction(['progress', 'episodes'], 'readwrite');
     const progStore = tx.objectStore('progress');
@@ -1696,6 +2147,7 @@ export class IdbSyncStore implements SyncStore {
       playedAt: record.playedAt ?? null,
       updatedAt: record.updatedAt,
       deviceId: record.deviceId,
+      localWrittenAt: opts?.localWrittenAt ?? Date.now(),
       syncDirty: (opts?.syncDirty ?? true) && !isLocal ? 1 : 0,
       ...(identity !== undefined ? { identity } : {}),
       ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),

@@ -28,6 +28,19 @@ export class HybridLogicalClock {
     return this.hlc;
   }
 
+  /**
+   * Restores this device's own persisted local HLC lower bound across restarts without
+   * clamping to `wallNow + 5 min` so local monotonicity survives backward wall-clock jumps.
+   * Only pass bounded local `hlcLast` values (never unbounded remote `hlcMax`).
+   */
+  restore(persistedLocalHlc: HlcMs): HlcMs {
+    if (!Number.isFinite(persistedLocalHlc) || persistedLocalHlc <= 0) {
+      return this.hlc;
+    }
+    this.hlc = Math.max(this.hlc, Math.trunc(persistedLocalHlc));
+    return this.hlc;
+  }
+
   observe(remoteHlcMax: HlcMs): HlcMs {
     if (!Number.isFinite(remoteHlcMax) || remoteHlcMax <= 0) {
       return this.hlc;
@@ -42,11 +55,27 @@ export class HybridLogicalClock {
     const tick = this.now();
     const prev = previousUpdatedAt !== undefined && Number.isFinite(previousUpdatedAt) ? Math.trunc(previousUpdatedAt) : 0;
     const next = Math.max(tick, prev + 1);
-    if (next > this.hlc) {
-      // Do not advance global clock past skew cap on skewed entity restamp unless needed locally;
-      // §7.3 keeps `this.hlc` bounded while entity `updatedAt` uses `max(hlc.now(), prev.updatedAt + 1)`.
+    const maxAllowed = Math.trunc(this.wallNow()) + HLC_MAX_FORWARD_SKEW_MS;
+    if (next > this.hlc && next <= maxAllowed) {
+      this.hlc = next;
     }
     return next;
+  }
+
+  /**
+   * Stamps a historical local event (e.g. Android background playback journal replay) at its
+   * real `eventWallMs` (capped at current wall clock) while preserving strict per-entity
+   * causality (`> previousUpdatedAt`) without advancing the global clock to the replay time.
+   */
+  stampAtEventTime(eventWallMs: EpochMs, previousUpdatedAt?: HlcMs): HlcMs {
+    const prev =
+      previousUpdatedAt !== undefined && Number.isFinite(previousUpdatedAt)
+        ? Math.trunc(previousUpdatedAt)
+        : 0;
+    const wall = Math.trunc(this.wallNow());
+    const eventTs =
+      Number.isFinite(eventWallMs) && eventWallMs > 0 ? Math.min(Math.trunc(eventWallMs), wall) : wall;
+    return Math.max(eventTs, prev + 1);
   }
 }
 

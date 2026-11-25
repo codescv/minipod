@@ -10,7 +10,7 @@ import {
   type SyncQueueEntry,
   type SyncSubscription,
 } from '../types';
-import { computeEntityMapsHlcMax } from './schema';
+import { canonicalizeValue, computeEntityMapsHlcMax } from './schema';
 
 const PROGRESS_STATE_RANK: Readonly<Record<ProgressState, number>> = {
   NEW: 0,
@@ -31,32 +31,42 @@ function pickDevice(a: SyncDevice, b: SyncDevice): SyncDevice {
   return compareLex(a.app, b.app) <= 0 ? a : b;
 }
 
+function mergeMovedTo(a: string | null | undefined, b: string | null | undefined): string | undefined {
+  const ma = a ? a : undefined;
+  const mb = b ? b : undefined;
+  if (ma && mb) {
+    return ma <= mb ? ma : mb;
+  }
+  return ma ?? mb;
+}
+
 export function pickSubscription(a: SyncSubscription, b: SyncSubscription): SyncSubscription {
+  // Pure LWW when timestamps differ: a lower-HLC entry may be dropped by a third replica's
+  // `floor`, so it must never mutate a higher-HLC winner (preserves floor-filtered associativity).
   if (a.updatedAt !== b.updatedAt) {
     return a.updatedAt > b.updatedAt ? a : b;
   }
+
   // Identical HLC tie-break (§7.5):
   // 1. Prefer `deleted === false`
   // 2. Smaller `deviceId`
-  // 3. Deterministic lexicographical tie-break for pure commutativity/associativity
+  // 3. Deterministic tie-break on base fields (independent of non-empty `movedTo`)
   let winner: SyncSubscription;
-  let loser: SyncSubscription;
   if (a.deleted !== b.deleted) {
     winner = !a.deleted ? a : b;
-    loser = !a.deleted ? b : a;
   } else if (a.deviceId !== b.deviceId) {
     winner = a.deviceId < b.deviceId ? a : b;
-    loser = a.deviceId < b.deviceId ? b : a;
   } else {
-    const jsonA = JSON.stringify([a.url, a.movedTo ?? '', a.title ?? '', a.imageUrl ?? '', a.hasCredentials ?? false]);
-    const jsonB = JSON.stringify([b.url, b.movedTo ?? '', b.title ?? '', b.imageUrl ?? '', b.hasCredentials ?? false]);
+    const jsonA = JSON.stringify([a.url, a.title ?? '', a.imageUrl ?? '', a.hasCredentials ?? false, a.movedTo === null ? 0 : 1]);
+    const jsonB = JSON.stringify([b.url, b.title ?? '', b.imageUrl ?? '', b.hasCredentials ?? false, b.movedTo === null ? 0 : 1]);
     winner = jsonA <= jsonB ? a : b;
-    loser = jsonA <= jsonB ? b : a;
   }
 
-  // Carry `movedTo` from either record if the winner lacks one (§7.5 line 639)
-  if (!winner.movedTo && loser.movedTo) {
-    return { ...winner, movedTo: loser.movedTo };
+  // Equal-HLC `movedTo` semilattice: purely value-based (non-null beats null; smaller URL wins),
+  // strictly commutative, associative, and idempotent across 3+ concurrent equal-HLC replicas (SYNC-P2-03).
+  const mergedMoved = mergeMovedTo(a.movedTo, b.movedTo);
+  if (mergedMoved !== undefined && winner.movedTo !== mergedMoved) {
+    return { ...winner, movedTo: mergedMoved };
   }
   return winner;
 }
@@ -68,7 +78,7 @@ export function pickQueueEntry(a: SyncQueueEntry, b: SyncQueueEntry): SyncQueueE
   // Identical HLC tie-break (§7.5):
   // 1. Prefer `removed === false`
   // 2. Smaller `deviceId`
-  // 3. Deterministic tie-break (`pos`, `addedAt`, `feedKey`)
+  // 3. Deterministic tie-break (`pos`, `addedAt`, canonical JSON)
   if (a.removed !== b.removed) {
     return !a.removed ? a : b;
   }
@@ -81,7 +91,7 @@ export function pickQueueEntry(a: SyncQueueEntry, b: SyncQueueEntry): SyncQueueE
   if (a.addedAt !== b.addedAt) {
     return a.addedAt < b.addedAt ? a : b;
   }
-  return JSON.stringify(a) <= JSON.stringify(b) ? a : b;
+  return JSON.stringify(canonicalizeValue(a)) <= JSON.stringify(canonicalizeValue(b)) ? a : b;
 }
 
 export function pickProgress(a: SyncProgress, b: SyncProgress): SyncProgress {
@@ -92,6 +102,7 @@ export function pickProgress(a: SyncProgress, b: SyncProgress): SyncProgress {
   // 1. Higher `rank(state)` (`PLAYED > IN_PROGRESS > NEW`)
   // 2. Larger `positionMs`
   // 3. Smaller `deviceId`
+  // 4. Deterministic canonical JSON (key-order independent)
   const rankA = PROGRESS_STATE_RANK[a.state];
   const rankB = PROGRESS_STATE_RANK[b.state];
   if (rankA !== rankB) {
@@ -103,7 +114,7 @@ export function pickProgress(a: SyncProgress, b: SyncProgress): SyncProgress {
   if (a.deviceId !== b.deviceId) {
     return a.deviceId < b.deviceId ? a : b;
   }
-  return JSON.stringify(a) <= JSON.stringify(b) ? a : b;
+  return JSON.stringify(canonicalizeValue(a)) <= JSON.stringify(canonicalizeValue(b)) ? a : b;
 }
 
 function mergeMap<T extends { readonly updatedAt: number }>(

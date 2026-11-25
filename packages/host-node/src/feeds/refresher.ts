@@ -188,11 +188,12 @@ export class FeedRefresher {
     });
 
     transaction(this.db, () => {
-      this.feedsRepo.upsertParsedFeed({
+      const res = this.feedsRepo.upsertParsedFeed({
         feedKey: row.feed_key,
         kind: 'LOCAL',
         url: scanned.feedUrl,
         subscribed: row.subscribed !== 0,
+        preserveSubscriptionState: true,
         parsed: scanned.parsed,
         hlc: this.hlc,
         nowWallMs: Date.now(),
@@ -203,6 +204,7 @@ export class FeedRefresher {
         localMtimeByIdentity: scanned.mtimeByIdentity,
         markSyncDirty: false,
       });
+      if (res.skipped) return;
 
       // Remove episodes whose files disappeared from disk (unless currently playing)
       const playingKey = this.deps.getCurrentPlayingEpisodeKey?.();
@@ -286,6 +288,12 @@ export class FeedRefresher {
       }
     }
 
+    // Verify feed is still subscribed after HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+    const liveRow = this.feedsRepo.getRaw(row.feed_key);
+    if (!liveRow || liveRow.subscribed === 0 || liveRow.deleted_at !== null) {
+      return;
+    }
+
     let targetFeedKey = row.feed_key;
     let moved = false;
     if (newPermUrl && newPermUrl !== fetchUrl) {
@@ -299,11 +307,13 @@ export class FeedRefresher {
     }
 
     const effectiveUrl = newPermUrl ?? fetchUrl;
-    this.feedsRepo.upsertParsedFeed({
+    const upsertRes = this.feedsRepo.upsertParsedFeed({
       feedKey: targetFeedKey,
       kind: 'RSS',
       url: effectiveUrl,
-      subscribed: row.subscribed !== 0,
+      subscribed: true,
+      preserveSubscriptionState: true,
+      deviceId: this.deps.getDeviceId(),
       parsed,
       hlc: this.hlc,
       nowWallMs: nowMs,
@@ -312,6 +322,9 @@ export class FeedRefresher {
       ...(newPermUrl ? { movedTo: newPermUrl } : {}),
       ...(moved ? { markSyncDirty: true } : {}),
     });
+    if (upsertRes.skipped) {
+      return;
+    }
 
     if (moved) {
       this.deps.onFeedMoved?.();
@@ -358,8 +371,13 @@ export class FeedRefresher {
     detectFeedType(xmlText);
     const parsed = parseFeed(xmlText, { baseUrl: finalUrl });
 
-    const added = this.episodesRepo.upsertParsedEpisodes(row.id, feedKey, parsed.episodes, {
-      fallbackImageUrl: row.image_url?.trim() || parsed.imageUrl?.trim(),
+    const liveRow = this.feedsRepo.getRaw(feedKey);
+    if (!liveRow || liveRow.subscribed === 0 || liveRow.deleted_at !== null) {
+      return 0;
+    }
+
+    const added = this.episodesRepo.upsertParsedEpisodes(liveRow.id, feedKey, parsed.episodes, {
+      fallbackImageUrl: liveRow.image_url?.trim() || parsed.imageUrl?.trim(),
     });
 
     const nextUrl =

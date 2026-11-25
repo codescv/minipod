@@ -17,6 +17,8 @@ import {
   type HlcMs,
   type LocalSyncSnapshot,
   type MiniPodErrorShape,
+  type RestampBelowFloorOptions,
+  type SyncDevice,
   type SyncDocument,
   type SyncEntityMaps,
   type SyncProgress,
@@ -50,6 +52,9 @@ interface SyncStateRow {
   last_push_at: number | null;
   last_error_json: string | null;
   backoff_until: number | null;
+  remote_devices_json?: string | null;
+  last_remote_fingerprint?: string | null;
+  pending_lineage_reset?: number | null;
 }
 
 export interface SqliteSyncStoreDeps {
@@ -57,6 +62,7 @@ export interface SqliteSyncStoreDeps {
   readonly hlc: HybridLogicalClock;
   readonly appVersion: string;
   readonly defaultDeviceName?: string;
+  readonly getCurrentEpisodeKey?: () => EpisodeKey | undefined;
   readonly onDeleteDownloads?: (paths: readonly string[]) => void;
 }
 
@@ -69,12 +75,27 @@ function defaultDesktopDeviceName(): string {
   }
 }
 
-function subscriptionEquals(row: FeedDbRow, remote: SyncSubscription): boolean {
+function subscriptionCoreMatches(row: FeedDbRow, remote: SyncSubscription): boolean {
   const localDeleted = row.deleted_at !== null || row.subscribed === 0;
   if (localDeleted !== remote.deleted) return false;
-  if (row.updated_at !== remote.updatedAt) return false;
   const effectiveUrl = remote.movedTo || remote.url;
-  if (!localDeleted && row.url !== effectiveUrl) return false;
+  // Compare against `(row.moved_to || row.url)` so permanentRedirect subscriptions match cleanly (SYNC-P1-12).
+  if (!localDeleted && (row.moved_to || row.url) !== effectiveUrl) return false;
+  return true;
+}
+
+function subscriptionFullyMatches(
+  row: FeedDbRow,
+  remote: SyncSubscription,
+  fallbackDeviceId: DeviceId,
+): boolean {
+  if (!subscriptionCoreMatches(row, remote)) return false;
+  if (row.updated_at !== remote.updatedAt) return false;
+  if ((row.device_id || fallbackDeviceId) !== remote.deviceId) return false;
+  if ((row.moved_to ?? null) !== (remote.movedTo ?? null)) return false;
+  if ((row.has_credentials !== 0) !== Boolean(remote.hasCredentials)) return false;
+  if (remote.title !== undefined && row.title === null) return false;
+  if (remote.imageUrl !== undefined && row.image_url === null) return false;
   return true;
 }
 
@@ -85,7 +106,7 @@ function feedRowToSyncSubscription(row: FeedDbRow, fallbackDeviceId: DeviceId): 
     movedTo: row.moved_to ?? null,
     updatedAt: row.updated_at,
     deleted,
-    deviceId: fallbackDeviceId,
+    deviceId: row.device_id || fallbackDeviceId,
     ...(row.title !== null ? { title: row.title } : {}),
     ...(row.image_url !== null ? { imageUrl: row.image_url } : {}),
     ...(row.has_credentials !== 0 ? { hasCredentials: true } : {}),
@@ -105,6 +126,19 @@ function progressRowToSyncProgress(row: ProgressDbRow): SyncProgress {
   };
 }
 
+function parseRemoteDevicesJson(json: string | null | undefined): Readonly<Record<DeviceId, SyncDevice>> | undefined {
+  if (!json) return undefined;
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Readonly<Record<DeviceId, SyncDevice>>;
+    }
+  } catch {
+    // ignore corrupt metadata
+  }
+  return undefined;
+}
+
 export class SqliteSyncStore implements SyncStore {
   private readonly db: Database;
   private readonly hlc: HybridLogicalClock;
@@ -113,6 +147,7 @@ export class SqliteSyncStore implements SyncStore {
   private readonly episodesRepo: EpisodesRepository;
   private readonly progressRepo: ProgressRepository;
   private readonly queueRepo: QueueRepository;
+  private readonly getCurrentEpisodeKey?: () => EpisodeKey | undefined;
   private readonly onDeleteDownloads?: (paths: readonly string[]) => void;
 
   constructor(deps: SqliteSyncStoreDeps) {
@@ -123,20 +158,48 @@ export class SqliteSyncStore implements SyncStore {
     this.episodesRepo = new EpisodesRepository(deps.db);
     this.progressRepo = new ProgressRepository(deps.db);
     this.queueRepo = new QueueRepository(deps.db);
+    if (deps.getCurrentEpisodeKey !== undefined) {
+      this.getCurrentEpisodeKey = deps.getCurrentEpisodeKey;
+    }
     if (deps.onDeleteDownloads !== undefined) {
       this.onDeleteDownloads = deps.onDeleteDownloads;
     }
 
-    this.ensureSyncStateRow(deps.defaultDeviceName ?? defaultDesktopDeviceName());
+    this.ensureSyncStateRow(deps.defaultDeviceName ?? defaultDesktopDeviceName(), true);
   }
 
-  private ensureSyncStateRow(defaultName: string): SyncStateRow {
+  private queryMaxLocalEntityHlc(deviceId: DeviceId): HlcMs {
+    const maxFeed = (
+      this.db
+        .prepare(
+          "SELECT MAX(updated_at) AS m FROM feeds WHERE kind = 'RSS' AND (device_id = ? OR device_id IS NULL)",
+        )
+        .get(deviceId) as { m: number | null } | undefined
+    )?.m ?? 0;
+    const maxQueue = (
+      this.db
+        .prepare('SELECT MAX(updated_at) AS m FROM queue WHERE device_id = ?')
+        .get(deviceId) as { m: number | null } | undefined
+    )?.m ?? 0;
+    const maxProg = (
+      this.db
+        .prepare('SELECT MAX(updated_at) AS m FROM progress WHERE device_id = ?')
+        .get(deviceId) as { m: number | null } | undefined
+    )?.m ?? 0;
+    return Math.max(maxFeed, maxQueue, maxProg);
+  }
+
+  private ensureSyncStateRow(defaultName: string, restoreHlc: boolean = false): SyncStateRow {
     const existing = this.db
       .prepare('SELECT * FROM sync_state WHERE id = 1')
       .get() as SyncStateRow | undefined;
     if (existing) {
-      if (existing.hlc_last > this.hlc.current()) {
-        this.hlc.observe(existing.hlc_last);
+      if (restoreHlc) {
+        // Restore local HLC without +5m clamp using MAX(hlc_last, own local entity timestamps) (SYNC-P2-01).
+        const maxLocal = Math.max(existing.hlc_last, this.queryMaxLocalEntityHlc(existing.device_id));
+        if (maxLocal > this.hlc.current()) {
+          this.hlc.restore(maxLocal);
+        }
       }
       return existing;
     }
@@ -161,6 +224,7 @@ export class SqliteSyncStore implements SyncStore {
         lastError = undefined;
       }
     }
+    const remoteDevices = parseRemoteDevicesJson(row.remote_devices_json);
     return {
       deviceId: row.device_id,
       deviceName: row.device_name,
@@ -177,6 +241,9 @@ export class SqliteSyncStore implements SyncStore {
       ...(row.last_push_at !== null ? { lastPushAt: row.last_push_at } : {}),
       ...(lastError !== undefined ? { lastError } : {}),
       ...(row.backoff_until !== null && row.backoff_until > 0 ? { backoffUntil: row.backoff_until } : {}),
+      ...(remoteDevices !== undefined ? { remoteDevices } : {}),
+      ...(row.last_remote_fingerprint !== undefined ? { lastRemoteFingerprint: row.last_remote_fingerprint } : {}),
+      ...(row.pending_lineage_reset ? { pendingLineageReset: true } : {}),
     };
   }
 
@@ -211,6 +278,22 @@ export class SqliteSyncStore implements SyncStore {
             ? patch.backoffUntil
             : null
           : current.backoff_until;
+      const remoteDevicesJson =
+        'remoteDevices' in patch
+          ? patch.remoteDevices
+            ? JSON.stringify(patch.remoteDevices)
+            : null
+          : (current.remote_devices_json ?? null);
+      const lastRemoteFingerprint =
+        'lastRemoteFingerprint' in patch
+          ? (patch.lastRemoteFingerprint ?? null)
+          : (current.last_remote_fingerprint ?? null);
+      const pendingLineageReset =
+        'pendingLineageReset' in patch
+          ? patch.pendingLineageReset
+            ? 1
+            : 0
+          : (current.pending_lineage_reset ?? 0);
 
       this.db
         .prepare(
@@ -227,7 +310,10 @@ export class SqliteSyncStore implements SyncStore {
              last_pull_at = ?,
              last_push_at = ?,
              last_error_json = ?,
-             backoff_until = ?
+             backoff_until = ?,
+             remote_devices_json = ?,
+             last_remote_fingerprint = ?,
+             pending_lineage_reset = ?
            WHERE id = 1`,
         )
         .run(
@@ -244,8 +330,32 @@ export class SqliteSyncStore implements SyncStore {
           lastPushAt,
           lastErrorJson,
           backoffUntil,
+          remoteDevicesJson,
+          lastRemoteFingerprint,
+          pendingLineageReset,
         );
     });
+  }
+
+  async getDirtyCount(): Promise<number> {
+    const subCount = (
+      this.db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM feeds WHERE kind = 'RSS' AND (subscribed = 1 OR deleted_at IS NOT NULL) AND sync_dirty = 1",
+        )
+        .get() as { c: number }
+    ).c;
+    const queueCount = (
+      this.db
+        .prepare("SELECT COUNT(*) AS c FROM queue WHERE sync_dirty = 1 AND feed_key NOT LIKE 'l_%'")
+        .get() as { c: number }
+    ).c;
+    const progCount = (
+      this.db
+        .prepare("SELECT COUNT(*) AS c FROM progress WHERE sync_dirty = 1 AND feed_key NOT LIKE 'l_%'")
+        .get() as { c: number }
+    ).c;
+    return subCount + queueCount + progCount;
   }
 
   private getLocalFeedKeySet(): Set<FeedKey> {
@@ -323,48 +433,95 @@ export class SqliteSyncStore implements SyncStore {
   async restampDirtyBelowFloor(
     floors: SyncState['floors'],
     stamp: () => HlcMs,
+    options?: RestampBelowFloorOptions,
   ): Promise<void> {
+    const excludeSubs = options?.excludeKeys?.subscriptions;
+    const excludeQueue = options?.excludeKeys?.queue;
+    const excludeProg = options?.excludeKeys?.progress;
+    const includeCleanLive = options?.includeCleanLive === true;
+
     transaction(this.db, () => {
+      const state = this.getSyncStateSync();
+
       if (floors.subscriptions > 0) {
-        const rows = this.db
-          .prepare(
-            "SELECT id, updated_at FROM feeds WHERE kind = 'RSS' AND sync_dirty = 1 AND updated_at <= ?",
-          )
-          .all(floors.subscriptions) as Array<{ id: number; updated_at: number }>;
+        const sql = includeCleanLive
+          ? "SELECT id, feed_key, updated_at FROM feeds WHERE kind = 'RSS' AND ((sync_dirty = 1 AND (subscribed = 1 OR deleted_at IS NOT NULL)) OR (sync_dirty = 0 AND subscribed = 1 AND deleted_at IS NULL)) AND updated_at <= ?"
+          : "SELECT id, feed_key, updated_at FROM feeds WHERE kind = 'RSS' AND sync_dirty = 1 AND (subscribed = 1 OR deleted_at IS NOT NULL) AND updated_at <= ?";
+        const rows = this.db.prepare(sql).all(floors.subscriptions) as Array<{
+          id: number;
+          feed_key: string;
+          updated_at: number;
+        }>;
         for (const row of rows) {
+          if (excludeSubs?.has(row.feed_key)) continue;
           const next = Math.max(stamp(), floors.subscriptions + 1, row.updated_at + 1);
           this.db
             .prepare(
-              'UPDATE feeds SET updated_at = ?, deleted_at = CASE WHEN deleted_at IS NOT NULL THEN ? ELSE NULL END WHERE id = ?',
+              'UPDATE feeds SET updated_at = ?, deleted_at = CASE WHEN deleted_at IS NOT NULL THEN ? ELSE NULL END, device_id = ?, sync_dirty = 1 WHERE id = ?',
             )
-            .run(next, next, row.id);
+            .run(next, next, state.deviceId, row.id);
         }
       }
 
       if (floors.queue > 0) {
-        const rows = this.db
-          .prepare('SELECT episode_key, updated_at FROM queue WHERE sync_dirty = 1 AND updated_at <= ?')
-          .all(floors.queue) as Array<{ episode_key: string; updated_at: number }>;
+        const sql = includeCleanLive
+          ? "SELECT episode_key, updated_at FROM queue WHERE feed_key NOT LIKE 'l_%' AND (sync_dirty = 1 OR (sync_dirty = 0 AND removed = 0)) AND updated_at <= ?"
+          : "SELECT episode_key, updated_at FROM queue WHERE feed_key NOT LIKE 'l_%' AND sync_dirty = 1 AND updated_at <= ?";
+        const rows = this.db.prepare(sql).all(floors.queue) as Array<{
+          episode_key: string;
+          updated_at: number;
+        }>;
         for (const row of rows) {
+          if (excludeQueue?.has(row.episode_key)) continue;
           const next = Math.max(stamp(), floors.queue + 1, row.updated_at + 1);
           this.db
-            .prepare('UPDATE queue SET updated_at = ? WHERE episode_key = ?')
-            .run(next, row.episode_key);
+            .prepare('UPDATE queue SET updated_at = ?, device_id = ?, sync_dirty = 1 WHERE episode_key = ?')
+            .run(next, state.deviceId, row.episode_key);
         }
       }
 
       if (floors.progress > 0) {
-        const rows = this.db
-          .prepare('SELECT episode_key, updated_at FROM progress WHERE sync_dirty = 1 AND updated_at <= ?')
-          .all(floors.progress) as Array<{ episode_key: string; updated_at: number }>;
+        const sql = includeCleanLive
+          ? "SELECT episode_key, updated_at FROM progress WHERE feed_key NOT LIKE 'l_%' AND updated_at <= ?"
+          : "SELECT episode_key, updated_at FROM progress WHERE feed_key NOT LIKE 'l_%' AND sync_dirty = 1 AND updated_at <= ?";
+        const rows = this.db.prepare(sql).all(floors.progress) as Array<{
+          episode_key: string;
+          updated_at: number;
+        }>;
         for (const row of rows) {
+          if (excludeProg?.has(row.episode_key)) continue;
           const next = Math.max(stamp(), floors.progress + 1, row.updated_at + 1);
           this.db
-            .prepare('UPDATE progress SET updated_at = ? WHERE episode_key = ?')
-            .run(next, row.episode_key);
+            .prepare('UPDATE progress SET updated_at = ?, device_id = ?, sync_dirty = 1 WHERE episode_key = ?')
+            .run(next, state.deviceId, row.episode_key);
         }
       }
     });
+  }
+
+  private canHardDeleteFeed(
+    feedId: number,
+    feedKey: FeedKey,
+    currentEpisodeKey: EpisodeKey | undefined,
+  ): boolean {
+    if (currentEpisodeKey) {
+      const playing = this.db
+        .prepare('SELECT 1 AS ok FROM episodes WHERE feed_id = ? AND episode_key = ? LIMIT 1')
+        .get(feedId, currentEpisodeKey) as { ok?: number } | undefined;
+      if (playing?.ok === 1) return false;
+    }
+    const activeQ = this.db
+      .prepare('SELECT 1 AS ok FROM queue WHERE feed_key = ? AND removed = 0 LIMIT 1')
+      .get(feedKey) as { ok?: number } | undefined;
+    if (activeQ?.ok === 1) return false;
+    return true;
+  }
+
+  private collectFeedDownloadPaths(feedId: number): string[] {
+    const rows = this.db
+      .prepare('SELECT download_path FROM episodes WHERE feed_id = ? AND download_path IS NOT NULL')
+      .all(feedId) as Array<{ download_path: string }>;
+    return rows.map((r) => r.download_path);
   }
 
   async applyMerged(
@@ -379,12 +536,17 @@ export class SqliteSyncStore implements SyncStore {
       readonly deviceName: string;
     }> = [];
     const feedsToRefresh: FeedKey[] = [];
+    let subsChanged = false;
+    let queueChanged = false;
+    let progressChanged = false;
+    const changedProgressKeys = new Set<EpisodeKey>();
+    let hasConcurrentLocalEdits = false;
 
     transaction(this.db, () => {
       const state = this.getSyncStateSync();
       const localFeeds = this.getLocalFeedKeySet();
 
-      // 1. Subscriptions
+      // Unified transaction-start snapshots BEFORE any subscription cascade (SYNC-P0-01)
       const existingFeedRows = this.db
         .prepare("SELECT * FROM feeds WHERE kind = 'RSS'")
         .all() as unknown as FeedDbRow[];
@@ -392,18 +554,43 @@ export class SqliteSyncStore implements SyncStore {
         existingFeedRows.map((r) => [r.feed_key, r]),
       );
 
+      const existingQueue = this.queueRepo.listAllRaw();
+      const localQueueByKey = new Map<EpisodeKey, QueueDbRow>(
+        existingQueue.map((q) => [q.episode_key, q]),
+      );
+
+      const existingProg = this.progressRepo.listAllRaw();
+      const localProgByKey = new Map<EpisodeKey, ProgressDbRow>(
+        existingProg.map((p) => [p.episode_key, p]),
+      );
+
+      // Helper: collect active merged queue keys for a feed that are newer than a subscription tombstone/floor
+      const collectMergedPreserveQueueKeys = (
+        feedKey: FeedKey,
+        cutoff: HlcMs,
+      ): ReadonlySet<EpisodeKey> => {
+        const preserved = new Set<EpisodeKey>();
+        for (const [epKey, q] of Object.entries(merged.queue.items)) {
+          if (q.feedKey === feedKey && !q.removed && q.updatedAt > cutoff) {
+            preserved.add(epKey);
+          }
+        }
+        return preserved;
+      };
+
+      // 1. Subscriptions (4-state updatedAt-first concurrent-edit guard, SYNC-P0-01)
       for (const [feedKey, winSub] of Object.entries(merged.subscriptions.items)) {
         const localRow = localFeedByKey.get(feedKey);
         const effectiveUrl = winSub.movedTo || winSub.url;
 
-        if (!winSub.deleted) {
-          if (!localRow) {
+        if (!localRow) {
+          if (!winSub.deleted) {
             this.db
               .prepare(
                 `INSERT INTO feeds
                  (feed_key, kind, subscribed, url, moved_to, title, image_url, has_credentials,
-                  added_at, updated_at, deleted_at, sync_dirty)
-                 VALUES (?, 'RSS', 1, ?, ?, ?, ?, ?, ?, ?, NULL, 0)`,
+                  added_at, updated_at, deleted_at, device_id, sync_dirty)
+                 VALUES (?, 'RSS', 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0)`,
               )
               .run(
                 feedKey,
@@ -414,54 +601,16 @@ export class SqliteSyncStore implements SyncStore {
                 winSub.hasCredentials ? 1 : 0,
                 winSub.updatedAt,
                 winSub.updatedAt,
+                winSub.deviceId,
               );
             feedsToRefresh.push(feedKey);
           } else {
-            const wasUnsubscribed = localRow.subscribed === 0 || localRow.deleted_at !== null;
-            const localWon =
-              localRow.sync_dirty !== 0 &&
-              localRow.subscribed === 1 &&
-              localRow.deleted_at === null &&
-              localRow.updated_at >= winSub.updatedAt &&
-              subscriptionEquals(localRow, winSub);
-
-            this.db
-              .prepare(
-                `UPDATE feeds SET
-                   subscribed = 1,
-                   url = ?,
-                   moved_to = COALESCE(?, moved_to),
-                   title = COALESCE(title, ?),
-                   image_url = COALESCE(image_url, ?),
-                   has_credentials = CASE WHEN has_credentials = 1 OR ? = 1 THEN 1 ELSE 0 END,
-                   updated_at = ?,
-                   deleted_at = NULL,
-                   sync_dirty = ?
-                 WHERE id = ?`,
-              )
-              .run(
-                effectiveUrl,
-                winSub.movedTo ?? null,
-                winSub.title ?? null,
-                winSub.imageUrl ?? null,
-                winSub.hasCredentials ? 1 : 0,
-                winSub.updatedAt,
-                localWon ? 1 : 0,
-                localRow.id,
-              );
-            if (wasUnsubscribed) {
-              feedsToRefresh.push(feedKey);
-            }
-          }
-        } else {
-          // Winner is deleted tombstone
-          if (!localRow) {
             this.db
               .prepare(
                 `INSERT INTO feeds
                  (feed_key, kind, subscribed, url, moved_to, title, image_url,
-                  added_at, updated_at, deleted_at, sync_dirty)
-                 VALUES (?, 'RSS', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
+                  added_at, updated_at, deleted_at, device_id, sync_dirty)
+                 VALUES (?, 'RSS', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
               )
               .run(
                 feedKey,
@@ -472,26 +621,87 @@ export class SqliteSyncStore implements SyncStore {
                 winSub.updatedAt,
                 winSub.updatedAt,
                 winSub.updatedAt,
+                winSub.deviceId,
               );
-          } else if (localRow.subscribed !== 0 || localRow.deleted_at === null) {
+          }
+          subsChanged = true;
+          continue;
+        }
+
+        // Concurrent local edit strictly newer than merged winner -> skip overwrite & keep dirty (SYNC-P0-01)
+        if (localRow.sync_dirty !== 0 && localRow.updated_at > winSub.updatedAt) {
+          hasConcurrentLocalEdits = true;
+          continue;
+        }
+
+        if (localRow.updated_at === winSub.updatedAt) {
+          if (localRow.sync_dirty !== 0 && subscriptionCoreMatches(localRow, winSub)) {
+            // Preserve local dirty flag until upload `markClean` clears it
+            continue;
+          }
+          if (localRow.sync_dirty === 0 && subscriptionFullyMatches(localRow, winSub, state.deviceId)) {
+            // Already up-to-date & clean
+            continue;
+          }
+        }
+
+        if (!winSub.deleted) {
+          const wasUnsubscribed = localRow.subscribed === 0 || localRow.deleted_at !== null;
+          this.db
+            .prepare(
+              `UPDATE feeds SET
+                 subscribed = 1,
+                 url = ?,
+                 moved_to = COALESCE(?, moved_to),
+                 title = COALESCE(title, ?),
+                 image_url = COALESCE(image_url, ?),
+                 has_credentials = CASE WHEN has_credentials = 1 OR ? = 1 THEN 1 ELSE 0 END,
+                 updated_at = ?,
+                 deleted_at = NULL,
+                 device_id = ?,
+                 sync_dirty = 0
+               WHERE id = ?`,
+            )
+            .run(
+              effectiveUrl,
+              winSub.movedTo ?? null,
+              winSub.title ?? null,
+              winSub.imageUrl ?? null,
+              winSub.hasCredentials ? 1 : 0,
+              winSub.updatedAt,
+              winSub.deviceId,
+              localRow.id,
+            );
+          subsChanged = true;
+          if (wasUnsubscribed) {
+            feedsToRefresh.push(feedKey);
+          }
+        } else {
+          // Winner is deleted tombstone
+          if (localRow.subscribed !== 0 || localRow.deleted_at === null) {
+            const preserveQueueKeys = collectMergedPreserveQueueKeys(feedKey, winSub.updatedAt);
             const dlPaths = this.feedsRepo.softDeleteUnsubscribe(
               feedKey,
               this.hlc,
-              state.deviceId,
+              winSub.deviceId,
               {
                 currentPlayingKey: currentEpisodeKey,
                 stampOverride: winSub.updatedAt,
                 syncDirty: false,
+                preCascadeQueueByKey: localQueueByKey,
+                preserveQueueKeys,
               },
             );
             downloadsToDelete.push(...dlPaths);
+            subsChanged = true;
+            queueChanged = true;
           } else {
-            const localWon = localRow.sync_dirty !== 0 && localRow.updated_at >= winSub.updatedAt;
             this.db
               .prepare(
-                'UPDATE feeds SET updated_at = ?, deleted_at = ?, sync_dirty = ? WHERE id = ?',
+                'UPDATE feeds SET updated_at = ?, deleted_at = ?, device_id = ?, sync_dirty = 0 WHERE id = ?',
               )
-              .run(winSub.updatedAt, winSub.updatedAt, localWon ? 1 : 0, localRow.id);
+              .run(winSub.updatedAt, winSub.updatedAt, winSub.deviceId, localRow.id);
+            subsChanged = true;
           }
         }
       }
@@ -501,30 +711,74 @@ export class SqliteSyncStore implements SyncStore {
         if (localRow.sync_dirty !== 0) continue;
         if (localRow.subscribed === 0 && localRow.deleted_at === null) continue; // stub
         if (!(localRow.feed_key in merged.subscriptions.items)) {
+          const floorStamp = Math.max(merged.subscriptions.floor, localRow.updated_at);
+          const preserveQueueKeys = collectMergedPreserveQueueKeys(localRow.feed_key, floorStamp);
           if (localRow.subscribed !== 0) {
             const dlPaths = this.feedsRepo.softDeleteUnsubscribe(
               localRow.feed_key,
               this.hlc,
               state.deviceId,
-              { currentPlayingKey: currentEpisodeKey, syncDirty: false },
+              {
+                currentPlayingKey: currentEpisodeKey,
+                stampOverride: floorStamp,
+                syncDirty: false,
+                preCascadeQueueByKey: localQueueByKey,
+                preserveQueueKeys,
+              },
             );
             downloadsToDelete.push(...dlPaths);
+            subsChanged = true;
+            queueChanged = true;
           }
-          this.db
-            .prepare('DELETE FROM feeds WHERE id = ? AND subscribed = 0')
-            .run(localRow.id);
+          // Protect currently playing or actively queued episodes & clean downloads before DELETE (SYNC-P2-06)
+          if (
+            preserveQueueKeys.size === 0 &&
+            this.canHardDeleteFeed(localRow.id, localRow.feed_key, currentEpisodeKey)
+          ) {
+            downloadsToDelete.push(...this.collectFeedDownloadPaths(localRow.id));
+            this.db
+              .prepare('DELETE FROM feeds WHERE id = ? AND subscribed = 0')
+              .run(localRow.id);
+            subsChanged = true;
+          }
         }
       }
 
-      // 2. Queue
-      const existingQueue = this.queueRepo.listAllRaw();
-      const localQueueByKey = new Map<EpisodeKey, QueueDbRow>(
-        existingQueue.map((q) => [q.episode_key, q]),
-      );
+      // 2. Queue (using pre-cascade `localQueueByKey` snapshot, SYNC-P0-01)
+      const getCurrentQueueRow = this.db.prepare('SELECT * FROM queue WHERE episode_key = ?');
 
       for (const [epKey, winQ] of Object.entries(merged.queue.items)) {
         if (localFeeds.has(winQ.feedKey) || winQ.feedKey.startsWith('l_')) continue;
-        const localQ = localQueueByKey.get(epKey);
+        const preQ = localQueueByKey.get(epKey);
+
+        if (preQ) {
+          // Concurrent local dirty write strictly newer than merged winner -> preserve!
+          if (preQ.sync_dirty !== 0 && preQ.updated_at > winQ.updatedAt) {
+            hasConcurrentLocalEdits = true;
+            continue;
+          }
+          if (preQ.updated_at === winQ.updatedAt) {
+            const coreMatch = (preQ.removed !== 0) === winQ.removed && preQ.pos === winQ.pos;
+            if (preQ.sync_dirty !== 0 && coreMatch) {
+              continue;
+            }
+            if (preQ.sync_dirty === 0) {
+              const curQ = getCurrentQueueRow.get(epKey) as QueueDbRow | undefined;
+              if (
+                curQ &&
+                curQ.updated_at === winQ.updatedAt &&
+                (curQ.removed !== 0) === winQ.removed &&
+                curQ.pos === winQ.pos &&
+                curQ.device_id === winQ.deviceId &&
+                curQ.added_at === winQ.addedAt &&
+                curQ.feed_key === winQ.feedKey &&
+                curQ.sync_dirty === 0
+              ) {
+                continue;
+              }
+            }
+          }
+        }
 
         if (!winQ.removed) {
           const feedStubRow = this.feedsRepo.ensureFeedStub(winQ.feedKey, {
@@ -537,49 +791,54 @@ export class SqliteSyncStore implements SyncStore {
           this.episodesRepo.ensureStubEpisode(feedStubRow.id, winQ.feedKey, epKey, winQ.stub);
         }
 
-        const localWon =
-          localQ !== undefined &&
-          localQ.sync_dirty !== 0 &&
-          localQ.updated_at >= winQ.updatedAt &&
-          localQ.device_id === winQ.deviceId &&
-          (localQ.removed !== 0) === winQ.removed &&
-          localQ.pos === winQ.pos;
-
         const entry = fromSyncQueueEntry(epKey, winQ);
-        this.queueRepo.upsertEntries([entry], localWon);
+        this.queueRepo.upsertEntries([entry], false);
+        queueChanged = true;
       }
 
       for (const localQ of existingQueue) {
         if (localFeeds.has(localQ.feed_key) || localQ.feed_key.startsWith('l_')) continue;
         if (localQ.sync_dirty === 0 && !(localQ.episode_key in merged.queue.items)) {
           this.queueRepo.deleteHard(localQ.episode_key);
+          queueChanged = true;
         }
       }
 
-      // 3. Progress
-      const existingProg = this.progressRepo.listAllRaw();
-      const localProgByKey = new Map<EpisodeKey, ProgressDbRow>(
-        existingProg.map((p) => [p.episode_key, p]),
-      );
-
+      // 3. Progress (using pre-cascade `localProgByKey` snapshot, SYNC-P0-01, SYNC-P1-08)
       for (const [epKey, winP] of Object.entries(merged.progress.items)) {
         if (localFeeds.has(winP.feedKey) || winP.feedKey.startsWith('l_')) continue;
-        const localP = localProgByKey.get(epKey);
+        const preP = localProgByKey.get(epKey);
+
+        if (preP) {
+          if (preP.sync_dirty !== 0 && preP.updated_at > winP.updatedAt) {
+            hasConcurrentLocalEdits = true;
+            continue;
+          }
+          if (preP.updated_at === winP.updatedAt) {
+            const coreMatch = preP.state === winP.state && preP.position_ms === winP.positionMs;
+            if (preP.sync_dirty !== 0 && coreMatch) {
+              continue;
+            }
+            if (
+              preP.sync_dirty === 0 &&
+              coreMatch &&
+              preP.device_id === winP.deviceId &&
+              preP.feed_key === winP.feedKey &&
+              (preP.duration_ms ?? undefined) === winP.durationMs &&
+              (preP.played_at ?? null) === (winP.playedAt ?? null) &&
+              (preP.identity ?? undefined) === winP.identity
+            ) {
+              continue;
+            }
+          }
+        }
 
         const changedRemotely =
           winP.deviceId !== state.deviceId &&
-          (!localP ||
-            winP.updatedAt > localP.updated_at ||
-            (winP.updatedAt === localP.updated_at &&
-              (winP.positionMs !== localP.position_ms || winP.state !== localP.state)));
-
-        const localWon =
-          localP !== undefined &&
-          localP.sync_dirty !== 0 &&
-          localP.updated_at >= winP.updatedAt &&
-          localP.device_id === winP.deviceId &&
-          localP.position_ms === winP.positionMs &&
-          localP.state === winP.state;
+          (!preP ||
+            winP.updatedAt > preP.updated_at ||
+            (winP.updatedAt === preP.updated_at &&
+              (winP.positionMs !== preP.position_ms || winP.state !== preP.state)));
 
         this.progressRepo.upsert(
           {
@@ -592,8 +851,10 @@ export class SqliteSyncStore implements SyncStore {
             ...(winP.durationMs !== undefined ? { durationMs: winP.durationMs } : {}),
             ...(winP.playedAt !== undefined && winP.playedAt !== null ? { playedAt: winP.playedAt } : {}),
           },
-          { syncDirty: localWon, identity: winP.identity },
+          { syncDirty: false, identity: winP.identity, fromSync: true },
         );
+        progressChanged = true;
+        changedProgressKeys.add(epKey);
 
         if (changedRemotely && currentEpisodeKey !== undefined && epKey === currentEpisodeKey) {
           const remoteDevName = merged.devices[winP.deviceId]?.name ?? 'another device';
@@ -610,6 +871,8 @@ export class SqliteSyncStore implements SyncStore {
         if (localFeeds.has(localP.feed_key) || localP.feed_key.startsWith('l_')) continue;
         if (localP.sync_dirty === 0 && !(localP.episode_key in merged.progress.items)) {
           this.progressRepo.delete(localP.episode_key);
+          progressChanged = true;
+          changedProgressKeys.add(localP.episode_key);
         }
       }
 
@@ -636,7 +899,17 @@ export class SqliteSyncStore implements SyncStore {
       this.onDeleteDownloads?.(downloadsToDelete);
     }
 
-    return { resumeHints, feedsToRefresh };
+    return {
+      resumeHints,
+      feedsToRefresh,
+      changed: {
+        subscriptions: subsChanged,
+        queue: queueChanged,
+        progress: progressChanged,
+        progressEpisodeKeys: [...changedProgressKeys],
+      },
+      hasConcurrentLocalEdits,
+    };
   }
 
   async markClean(pushed: SyncEntityMaps): Promise<void> {
@@ -665,13 +938,24 @@ export class SqliteSyncStore implements SyncStore {
   }
 
   async purgeBelowFloors(floors: SyncState['floors']): Promise<void> {
+    const downloadsToDelete: string[] = [];
+    const currentEpKey = this.getCurrentEpisodeKey?.();
+
     transaction(this.db, () => {
       if (floors.subscriptions > 0) {
-        this.db
+        const candidates = this.db
           .prepare(
-            "DELETE FROM feeds WHERE kind = 'RSS' AND subscribed = 0 AND deleted_at IS NOT NULL AND sync_dirty = 0 AND updated_at <= ?",
+            "SELECT id, feed_key FROM feeds WHERE kind = 'RSS' AND subscribed = 0 AND deleted_at IS NOT NULL AND sync_dirty = 0 AND updated_at <= ?",
           )
-          .run(floors.subscriptions);
+          .all(floors.subscriptions) as Array<{ id: number; feed_key: string }>;
+        for (const cand of candidates) {
+          // Never ON DELETE CASCADE a currently playing or actively queued episode, and clean download files (SYNC-P2-06).
+          if (!this.canHardDeleteFeed(cand.id, cand.feed_key, currentEpKey)) {
+            continue;
+          }
+          downloadsToDelete.push(...this.collectFeedDownloadPaths(cand.id));
+          this.db.prepare('DELETE FROM feeds WHERE id = ?').run(cand.id);
+        }
       }
       if (floors.queue > 0) {
         this.db
@@ -688,6 +972,10 @@ export class SqliteSyncStore implements SyncStore {
           .run(floors.progress);
       }
     });
+
+    if (downloadsToDelete.length > 0) {
+      this.onDeleteDownloads?.(downloadsToDelete);
+    }
   }
 
   async markAllDirty(): Promise<void> {

@@ -115,7 +115,25 @@ export function createLocalFolderFileAccess(
         } finally {
           closeSync(fd);
         }
-        renameSync(tmpPath, filePath);
+        // Windows cloud daemons / AV scanners occasionally hold brief locks during atomic rename;
+        // retry transient EPERM / EBUSY with short backoff before failing (SYNC-P2-08).
+        const renameRetryDelaysMs = [25, 50, 100, 200];
+        for (let attempt = 0; ; attempt++) {
+          try {
+            renameSync(tmpPath, filePath);
+            break;
+          } catch (renameErr) {
+            const code =
+              renameErr && typeof renameErr === 'object'
+                ? (renameErr as { code?: unknown }).code
+                : undefined;
+            const isTransientLock = code === 'EPERM' || code === 'EBUSY';
+            if (!isTransientLock || attempt >= renameRetryDelaysMs.length) {
+              throw renameErr;
+            }
+            await new Promise((r) => setTimeout(r, renameRetryDelaysMs[attempt]!));
+          }
+        }
 
         try {
           const st = statSync(filePath);

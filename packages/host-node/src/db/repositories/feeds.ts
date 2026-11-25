@@ -41,6 +41,7 @@ export interface FeedDbRow {
   added_at: number;
   updated_at: number;
   deleted_at: number | null;
+  device_id?: string | null;
   sync_dirty: number;
 }
 
@@ -174,6 +175,8 @@ export class FeedsRepository {
     readonly parsed: ParsedFeed;
     readonly hlc: HybridLogicalClock;
     readonly nowWallMs: number;
+    readonly deviceId?: DeviceId | undefined;
+    readonly preserveSubscriptionState?: boolean | undefined;
     readonly etag?: string | undefined;
     readonly lastModified?: string | undefined;
     readonly movedTo?: string | undefined;
@@ -182,9 +185,29 @@ export class FeedsRepository {
     readonly overrideImageUrl?: string | undefined;
     readonly localMtimeByIdentity?: ReadonlyMap<string, number> | undefined;
     readonly markSyncDirty?: boolean | undefined;
-  }): { readonly feed: Feed; readonly addedEpisodes: number } {
+  }): { readonly feed: Feed; readonly addedEpisodes: number; readonly skipped?: boolean } {
     return transaction(this.db, () => {
       const existing = this.getRaw(options.feedKey);
+
+      // Refresh guard (SYNC-P0-02): inside the write transaction, verify the feed is still
+      // actively subscribed; if unsubscribed/deleted/purged during the HTTP round-trip, abort.
+      if (options.preserveSubscriptionState) {
+        if (!existing || existing.subscribed === 0 || existing.deleted_at !== null) {
+          const fallbackFeed: Feed = existing
+            ? rowToFeed(existing)
+            : {
+                feedKey: options.feedKey,
+                kind: options.kind,
+                subscribed: false,
+                url: options.url,
+                hasCredentials: false,
+                addedAt: options.nowWallMs,
+                updatedAt: options.nowWallMs,
+              };
+          return { feed: fallbackFeed, addedEpisodes: 0, skipped: true };
+        }
+      }
+
       const imageUrl =
         options.overrideImageUrl?.trim() ||
         options.parsed.imageUrl?.trim() ||
@@ -200,8 +223,8 @@ export class FeedsRepository {
             `INSERT INTO feeds
              (feed_key, kind, subscribed, url, moved_to, title, author, description, link,
               image_url, language, funding_url, local_cover_path, has_credentials,
-              etag, last_modified, next_page_url, last_refreshed_at, added_at, updated_at, deleted_at, sync_dirty)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+              etag, last_modified, next_page_url, last_refreshed_at, added_at, updated_at, deleted_at, device_id, sync_dirty)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
           )
           .run(
             options.feedKey,
@@ -224,11 +247,18 @@ export class FeedsRepository {
             options.nowWallMs,
             stamp,
             stamp,
+            options.deviceId ?? null,
             dirty,
           );
         feedId = Number(res.lastInsertRowid);
       } else {
-        const subscribingNow = options.subscribed && (existing.subscribed === 0 || existing.deleted_at !== null);
+        const effectiveSubscribed = options.preserveSubscriptionState
+          ? existing.subscribed !== 0
+          : options.subscribed;
+        const subscribingNow =
+          !options.preserveSubscriptionState &&
+          effectiveSubscribed &&
+          (existing.subscribed === 0 || existing.deleted_at !== null);
         const urlMoved = options.movedTo !== undefined && options.movedTo !== existing.moved_to;
         const nextUpdatedAt =
           subscribingNow || urlMoved ? options.hlc.stamp(existing.updated_at) : existing.updated_at;
@@ -244,8 +274,12 @@ export class FeedsRepository {
                 : 0
               : existing.sync_dirty;
 
-        const nextSubscribed = options.subscribed ? 1 : existing.subscribed;
-        const nextDeletedAt = options.subscribed ? null : existing.deleted_at;
+        const nextSubscribed = effectiveSubscribed ? 1 : existing.subscribed;
+        const nextDeletedAt = effectiveSubscribed ? null : existing.deleted_at;
+        const nextDeviceId =
+          (subscribingNow || urlMoved) && options.deviceId !== undefined
+            ? options.deviceId
+            : (existing.device_id ?? options.deviceId ?? null);
 
         this.db
           .prepare(
@@ -269,6 +303,7 @@ export class FeedsRepository {
                added_at = ?,
                updated_at = ?,
                deleted_at = ?,
+               device_id = ?,
                sync_dirty = ?
              WHERE id = ?`,
           )
@@ -292,6 +327,7 @@ export class FeedsRepository {
             nextAddedAt,
             nextUpdatedAt,
             nextDeletedAt,
+            nextDeviceId,
             nextDirty,
             existing.id,
           );
@@ -337,6 +373,8 @@ export class FeedsRepository {
       readonly currentPlayingKey?: EpisodeKey | undefined;
       readonly stampOverride?: HlcMs | undefined;
       readonly syncDirty?: boolean | undefined;
+      readonly preserveQueueKeys?: ReadonlySet<EpisodeKey> | undefined;
+      readonly preCascadeQueueByKey?: ReadonlyMap<EpisodeKey, QueueDbRow> | undefined;
     },
   ): readonly string[] {
     return transaction(this.db, () => {
@@ -344,6 +382,7 @@ export class FeedsRepository {
       if (!feed) return [];
 
       const stamp = options?.stampOverride ?? hlc.stamp(feed.updated_at);
+      const isRemoteCascade = options?.stampOverride !== undefined;
       const dirty =
         options?.syncDirty !== undefined
           ? options.syncDirty
@@ -368,39 +407,66 @@ export class FeedsRepository {
       this.db
         .prepare(
           `UPDATE feeds
-           SET subscribed = 0, deleted_at = ?, updated_at = ?, sync_dirty = ?
+           SET subscribed = 0, deleted_at = ?, updated_at = ?, device_id = ?, sync_dirty = ?
            WHERE id = ?`,
         )
-        .run(stamp, stamp, dirty, feed.id);
+        .run(stamp, stamp, deviceId, dirty, feed.id);
 
-      // Tombstone active queue items of this feed
+      const protectedEpisodeKeys = new Set<EpisodeKey>();
+      if (options?.currentPlayingKey) {
+        protectedEpisodeKeys.add(options.currentPlayingKey);
+      }
+      if (options?.preserveQueueKeys) {
+        for (const k of options.preserveQueueKeys) {
+          protectedEpisodeKeys.add(k);
+        }
+      }
+
+      // Tombstone active queue items of this feed, respecting remote-cascade stampOverride
+      // and concurrent local dirty queue edits (SYNC-P0-01).
       const activeQueueRows = this.db
         .prepare('SELECT * FROM queue WHERE feed_key = ? AND removed = 0')
         .all(feedKey) as unknown as QueueDbRow[];
       if (activeQueueRows.length > 0) {
-        const tombstones = activeQueueRows.map((q) => {
+        const tombstones = [];
+        for (const q of activeQueueRows) {
+          if (options?.preserveQueueKeys?.has(q.episode_key)) {
+            protectedEpisodeKeys.add(q.episode_key);
+            continue;
+          }
+          if (isRemoteCascade) {
+            const preQ = options?.preCascadeQueueByKey?.get(q.episode_key) ?? q;
+            if (preQ.sync_dirty !== 0 && preQ.updated_at > stamp) {
+              // Concurrent local re-queue/edit strictly newer than remote unsubscribe -> protect!
+              protectedEpisodeKeys.add(q.episode_key);
+              continue;
+            }
+          }
           const entry = rowToQueueEntry(q);
-          return {
+          tombstones.push({
             episodeKey: entry.episodeKey,
             feedKey: entry.feedKey,
             pos: entry.pos,
             addedAt: entry.addedAt,
-            updatedAt: hlc.stamp(entry.updatedAt),
+            // Remote cascade uses `stampOverride` (never `hlc.stamp`), keeping `sync_dirty = 0`
+            // so a newer active queue entry in the same sync doc still wins in Step 2 (SYNC-P0-01).
+            updatedAt: isRemoteCascade ? stamp : hlc.stamp(entry.updatedAt),
             removed: true,
             deviceId,
-          };
-        });
-        this.queueRepo.upsertEntries(tombstones, options?.syncDirty ?? true);
+          });
+        }
+        if (tombstones.length > 0) {
+          this.queueRepo.upsertEntries(tombstones, isRemoteCascade ? false : (options?.syncDirty ?? true));
+        }
       }
 
       const dlRows = this.db
         .prepare('SELECT episode_key, download_path FROM episodes WHERE feed_id = ? AND download_path IS NOT NULL')
         .all(feed.id) as Array<{ episode_key: string; download_path: string }>;
 
-      const playingKey = options?.currentPlayingKey;
       const downloadPaths: string[] = [];
       for (const dl of dlRows) {
-        if (dl.episode_key !== playingKey) {
+        if (!protectedEpisodeKeys.has(dl.episode_key)) {
           downloadPaths.push(dl.download_path);
           this.db
             .prepare("UPDATE episodes SET download_state = 'NONE', download_path = NULL WHERE episode_key = ?")
@@ -408,12 +474,18 @@ export class FeedsRepository {
         }
       }
 
-      if (playingKey) {
-        this.db
-          .prepare('DELETE FROM episodes WHERE feed_id = ? AND episode_key != ?')
-          .run(feed.id, playingKey);
-      } else {
+      if (protectedEpisodeKeys.size === 0) {
         this.db.prepare('DELETE FROM episodes WHERE feed_id = ?').run(feed.id);
+      } else {
+        const allEps = this.db
+          .prepare('SELECT id, episode_key FROM episodes WHERE feed_id = ?')
+          .all(feed.id) as Array<{ id: number; episode_key: string }>;
+        const delStmt = this.db.prepare('DELETE FROM episodes WHERE id = ?');
+        for (const ep of allEps) {
+          if (!protectedEpisodeKeys.has(ep.episode_key)) {
+            delStmt.run(ep.id);
+          }
+        }
       }
 
       return downloadPaths;
@@ -444,10 +516,10 @@ export class FeedsRepository {
           this.db
             .prepare(
               `UPDATE feeds
-               SET url = ?, moved_to = ?, updated_at = ?, sync_dirty = 1
+               SET url = ?, moved_to = ?, updated_at = ?, device_id = ?, sync_dirty = 1
                WHERE id = ?`,
             )
-            .run(newUrl, newUrl, stamp, existing.id);
+            .run(newUrl, newUrl, stamp, deviceId, existing.id);
         }
         return oldFeedKey;
       }
@@ -458,10 +530,10 @@ export class FeedsRepository {
         this.db
           .prepare(
             `UPDATE feeds
-             SET url = ?, moved_to = ?, updated_at = ?, sync_dirty = 1
+             SET url = ?, moved_to = ?, updated_at = ?, device_id = ?, sync_dirty = 1
              WHERE id = ?`,
           )
-          .run(newUrl, newUrl, stamp, existing.id);
+          .run(newUrl, newUrl, stamp, deviceId, existing.id);
         return oldFeedKey;
       }
 
@@ -474,19 +546,20 @@ export class FeedsRepository {
                deleted_at = CASE WHEN ? = 1 THEN NULL ELSE deleted_at END,
                url = ?,
                updated_at = ?,
+               device_id = ?,
                sync_dirty = 1
            WHERE id = ?`,
         )
-        .run(existing.subscribed, existing.subscribed, newUrl, survivorStamp, colliding.id);
+        .run(existing.subscribed, existing.subscribed, newUrl, survivorStamp, deviceId, colliding.id);
 
       // Tombstone old key with moved_to pointer
       this.db
         .prepare(
           `UPDATE feeds
-           SET subscribed = 0, moved_to = ?, deleted_at = ?, updated_at = ?, sync_dirty = 1
+           SET subscribed = 0, moved_to = ?, deleted_at = ?, updated_at = ?, device_id = ?, sync_dirty = 1
            WHERE id = ?`,
         )
-        .run(newUrl, stamp, stamp, existing.id);
+        .run(newUrl, stamp, stamp, deviceId, existing.id);
 
       // Re-key progress & queue via identity
       this.progressRepo.rekeyFeed(oldFeedKey, targetKey, (id) => computeEpisodeKey(targetKey, id));
@@ -529,15 +602,22 @@ export class FeedsRepository {
     });
   }
 
-  setHasCredentials(feedKey: FeedKey, hasCredentials: boolean, hlc: HybridLogicalClock): void {
+  setHasCredentials(
+    feedKey: FeedKey,
+    hasCredentials: boolean,
+    hlc: HybridLogicalClock,
+    deviceId?: DeviceId,
+  ): void {
     const row = this.getRaw(feedKey);
     if (!row) return;
     const nextVal = hasCredentials ? 1 : 0;
     if (row.has_credentials === nextVal) return;
     const stamp = hlc.stamp(row.updated_at);
     this.db
-      .prepare('UPDATE feeds SET has_credentials = ?, updated_at = ?, sync_dirty = 1 WHERE id = ?')
-      .run(nextVal, stamp, row.id);
+      .prepare(
+        'UPDATE feeds SET has_credentials = ?, updated_at = ?, device_id = COALESCE(?, device_id), sync_dirty = 1 WHERE id = ?',
+      )
+      .run(nextVal, stamp, deviceId ?? null, row.id);
   }
 
   updateConditionalHeaders(

@@ -121,7 +121,13 @@ export class HostEventStream {
 
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        // A clean server EOF while still subscribed must trigger automatic reconnect (SYNC-P2-08).
+        if (!signal.aborted) {
+          throw new Error('SSE stream ended unexpectedly');
+        }
+        break;
+      }
       if (!value) continue;
       const text = decoder.decode(value, { stream: true });
       parser.feed(text, (jsonStr) => {

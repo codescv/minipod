@@ -117,7 +117,15 @@ export function createSafFileProvider(options: SafFileProviderOptions): CloudFil
           .stat({ uri: documentUri })
           .then((res) => {
             if (!res.exists || writing) return;
-            const current = syntheticEtag(res.mtimeMs ?? 0, res.size ?? 0);
+            const mtimeMs = res.mtimeMs ?? 0;
+            const size = res.size ?? 0;
+            // When SAF reports unknown size/mtimeMs (0), never suppress watch notifications;
+            // HostFileProvider.read() uses SHA-1 content hashes to detect real remote changes (SYNC-P1-01).
+            if (mtimeMs === 0 || size === 0) {
+              onChange();
+              return;
+            }
+            const current = syntheticEtag(mtimeMs, size);
             if (current === lastWrittenEtag) {
               lastKnownEtag = current;
               return;

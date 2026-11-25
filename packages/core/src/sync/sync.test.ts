@@ -584,8 +584,8 @@ describe('sync/merge property-based CRDT invariants & gc', () => {
       progress: {
         floor: 0,
         items: {
-          e_inprog_old: { feedKey: 'f_1', positionMs: 5_000, state: 'IN_PROGRESS', updatedAt: 100, deviceId: 'd_writer' },
-          e_played_1: { feedKey: 'f_1', positionMs: 0, state: 'PLAYED', updatedAt: 200, deviceId: 'd_writer' },
+          e_played_1: { feedKey: 'f_1', positionMs: 0, state: 'PLAYED', updatedAt: 100, deviceId: 'd_writer' },
+          e_inprog_old: { feedKey: 'f_1', positionMs: 5_000, state: 'IN_PROGRESS', updatedAt: 250, deviceId: 'd_writer' },
           e_played_2: { feedKey: 'f_1', positionMs: 0, state: 'PLAYED', updatedAt: 300, deviceId: 'd_writer' },
           e_played_3: { feedKey: 'f_1', positionMs: 0, state: 'PLAYED', updatedAt: 400, deviceId: 'd_writer' },
         },
@@ -604,13 +604,15 @@ describe('sync/merge property-based CRDT invariants & gc', () => {
     const notYetGced = gcSyncDocument(activeLaggingDoc, { nowMs: now, writerDeviceId: 'd_writer', maxProgressEntries: 3 });
     expect(notYetGced.queue.items['e_gone']).toBeDefined();
 
-    // Progress capped at 3: `e_played_1` (oldest PLAYED, updatedAt=200) evicted, while `e_inprog_old` (updatedAt=100) is KEPT and `progress.floor` stays <= 99!
+    // Progress capped at 3: `e_played_1` (oldest PLAYED strictly < `e_inprog_old@250`) is evicted
+    // and `progress.floor` advances to 100 (covering the evicted entry while staying < 250, SYNC-P1-13).
     expect(Object.keys(notYetGced.progress.items).sort()).toEqual([
       'e_inprog_old',
       'e_played_2',
       'e_played_3',
     ]);
-    expect(notYetGced.progress.floor).toBeLessThan(100);
+    expect(notYetGced.progress.floor).toBe(100);
+    expect(notYetGced.progress.floor).toBeLessThan(250);
 
     // Once `d_recent_lag` catches up (`lastSeenAt: now`), both tombstones are GC'd and floors advance!
     const caughtUpDoc: SyncDocument = {
@@ -1048,11 +1050,12 @@ describe('sync/SyncEngine & SyncScheduler', () => {
     expect(resA1.status.remoteRev).toBe(1);
     expect(resA1.status.dirtyCount).toBe(0);
 
-    // Device B (clean) pulls -> applies `f_show` & `e_ep1`, emits resumeHint, and performs ZERO uploads!
+    // Device B (clean) pulls for the first time -> applies `f_show` & `e_ep1`, emits resumeHint,
+    // and registers itself once in `remoteDoc.devices` (SYNC-P2-04); subsequent idle pulls upload NOTHING!
     now += 5_000;
     const resB1 = await engineB.run('foreground');
     expect(resB1.pulled).toBe(true);
-    expect(resB1.uploaded).toBe(false);
+    expect(resB1.uploaded).toBe(true);
     expect(decisionsOnB[0]?.feedsToRefresh).toEqual(['f_show']);
     expect(decisionsOnB[0]?.resumeHints[0]).toMatchObject({
       episodeKey: 'e_ep1',
@@ -1060,7 +1063,12 @@ describe('sync/SyncEngine & SyncScheduler', () => {
       deviceName: 'Desktop',
     });
 
-    // Subsequent idle pull on A -> 304 Not Modified, zero uploads (no ping-pong!)
+    // Second idle pull on B within 24h -> ZERO uploads (no ping-pong!)
+    now += 2_000;
+    const resB1Idle = await engineB.run('periodic');
+    expect(resB1Idle.uploaded).toBe(false);
+
+    // Subsequent idle pull on A -> equal entity maps & fresh device heartbeat -> zero uploads!
     now += 5_000;
     const resA2 = await engineA.run('periodic');
     expect(resA2.uploaded).toBe(false);

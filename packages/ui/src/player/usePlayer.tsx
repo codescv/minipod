@@ -174,12 +174,34 @@ export function PlayerProvider({
   /** Until this time, a paused `positionMs: 0` is intentional (user seek to 0 / fresh load). */
   const allowZeroUntilRef = useRef(0);
   /**
-   * Episode that just finished (`ended` / `nativeAdvanced.from`). A later playing->paused `state`
-   * (e.g. the trailing native `media-state` after `media-ended`) for it must never be saved as
-   * IN_PROGRESS, which would undo PLAYED (and its queue removal / download deletion).
+   * Episode that just finished (`ended` / `nativeAdvanced.from` / `fromSync PLAYED`). A later
+   * playing->paused `state` or `pagehide` for it must never be saved as IN_PROGRESS, which would
+   * undo PLAYED (and its queue removal / download deletion).
    * Reset when a new episode is loaded or playback resumes.
    */
   const completedEpisodeKeyRef = useRef<string | null>(null);
+  /**
+   * Suppresses echoing programmatic sync/Undo/journal-reconcile `engine.seekTo()` calls back to
+   * `host.progress.save()`, eliminating cross-device seek ping-pong (SYNC-P1-05).
+   */
+  const suppressSeekSaveRef = useRef<{ readonly episodeKey: string; readonly untilMs: number } | null>(
+    null,
+  );
+  /**
+   * Tracks whether local playback actually advanced or user-seeked since the last saved/synced
+   * position so `pagehide` never flushes stale paused state over remote updates (SYNC-P1-06).
+   */
+  const hasUnsavedLocalPlaybackRef = useRef(false);
+
+  const isSeekSaveSuppressed = useCallback((episodeKey: string): boolean => {
+    const s = suppressSeekSaveRef.current;
+    return s !== null && s.episodeKey === episodeKey && Date.now() < s.untilMs;
+  }, []);
+
+  const suppressProgrammaticSeekSave = useCallback((episodeKey: string): void => {
+    suppressSeekSaveRef.current = { episodeKey, untilMs: Date.now() + 2000 };
+    lastSavedAtRef.current = Date.now();
+  }, []);
 
   /**
    * True when a paused `positionMs: 0` for the current episode is a transient native idle/reset
@@ -219,6 +241,7 @@ export function PlayerProvider({
       readonly flush?: boolean | undefined;
     }) => {
       lastSavedAtRef.current = Date.now();
+      hasUnsavedLocalPlaybackRef.current = false;
       void host.progress
         .save({
           episodeKey: params.episodeKey,
@@ -323,6 +346,7 @@ export function PlayerProvider({
       setChapterArtworkUrl(undefined);
       setChapters(options?.inlineChapters ?? []);
       suppressAutoAdvanceForKeyRef.current = null;
+      hasUnsavedLocalPlaybackRef.current = false;
       if (startMs === 0) {
         allowZeroUntilRef.current = Date.now() + 2000;
       }
@@ -459,9 +483,14 @@ export function PlayerProvider({
 
         // Persist a seek made outside the in-app controls (lock screen / notification / OS media
         // session / Bluetooth) right away so IndexedDB matches the native checkpoint, incl. a paused
-        // rewind to 0:00. Never for a just-finished episode (would undo PLAYED) and never near the
-        // end (the native `ended` flow marks it PLAYED).
-        if (ev.seeked && nextSnap.episodeKey && completedEpisodeKeyRef.current !== nextSnap.episodeKey) {
+        // rewind to 0:00. Never for a just-finished episode (would undo PLAYED), never near the
+        // end (the native `ended` flow marks it PLAYED), and NEVER for programmatic sync/Undo seeks (SYNC-P1-05).
+        if (
+          ev.seeked &&
+          nextSnap.episodeKey &&
+          completedEpisodeKeyRef.current !== nextSnap.episodeKey &&
+          !isSeekSaveSuppressed(nextSnap.episodeKey)
+        ) {
           const dur = nextSnap.durationMs ?? episodeRef.current?.durationMs;
           if (!isEpisodeNearEnd(nextSnap.positionMs, dur)) {
             const isHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
@@ -506,8 +535,13 @@ export function PlayerProvider({
           positionMs: ev.positionMs,
           ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
         }));
+        const suppressed = isSeekSaveSuppressed(ev.episodeKey);
+        if (engine.getSnapshot().playing && !suppressed) {
+          hasUnsavedLocalPlaybackRef.current = true;
+        }
         const now = Date.now();
         if (
+          !suppressed &&
           now - lastSavedAtRef.current >= LOCAL_PROGRESS_INTERVAL_MS &&
           !(completedEpisodeKeyRef.current === ev.episodeKey && !engine.getSnapshot().playing)
         ) {
@@ -522,6 +556,7 @@ export function PlayerProvider({
         setSleepTimerState(ev.state);
       } else if (ev.type === 'ended') {
         completedEpisodeKeyRef.current = ev.episodeKey;
+        hasUnsavedLocalPlaybackRef.current = false;
         const dur = snapshotRef.current.durationMs ?? episodeRef.current?.durationMs;
         const sleepWasEndOfEp = sleepTimerRef.current.timer.mode === 'endOfEpisode';
         const htmlConsumedSleep =
@@ -610,7 +645,7 @@ export function PlayerProvider({
         })();
       }
     });
-  }, [engine, host, saveProgressSafe, isTransientZero]);
+  }, [engine, host, saveProgressSafe, isTransientZero, isSeekSaveSuppressed]);
 
   // Hydrate the current episode when the engine already has an active/paused track (e.g. the
   // WebView reloaded while `PlaybackService` kept a paused episode).
@@ -659,10 +694,11 @@ export function PlayerProvider({
     })();
   }, [snapshot.episodeKey, host]);
 
-  // Flush progress on `pagehide` / hidden visibility change
+  // Flush progress on `pagehide` / hidden visibility change ONLY when local playback has unsaved changes (SYNC-P1-06)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const onPageHide = () => {
+      if (!hasUnsavedLocalPlaybackRef.current) return;
       const snap = engine.getSnapshot();
       if (
         snap.episodeKey &&
@@ -716,8 +752,10 @@ export function PlayerProvider({
             engSnap.episodeKey === event.episodeKey &&
             Math.abs(engSnap.positionMs - posMs) > 1500
           ) {
+            suppressProgrammaticSeekSave(event.episodeKey);
             engine.seekTo(posMs);
           }
+          hasUnsavedLocalPlaybackRef.current = false;
           setSnapshot((s) => {
             const next: PlayerSnapshot = {
               ...s,
@@ -736,20 +774,57 @@ export function PlayerProvider({
 
       const { deviceName, positionMs: remotePosMs, state: remoteState } = event.fromSync;
       if (remoteState === 'PLAYED') {
-        // ARCHITECTURE.md §7.6: do not stop playback; suppress auto-advance for this item
+        // ARCHITECTURE.md §7.6 + SYNC-P1-06: do not stop playback; suppress auto-advance and
+        // mark completed so a subsequent `pagehide` never overwrites remote PLAYED with IN_PROGRESS.
         suppressAutoAdvanceForKeyRef.current = event.episodeKey;
+        completedEpisodeKeyRef.current = event.episodeKey;
+        hasUnsavedLocalPlaybackRef.current = false;
         return;
       }
 
-      const previousPositionMs = engine.getSnapshot().positionMs;
-      engine.seekTo(remotePosMs);
+      const engSnap = engine.getSnapshot();
       const timeLabel = formatClock(remotePosMs);
+
+      // While actively playing, do not forcibly interrupt audio with `seekTo`; offer manual jump (SYNC-P1-05).
+      if (engSnap.playing) {
+        showSnackbar(
+          tRef.current('player.syncPositionAvailable', { device: deviceName, time: timeLabel }),
+          {
+            action: {
+              label: tRef.current('player.jumpToSync'),
+              run: () => {
+                suppressProgrammaticSeekSave(event.episodeKey);
+                if (remotePosMs === 0) {
+                  allowZeroUntilRef.current = Date.now() + 2000;
+                }
+                hasUnsavedLocalPlaybackRef.current = false;
+                engine.seekTo(remotePosMs);
+              },
+            },
+            durationMs: 8000,
+          },
+        );
+        return;
+      }
+
+      const previousPositionMs = engSnap.positionMs;
+      suppressProgrammaticSeekSave(event.episodeKey);
+      if (remotePosMs === 0) {
+        allowZeroUntilRef.current = Date.now() + 2000;
+      }
+      hasUnsavedLocalPlaybackRef.current = false;
+      engine.seekTo(remotePosMs);
       showSnackbar(
         tRef.current('player.resumedFrom', { device: deviceName, time: timeLabel }),
         {
           action: {
             label: tRef.current('common.undo'),
             run: () => {
+              suppressProgrammaticSeekSave(event.episodeKey);
+              if (previousPositionMs === 0) {
+                allowZeroUntilRef.current = Date.now() + 2000;
+              }
+              hasUnsavedLocalPlaybackRef.current = false;
               engine.seekTo(previousPositionMs);
               void host.sync.undoResume(event.episodeKey, previousPositionMs).catch(() => undefined);
             },

@@ -173,6 +173,8 @@ export const zhCN = {
   'player.shownotes': '单集简介',
   'player.noShownotes': '暂无简介内容',
   'player.resumedFrom': '已从 {device} 恢复至 {time}',
+  'player.syncPositionAvailable': '{device} 已播至 {time}',
+  'player.jumpToSync': '跳转',
 
   'sleep.title': '睡眠定时',
   'sleep.off': '关闭',

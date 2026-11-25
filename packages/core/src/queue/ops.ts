@@ -11,10 +11,12 @@ import {
   type SyncQueueEntry,
 } from '../types';
 import {
+  BASE62_DIGITS,
   compareQueueOrder,
   generateKeyBetween,
   generateNKeysBetween,
   needsKeyRebalance,
+  validateOrderKey,
 } from '../sync/fractional-index';
 import type { HybridLogicalClock } from '../sync/hlc';
 
@@ -141,6 +143,69 @@ function forceRebalanceSorted(
   return mutated;
 }
 
+function isValidOrderKey(pos: string): boolean {
+  if (!pos) return false;
+  try {
+    validateOrderKey(pos);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Derives a deterministic 2-char Base-62 suffix whose trailing digit is never `'0'`
+ * so appending it to any valid fractional-index key preserves `validateOrderKey`
+ * and separates concurrent offline insertions from different devices (SYNC-P1-11).
+ */
+function deviceJitterSuffix(deviceId: DeviceId): string {
+  // FNV-1a 32-bit hash + final avalanche mix
+  let h = 0x811c9dc5;
+  for (let i = 0; i < deviceId.length; i++) {
+    h ^= deviceId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  const u = h >>> 0;
+  const d1 = BASE62_DIGITS[u % 62]!;
+  const d2 = BASE62_DIGITS[1 + (Math.floor(u / 62) % 61)]!;
+  return `${d1}${d2}`;
+}
+
+/**
+ * Generates a valid fractional-index key strictly between `a` and `b` with a
+ * device-derived 2-char suffix so concurrent insertions at the head, tail, or
+ * midpoint (`queuePlayNext`) from distinct devices do not collide on identical `pos`.
+ */
+function generateJitteredKeyBetween(
+  a: string | null | undefined,
+  b: string | null | undefined,
+  deviceId: DeviceId,
+): string {
+  const base = generateKeyBetween(a, b);
+  const jitter = deviceJitterSuffix(deviceId);
+  const candidate = base + jitter;
+  if (b == null || candidate < b) {
+    return candidate;
+  }
+  // `base` is a prefix of `b` (e.g. base = "a0", b = "a0V"); step strictly inside (base, b).
+  const mid = generateKeyBetween(base, b);
+  const midCandidate = mid + jitter;
+  if (midCandidate < b) {
+    return midCandidate;
+  }
+  const mid2 = generateKeyBetween(base, mid);
+  const mid2Candidate = mid2 + jitter;
+  if (mid2Candidate < b) {
+    return mid2Candidate;
+  }
+  return mid;
+}
+
 function applyInsertionAtIndex(
   entries: readonly QueueEntry[],
   item: QueueItemInput,
@@ -166,28 +231,129 @@ function applyInsertionAtIndex(
     existing && !existing.removed ? existing.addedAt : updatedAt;
   const stub = item.stub ?? existing?.stub;
 
-  // If neighbor keys collided (e.g. concurrent offline insert at same slot), rebalance whole ordered list
-  if (prevNeighbor && nextNeighbor && prevNeighbor.pos >= nextNeighbor.pos) {
+  const prevInvalid = prevNeighbor !== undefined && !isValidOrderKey(prevNeighbor.pos);
+  const nextInvalid = nextNeighbor !== undefined && !isValidOrderKey(nextNeighbor.pos);
+  const neighborsCollide =
+    prevNeighbor !== undefined &&
+    nextNeighbor !== undefined &&
+    prevNeighbor.pos >= nextNeighbor.pos;
+
+  // Localized repair for colliding neighbors or malformed neighbor keys (SYNC-P1-11, SYNC-P2-07).
+  // Only re-keys the minimal contiguous colliding/invalid run `[runStart..runEnd]` so unrelated
+  // queue items keep their original `pos` and `updatedAt` (no cross-device resurrection).
+  if (prevInvalid || nextInvalid || neighborsCollide) {
     const placeholder: QueueEntry = {
       episodeKey: item.episodeKey,
       feedKey: item.feedKey,
-      pos: prevNeighbor.pos,
+      pos: prevNeighbor?.pos ?? nextNeighbor?.pos ?? 'a0',
       addedAt,
       updatedAt,
       removed: false,
       deviceId: ctx.deviceId,
       ...(stub !== undefined ? { stub } : {}),
     };
+
+    let runStart = clampedIdx;
+    let runEnd = clampedIdx - 1;
+    if (prevInvalid || neighborsCollide) {
+      runStart = Math.min(runStart, clampedIdx - 1);
+      runEnd = Math.max(runEnd, clampedIdx - 1);
+    }
+    if (nextInvalid || neighborsCollide) {
+      runStart = Math.min(runStart, clampedIdx);
+      runEnd = Math.max(runEnd, clampedIdx);
+    }
+
+    const collidingPos = neighborsCollide ? prevNeighbor.pos : undefined;
+
+    for (;;) {
+      let expanded = false;
+      while (runStart > 0) {
+        const left = othersActive[runStart - 1]!;
+        const firstInRun = runStart <= runEnd ? othersActive[runStart]! : undefined;
+        const mustInclude =
+          !isValidOrderKey(left.pos) ||
+          (collidingPos !== undefined && left.pos === collidingPos) ||
+          (firstInRun !== undefined && isValidOrderKey(firstInRun.pos) && left.pos >= firstInRun.pos);
+        if (mustInclude) {
+          runStart -= 1;
+          expanded = true;
+        } else {
+          break;
+        }
+      }
+      while (runEnd + 1 < othersActive.length) {
+        const right = othersActive[runEnd + 1]!;
+        const lastInRun = runStart <= runEnd ? othersActive[runEnd]! : undefined;
+        const mustInclude =
+          !isValidOrderKey(right.pos) ||
+          (collidingPos !== undefined && right.pos === collidingPos) ||
+          (lastInRun !== undefined && isValidOrderKey(lastInRun.pos) && lastInRun.pos >= right.pos);
+        if (mustInclude) {
+          runEnd += 1;
+          expanded = true;
+        } else {
+          break;
+        }
+      }
+
+      const leftBound = runStart > 0 ? othersActive[runStart - 1]!.pos : null;
+      const rightBound =
+        runEnd + 1 < othersActive.length ? othersActive[runEnd + 1]!.pos : null;
+      if (leftBound !== null && rightBound !== null && leftBound >= rightBound) {
+        if (runStart > 0) {
+          runStart -= 1;
+          expanded = true;
+        } else if (runEnd + 1 < othersActive.length) {
+          runEnd += 1;
+          expanded = true;
+        }
+      }
+      if (!expanded) break;
+    }
+
+    const leftBound = runStart > 0 ? othersActive[runStart - 1]!.pos : null;
+    const rightBound =
+      runEnd + 1 < othersActive.length ? othersActive[runEnd + 1]!.pos : null;
+
+    const runEntries: QueueEntry[] = [
+      ...othersActive.slice(runStart, clampedIdx),
+      placeholder,
+      ...othersActive.slice(clampedIdx, runEnd + 1),
+    ];
+
+    const freshKeys = generateNKeysBetween(leftBound, rightBound, runEntries.length);
+    const anyOverlong = freshKeys.some((k) => needsKeyRebalance(k));
+    if (!anyOverlong) {
+      const out: QueueEntry[] = [];
+      for (let i = 0; i < runEntries.length; i++) {
+        const e = runEntries[i]!;
+        const k = freshKeys[i]!;
+        if (e.episodeKey === item.episodeKey) {
+          out.push({ ...placeholder, pos: k });
+        } else if (e.pos !== k) {
+          out.push({
+            ...e,
+            pos: k,
+            updatedAt: ctx.hlc.stamp(e.updatedAt),
+            deviceId: ctx.deviceId,
+          });
+        }
+      }
+      return out;
+    }
+
+    // Fallback: keys inside the narrow colliding window exceeded max length -> full rebalance.
     const desiredOrder = [
       ...othersActive.slice(0, clampedIdx),
       placeholder,
       ...othersActive.slice(clampedIdx),
     ];
-    const freshKeys = generateNKeysBetween(null, null, desiredOrder.length);
+    const allKeys = generateNKeysBetween(null, null, desiredOrder.length);
     const out: QueueEntry[] = [];
     for (let i = 0; i < desiredOrder.length; i++) {
       const e = desiredOrder[i]!;
-      const k = freshKeys[i]!;
+      const k = allKeys[i]!;
       if (e.episodeKey === item.episodeKey) {
         out.push({ ...placeholder, pos: k });
       } else if (e.pos !== k) {
@@ -202,7 +368,11 @@ function applyInsertionAtIndex(
     return out;
   }
 
-  const pos = generateKeyBetween(prevNeighbor?.pos ?? null, nextNeighbor?.pos ?? null);
+  const pos = generateJitteredKeyBetween(
+    prevNeighbor?.pos ?? null,
+    nextNeighbor?.pos ?? null,
+    ctx.deviceId,
+  );
   const upserted: QueueEntry = {
     episodeKey: item.episodeKey,
     feedKey: item.feedKey,

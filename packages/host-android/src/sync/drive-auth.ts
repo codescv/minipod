@@ -130,6 +130,16 @@ export class AndroidDriveAuthManager {
       } catch (err) {
         if (err instanceof MiniPodError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
+        // Preserve transient connectivity / Play Services I/O errors as retryable `network` (SYNC-P1-14).
+        if (
+          /network|timeout|timed out|offline|unreachable|ioexception|unknownhost|socket|connection|service unavailable|50[0-4]|429/i.test(
+            msg,
+          )
+        ) {
+          throw new MiniPodError('network', msg || 'Google Drive token refresh network error', {
+            cause: err,
+          });
+        }
         throw new MiniPodError('sync-auth', msg || 'Google Drive token refresh failed', {
           cause: err,
         });

@@ -59,6 +59,8 @@ export interface StampProgressSaveOptions {
   readonly deviceId: DeviceId;
   readonly previous?: ProgressRecord | undefined;
   readonly ended?: boolean | undefined;
+  /** Optional real event wall-clock timestamp for replaying historical native checkpoints. */
+  readonly eventWallMs?: EpochMs | undefined;
 }
 
 /**
@@ -78,7 +80,10 @@ export function stampProgressSave(
       ended: options.ended,
     });
 
-  const updatedAt = options.hlc.stamp(options.previous?.updatedAt);
+  const updatedAt =
+    options.eventWallMs !== undefined
+      ? options.hlc.stampAtEventTime(options.eventWallMs, options.previous?.updatedAt)
+      : options.hlc.stamp(options.previous?.updatedAt);
 
   if (completed) {
     return {
@@ -125,10 +130,15 @@ export interface StampMarkPlayedOptions {
   readonly deviceId: DeviceId;
   readonly previous?: ProgressRecord | undefined;
   readonly durationMs?: number | undefined;
+  /** Optional real event wall-clock timestamp for replaying historical native completions. */
+  readonly eventWallMs?: EpochMs | undefined;
 }
 
 export function stampMarkPlayed(options: StampMarkPlayedOptions): ProgressRecord {
-  const updatedAt = options.hlc.stamp(options.previous?.updatedAt);
+  const updatedAt =
+    options.eventWallMs !== undefined
+      ? options.hlc.stampAtEventTime(options.eventWallMs, options.previous?.updatedAt)
+      : options.hlc.stamp(options.previous?.updatedAt);
   const durationMs = options.durationMs ?? options.previous?.durationMs;
   if (options.played) {
     return {

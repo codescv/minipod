@@ -23,6 +23,7 @@ import {
   type MiniPodErrorShape,
   type ProgressState,
   type QueueStub,
+  type SyncDevice,
   type SyncProviderSecret,
 } from '@minipod/core';
 
@@ -52,6 +53,7 @@ export interface IdbFeedRecord {
   readonly addedAt: HlcMs;
   readonly updatedAt: HlcMs;
   readonly deletedAt?: HlcMs | null;
+  readonly deviceId?: DeviceId;
   /** `1` = dirty, `0` = clean. */
   readonly syncDirty: 0 | 1;
 }
@@ -93,6 +95,8 @@ export interface IdbProgressRecord {
   readonly playedAt?: HlcMs | null;
   readonly updatedAt: HlcMs;
   readonly deviceId: DeviceId;
+  /** Local wall-clock ms when this progress record was last written locally or via sync (never synced, SYNC-P0-03). */
+  readonly localWrittenAt?: EpochMs;
   readonly syncDirty: 0 | 1;
 }
 
@@ -130,6 +134,9 @@ export interface IdbSyncStateRecord {
   readonly lastPushAt?: EpochMs;
   readonly lastError?: MiniPodErrorShape;
   readonly backoffUntil?: EpochMs;
+  readonly remoteDevices?: Readonly<Record<DeviceId, SyncDevice>>;
+  readonly lastRemoteFingerprint?: string | null;
+  readonly pendingLineageReset?: boolean;
 }
 
 export interface IdbSettingsRecord {

@@ -37,7 +37,6 @@ import {
   queueMove,
   queuePlayNext,
   queueRemove,
-  rebalanceQueueIfNeeded,
   RedirectRecorder,
   stampMarkPlayed,
   stampProgressSave,
@@ -80,6 +79,7 @@ import {
   type SyncProviderConfig,
   type SyncProviderSecret,
   type SyncSettings,
+  type SyncState,
   type SyncStatus,
   type Unsubscribe,
 } from '@minipod/core';
@@ -100,7 +100,7 @@ import {
   openMiniPodDb,
   type MiniPodDb,
 } from './storage/idb';
-import { IdbSyncStore } from './storage/IdbSyncStore';
+import { idbRecordToProgress, IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
@@ -216,11 +216,14 @@ export async function createCapacitorPlatformHost(
     }
   };
 
+  let currentPlayingEpisodeKey: EpisodeKey | undefined;
+
   const syncStore = new IdbSyncStore({
     db,
     hlc,
     appVersion: deps.appVersion,
     defaultDeviceName: deps.defaultDeviceName,
+    getCurrentEpisodeKey: () => currentPlayingEpisodeKey,
     onDeleteDownloads: async (paths) => {
       for (const path of paths) {
         await plugin.deleteLocalFile({ path }).catch(() => undefined);
@@ -266,7 +269,6 @@ export async function createCapacitorPlatformHost(
     return merged;
   };
 
-  let currentPlayingEpisodeKey: EpisodeKey | undefined;
   let disposed = false;
 
   // Serialized journal reconciliation mutex (`ARCHITECTURE.md §3.3`)
@@ -540,13 +542,14 @@ export async function createCapacitorPlatformHost(
     notifySync: boolean,
   ): Promise<void> => {
     const st = await syncStore.getSyncState();
-    const allQ = await syncStore.listAllQueueEntries();
-    const removedEntry = queueAutoRemoveOnFinish(allQ, episodeKey, {
-      hlc,
-      deviceId: st.deviceId,
+    const mutated = await syncStore.mutateQueueAtomic((allQ) => {
+      const removedEntry = queueAutoRemoveOnFinish(allQ, episodeKey, {
+        hlc,
+        deviceId: st.deviceId,
+      });
+      return removedEntry ? [removedEntry] : [];
     });
-    if (removedEntry) {
-      await syncStore.upsertQueueEntries([removedEntry], true);
+    if (mutated.length > 0) {
       emit({ type: 'queue-changed' });
       if (notifySync && !feedKey.startsWith('l_')) {
         syncScheduler.request('queue-changed');
@@ -583,21 +586,24 @@ export async function createCapacitorPlatformHost(
     const changedEpisodes = new Set<EpisodeKey>();
     let maxWallMs = 0;
 
-    // 1. Replay append-only native completions (`completed[]`)
+    // 1. Replay append-only native completions (`completed[]`) using event wall-clock time (SYNC-P0-03)
     for (const c of completed) {
       completedKeys.add(c.episodeKey);
       if (c.endedWallMs > maxWallMs) {
         maxWallMs = c.endedWallMs;
       }
 
-      const [epRec, prevProg] = await Promise.all([
+      const [epRec, prevProgRec] = await Promise.all([
         syncStore.getEpisodeRecord(c.episodeKey),
-        syncStore.getProgress(c.episodeKey),
+        syncStore.getProgressRecord(c.episodeKey),
       ]);
+      const prevProg = prevProgRec ? idbRecordToProgress(prevProgRec) : undefined;
       const feedKey = epRec?.feedKey ?? prevProg?.feedKey ?? qByEp.get(c.episodeKey)?.feedKey;
       if (!feedKey) continue;
 
-      if (prevProg?.state !== 'PLAYED' || c.endedWallMs > prevProg.updatedAt) {
+      const prevLocalWall = prevProgRec?.localWrittenAt ?? prevProgRec?.updatedAt ?? 0;
+      const completionIsNewer = !prevProgRec || c.endedWallMs > prevLocalWall;
+      if (completionIsNewer && (prevProg?.state !== 'PLAYED' || c.endedWallMs > prevProg.updatedAt)) {
         const playedRec = stampMarkPlayed({
           episodeKey: c.episodeKey,
           feedKey,
@@ -606,45 +612,45 @@ export async function createCapacitorPlatformHost(
           deviceId: st.deviceId,
           previous: prevProg,
           durationMs: c.durationMs ?? epRec?.durationMs ?? prevProg?.durationMs,
+          eventWallMs: c.endedWallMs,
         });
         await syncStore.upsertProgress(playedRec, {
           syncDirty: true,
           identity: epRec?.identity,
         });
         changedEpisodes.add(c.episodeKey);
+        await handleEpisodeCompletedSideEffects(c.episodeKey, feedKey, false);
+      } else if (prevProg?.state === 'PLAYED') {
+        await handleEpisodeCompletedSideEffects(c.episodeKey, feedKey, false);
       }
-
-      await handleEpisodeCompletedSideEffects(c.episodeKey, feedKey, false);
     }
 
-    // 2. Replay active 5s native checkpoint (`current`)
+    // 2. Replay active 5s native checkpoint (`current`) using event wall-clock vs `localWrittenAt` (SYNC-P0-03)
     if (current && !completedKeys.has(current.episodeKey)) {
       if (current.wallMs > maxWallMs) {
         maxWallMs = current.wallMs;
       }
 
-      const [epRec, prevProg] = await Promise.all([
+      const [epRec, prevProgRec] = await Promise.all([
         syncStore.getEpisodeRecord(current.episodeKey),
-        syncStore.getProgress(current.episodeKey),
+        syncStore.getProgressRecord(current.episodeKey),
       ]);
+      const prevProg = prevProgRec ? idbRecordToProgress(prevProgRec) : undefined;
       const feedKey = epRec?.feedKey ?? prevProg?.feedKey ?? qByEp.get(current.episodeKey)?.feedKey;
       if (feedKey) {
-        const isNewerThanStored =
-          !prevProg ||
-          current.wallMs > prevProg.updatedAt ||
-          (prevProg.state !== 'PLAYED' && current.positionMs !== prevProg.positionMs);
+        const prevLocalWall = prevProgRec?.localWrittenAt ?? prevProgRec?.updatedAt ?? 0;
+        const isNewerThanStored = !prevProgRec || current.wallMs > prevLocalWall;
         // A `positionMs: 0` checkpoint is normally a transient idle/reset and ignored. It is only
         // adopted when native flagged it as an explicit seek (lock-screen Rewind -10 s / scrub to
         // 0:00 while the WebView was frozen or killed), it is newer than the stored IN_PROGRESS
-        // position, and it can never undo PLAYED.
+        // local write time, and it can never undo PLAYED.
         const explicitRewindToZero =
           current.positionMs === 0 &&
           current.seeked === true &&
           prevProg !== undefined &&
-          prevProg !== null &&
           prevProg.state === 'IN_PROGRESS' &&
           prevProg.positionMs > 0 &&
-          current.wallMs > prevProg.updatedAt;
+          isNewerThanStored;
 
         if (isNewerThanStored && (current.positionMs > 0 || explicitRewindToZero)) {
           const stamped = stampProgressSave(
@@ -663,6 +669,7 @@ export async function createCapacitorPlatformHost(
               hlc,
               deviceId: st.deviceId,
               previous: prevProg,
+              eventWallMs: current.wallMs,
             },
           );
           await syncStore.upsertProgress(stamped, {
@@ -695,9 +702,31 @@ export async function createCapacitorPlatformHost(
     return journalChain;
   };
 
+  const computeAndroidRemoteFingerprint = (config: SyncProviderConfig): string => {
+    switch (config.id) {
+      case 'saf':
+        return `saf:${config.documentUri}`;
+      case 'webdav':
+        return `webdav:${config.fileUrl.trim()}`;
+      case 'gist':
+        return `gist:${config.gistId?.trim() ?? ''}`;
+      case 'local-folder':
+        return `local-folder:${config.folderPath}`;
+      case 'drive-appdata':
+      case 'drive-file': {
+        const hint = config.accountHint ?? driveAuth.getLastAuthorizedEmail() ?? config.id;
+        return `${config.id}:${hint}`;
+      }
+    }
+  };
+
   // Instantiate SyncEngine + SyncScheduler (`ARCHITECTURE.md §8`, `§9`)
   const instantiateSyncProvider = async (
     config: SyncProviderConfig,
+    options?: {
+      readonly secretOverride?: SyncProviderSecret | undefined;
+      readonly ignoreStoredFileId?: boolean | undefined;
+    },
   ): Promise<CloudFileProvider> => {
     switch (config.id) {
       case 'saf':
@@ -722,7 +751,7 @@ export async function createCapacitorPlatformHost(
           mode: config.id === 'drive-appdata' ? 'appdata' : 'file',
           http,
           getToken: driveAuth.createTokenProvider(config.id, effectiveHint),
-          initialFileId: st.remoteFileId,
+          initialFileId: options?.ignoreStoredFileId ? null : st.remoteFileId,
           userAgent,
           ...(config.id === 'drive-file' && config.folderName
             ? { folderName: config.folderName }
@@ -731,7 +760,10 @@ export async function createCapacitorPlatformHost(
       }
 
       case 'webdav': {
-        const password = (await secretsStore.getWebDavPassword()) ?? '';
+        const password =
+          options?.secretOverride?.id === 'webdav'
+            ? options.secretOverride.password
+            : ((await secretsStore.getWebDavPassword()) ?? '');
         return new WebDavProvider({
           fileUrl: config.fileUrl,
           username: config.username,
@@ -742,9 +774,13 @@ export async function createCapacitorPlatformHost(
       }
 
       case 'gist': {
-        const token = (await secretsStore.getGistToken()) ?? '';
+        const token =
+          options?.secretOverride?.id === 'gist'
+            ? options.secretOverride.token
+            : ((await secretsStore.getGistToken()) ?? '');
         const st = await syncStore.getSyncState();
-        const initialGistId = config.gistId ?? st.remoteFileId ?? undefined;
+        const initialGistId =
+          config.gistId ?? (options?.ignoreStoredFileId ? undefined : (st.remoteFileId ?? undefined));
         return new GitHubGistProvider({
           token,
           http,
@@ -788,10 +824,17 @@ export async function createCapacitorPlatformHost(
       emit({ type: 'sync-status', status });
     },
     onDecisions: (decisions: ApplyDecisions) => {
-      emit({ type: 'feeds-changed' });
-      emit({ type: 'queue-changed' });
-      void pushNativeQueueFn?.();
+      const changed = decisions.changed;
+      if (!changed || changed.subscriptions || decisions.feedsToRefresh.length > 0) {
+        emit({ type: 'feeds-changed' });
+      }
+      if (!changed || changed.queue) {
+        emit({ type: 'queue-changed' });
+        void pushNativeQueueFn?.();
+      }
+      const hintKeys = new Set<EpisodeKey>();
       for (const hint of decisions.resumeHints) {
+        hintKeys.add(hint.episodeKey);
         emit({
           type: 'progress-changed',
           episodeKey: hint.episodeKey,
@@ -801,6 +844,14 @@ export async function createCapacitorPlatformHost(
             state: hint.state,
           },
         });
+      }
+      // Emit plain `progress-changed` ONLY for episodes NOT already in `resumeHints` (SYNC-P1-07).
+      if (changed?.progressEpisodeKeys) {
+        for (const epKey of changed.progressEpisodeKeys) {
+          if (!hintKeys.has(epKey)) {
+            emit({ type: 'progress-changed', episodeKey: epKey });
+          }
+        }
       }
       if (decisions.feedsToRefresh.length > 0) {
         refreshFeedsFn?.(decisions.feedsToRefresh);
@@ -975,17 +1026,23 @@ export async function createCapacitorPlatformHost(
   };
   pushNativeQueueFn = syncNativeQueue;
 
-  // Refresh the native playlist when connectivity changes (re-add remote items once back online).
+  // Refresh the native playlist and trigger catch-up sync when connectivity returns (SYNC-P2-02).
   let removeConnectivityListeners: (() => void) | null = null;
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-    const onConnectivityChanged = (): void => {
+    const onOnline = (): void => {
+      void syncNativeQueue().catch(() => undefined);
+      if (syncEngine.getProvider()) {
+        syncScheduler.request('foreground');
+      }
+    };
+    const onOffline = (): void => {
       void syncNativeQueue().catch(() => undefined);
     };
-    window.addEventListener('online', onConnectivityChanged);
-    window.addEventListener('offline', onConnectivityChanged);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
     removeConnectivityListeners = () => {
-      window.removeEventListener('online', onConnectivityChanged);
-      window.removeEventListener('offline', onConnectivityChanged);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
     };
   }
 
@@ -1064,11 +1121,13 @@ export async function createCapacitorPlatformHost(
     }
     const storedCreds = await secretsStore.getFeedCredentials(preview.feedKey);
 
+    const st = await syncStore.getSyncState();
     const feed = await syncStore.upsertParsedFeed({
       feedKey: preview.feedKey,
       kind: 'RSS',
       url: preview.url,
       subscribed: true,
+      deviceId: st.deviceId,
       parsed: preview.parsed,
       nowWallMs: Date.now(),
       hasCredentials: Boolean(effectiveCreds || storedCreds),
@@ -1131,6 +1190,7 @@ export async function createCapacitorPlatformHost(
             kind: 'LOCAL',
             url: scanned.feedUrl,
             subscribed: feedRec.subscribedNum === 1,
+            preserveSubscriptionState: true,
             parsed: scanned.parsed,
             nowWallMs: Date.now(),
             localMtimeByIdentity: scanned.mtimeByIdentity,
@@ -1203,10 +1263,16 @@ export async function createCapacitorPlatformHost(
           if (candidate !== cleanUrl) newPermUrl = candidate;
         }
 
+        // Verify feed is still subscribed after HTTP fetch before committing redirect/episodes (SYNC-P0-02).
+        const liveRec = await syncStore.getFeedRecord(feedKey);
+        if (!liveRec || liveRec.subscribedNum === 0 || liveRec.deletedAt != null) {
+          return;
+        }
+
+        const st = await syncStore.getSyncState();
         let targetKey = feedKey;
         let moved = false;
         if (newPermUrl && newPermUrl !== fetchUrl) {
-          const st = await syncStore.getSyncState();
           targetKey = await syncStore.recordPermanentMove(feedKey, newPermUrl, st.deviceId);
           moved = true;
         }
@@ -1215,7 +1281,9 @@ export async function createCapacitorPlatformHost(
           feedKey: targetKey,
           kind: 'RSS',
           url: newPermUrl ?? fetchUrl,
-          subscribed: feedRec.subscribedNum === 1,
+          subscribed: true,
+          preserveSubscriptionState: true,
+          deviceId: st.deviceId,
           parsed,
           nowWallMs: nowMs,
           ...(resp.headers['etag'] !== undefined ? { etag: resp.headers['etag'] } : {}),
@@ -1863,7 +1931,8 @@ export async function createCapacitorPlatformHost(
         credentials: HttpBasicCredentials | null,
       ): Promise<void> {
         await secretsStore.setFeedCredentials(feedKey, credentials);
-        await syncStore.setFeedHasCredentials(feedKey, credentials !== null);
+        const st = await syncStore.getSyncState();
+        await syncStore.setFeedHasCredentials(feedKey, credentials !== null, st.deviceId);
         emit({ type: 'feeds-changed' });
         if (!feedKey.startsWith('l_')) {
           syncScheduler.request('subscriptions-changed');
@@ -2121,15 +2190,7 @@ export async function createCapacitorPlatformHost(
 
     queue: {
       async list(): Promise<readonly QueueRow[]> {
-        const [all, st] = await Promise.all([
-          syncStore.listAllQueueEntries(),
-          syncStore.getSyncState(),
-        ]);
-        const rebalanced = rebalanceQueueIfNeeded(all, { hlc, deviceId: st.deviceId });
-        if (rebalanced.length > 0) {
-          await syncStore.upsertQueueEntries(rebalanced, true);
-          syncScheduler.request('queue-changed');
-        }
+        // Pure read: never re-stamp/rebalance queue on read (SYNC-P1-11).
         return syncStore.listActiveQueueRows();
       },
 
@@ -2139,20 +2200,23 @@ export async function createCapacitorPlatformHost(
         const st = await syncStore.getSyncState();
         const isLocal = feed.kind === 'LOCAL';
         const stub = isLocal ? undefined : buildQueueStub(epRow.episode, feed);
-        const mutated = queueAdd(
-          await syncStore.listAllQueueEntries(),
-          {
-            episodeKey,
-            feedKey: feed.feedKey,
-            ...(stub !== undefined ? { stub } : {}),
-          },
-          { hlc, deviceId: st.deviceId },
+        const mutated = await syncStore.mutateQueueAtomic((entries) =>
+          queueAdd(
+            entries,
+            {
+              episodeKey,
+              feedKey: feed.feedKey,
+              ...(stub !== undefined ? { stub } : {}),
+            },
+            { hlc, deviceId: st.deviceId },
+          ),
         );
         if (mutated.length > 0) {
-          await syncStore.upsertQueueEntries(mutated, !isLocal);
           emit({ type: 'queue-changed' });
           await syncNativeQueue();
-          if (!isLocal) syncScheduler.request('queue-changed');
+          if (mutated.some((m) => !m.feedKey.startsWith('l_'))) {
+            syncScheduler.request('queue-changed');
+          }
         }
       },
 
@@ -2162,34 +2226,33 @@ export async function createCapacitorPlatformHost(
         const st = await syncStore.getSyncState();
         const isLocal = feed.kind === 'LOCAL';
         const stub = isLocal ? undefined : buildQueueStub(epRow.episode, feed);
-        const mutated = queuePlayNext(
-          await syncStore.listAllQueueEntries(),
-          {
-            episodeKey,
-            feedKey: feed.feedKey,
-            ...(stub !== undefined ? { stub } : {}),
-          },
-          { hlc, deviceId: st.deviceId },
-          currentPlayingEpisodeKey,
+        const mutated = await syncStore.mutateQueueAtomic((entries) =>
+          queuePlayNext(
+            entries,
+            {
+              episodeKey,
+              feedKey: feed.feedKey,
+              ...(stub !== undefined ? { stub } : {}),
+            },
+            { hlc, deviceId: st.deviceId },
+            currentPlayingEpisodeKey,
+          ),
         );
         if (mutated.length > 0) {
-          await syncStore.upsertQueueEntries(mutated, !isLocal);
           emit({ type: 'queue-changed' });
           await syncNativeQueue();
-          if (!isLocal) syncScheduler.request('queue-changed');
+          if (mutated.some((m) => !m.feedKey.startsWith('l_'))) {
+            syncScheduler.request('queue-changed');
+          }
         }
       },
 
       async move(episodeKey: EpisodeKey, beforeKey: EpisodeKey | null): Promise<void> {
         const st = await syncStore.getSyncState();
-        const mutated = queueMove(
-          await syncStore.listAllQueueEntries(),
-          episodeKey,
-          beforeKey,
-          { hlc, deviceId: st.deviceId },
+        const mutated = await syncStore.mutateQueueAtomic((entries) =>
+          queueMove(entries, episodeKey, beforeKey, { hlc, deviceId: st.deviceId }),
         );
         if (mutated.length > 0) {
-          await syncStore.upsertQueueEntries(mutated, true);
           emit({ type: 'queue-changed' });
           await syncNativeQueue();
           if (mutated.some((m) => !m.feedKey.startsWith('l_'))) {
@@ -2200,16 +2263,14 @@ export async function createCapacitorPlatformHost(
 
       async remove(episodeKey: EpisodeKey): Promise<void> {
         const st = await syncStore.getSyncState();
-        const removed = queueRemove(await syncStore.listAllQueueEntries(), episodeKey, {
-          hlc,
-          deviceId: st.deviceId,
+        const mutated = await syncStore.mutateQueueAtomic((entries) => {
+          const removed = queueRemove(entries, episodeKey, { hlc, deviceId: st.deviceId });
+          return removed ? [removed] : [];
         });
-        if (removed) {
-          const isLocal = removed.feedKey.startsWith('l_');
-          await syncStore.upsertQueueEntries([removed], !isLocal);
+        if (mutated.length > 0) {
           emit({ type: 'queue-changed' });
           await syncNativeQueue();
-          if (!isLocal) {
+          if (mutated.some((m) => !m.feedKey.startsWith('l_'))) {
             syncScheduler.request('queue-changed');
           }
         }
@@ -2217,12 +2278,10 @@ export async function createCapacitorPlatformHost(
 
       async clear(): Promise<void> {
         const st = await syncStore.getSyncState();
-        const mutated = queueClear(await syncStore.listAllQueueEntries(), {
-          hlc,
-          deviceId: st.deviceId,
-        });
+        const mutated = await syncStore.mutateQueueAtomic((entries) =>
+          queueClear(entries, { hlc, deviceId: st.deviceId }),
+        );
         if (mutated.length > 0) {
-          await syncStore.upsertQueueEntries(mutated, true);
           emit({ type: 'queue-changed' });
           await syncNativeQueue();
           if (mutated.some((m) => !m.feedKey.startsWith('l_'))) {
@@ -2352,52 +2411,33 @@ export async function createCapacitorPlatformHost(
       },
 
       async configure(settings: SyncSettings, secret?: SyncProviderSecret): Promise<SyncStatus> {
-        if (secret) {
-          await secretsStore.saveSyncSecret(secret);
-        }
+        const safFallbackUri =
+          settings.provider?.id === 'drive-appdata' || settings.provider?.id === 'drive-file'
+            ? driveAuth.getSafFallbackUri()
+            : undefined;
 
-        const effectiveSettings: SyncSettings =
-          (settings.provider?.id === 'drive-appdata' || settings.provider?.id === 'drive-file') &&
-          driveAuth.getSafFallbackUri()
+        const effectiveSettings: SyncSettings = safFallbackUri
+          ? {
+              ...settings,
+              provider: { id: 'saf', documentUri: safFallbackUri },
+            }
+          : (settings.provider?.id === 'drive-appdata' ||
+                settings.provider?.id === 'drive-file') &&
+              !settings.provider.accountHint &&
+              driveAuth.getLastAuthorizedEmail()
             ? {
                 ...settings,
-                provider: { id: 'saf', documentUri: driveAuth.consumeSafFallbackUri()! },
+                provider: {
+                  ...settings.provider,
+                  accountHint: driveAuth.getLastAuthorizedEmail()!,
+                },
               }
-            : (settings.provider?.id === 'drive-appdata' ||
-                  settings.provider?.id === 'drive-file') &&
-                !settings.provider.accountHint &&
-                driveAuth.getLastAuthorizedEmail()
-              ? {
-                  ...settings,
-                  provider: {
-                    ...settings.provider,
-                    accountHint: driveAuth.getLastAuthorizedEmail()!,
-                  },
-                }
-              : settings;
-
-        const prevSettings = await readSettings();
-        const providerChanged =
-          JSON.stringify(prevSettings.sync.provider) !== JSON.stringify(effectiveSettings.provider);
-
-        if (providerChanged && effectiveSettings.provider !== null) {
-          await syncStore.markAllDirty();
-        }
-
-        await syncStore.setSyncState({
-          deviceName: effectiveSettings.deviceName,
-          ...(providerChanged
-            ? {
-                remoteEtag: null,
-                remoteFileId: null,
-                remoteRev: 0,
-                floors: { subscriptions: 0, queue: 0, progress: 0 },
-              }
-            : {}),
-        });
+            : settings;
 
         if (!effectiveSettings.provider) {
           syncEngine.setProvider(null);
+          await syncEngine.drainActiveCycle();
+          await syncStore.setSyncState({ deviceName: effectiveSettings.deviceName });
           const updated = await writeSettings({ sync: effectiveSettings });
           syncScheduler.setWifiOnly(updated.sync.wifiOnly);
           syncScheduler.rebindProviderWatcher();
@@ -2407,13 +2447,78 @@ export async function createCapacitorPlatformHost(
           return status;
         }
 
-        const candidate = await instantiateSyncProvider(effectiveSettings.provider);
+        // Determine whether target represents a new remote lineage BEFORE mutating secrets/state (SYNC-P0-05, SYNC-P1-10)
+        const [prevSettings, state] = await Promise.all([readSettings(), syncStore.getSyncState()]);
+        const nextFingerprint = computeAndroidRemoteFingerprint(effectiveSettings.provider);
+        const isDrive =
+          effectiveSettings.provider.id === 'drive-appdata' ||
+          effectiveSettings.provider.id === 'drive-file';
+        const prevHint =
+          prevSettings.sync.provider &&
+          (prevSettings.sync.provider.id === 'drive-appdata' ||
+            prevSettings.sync.provider.id === 'drive-file')
+            ? prevSettings.sync.provider.accountHint
+            : undefined;
+        const nextHint = isDrive ? effectiveSettings.provider.accountHint : undefined;
+        const accountHintChanged =
+          isDrive && prevHint !== undefined && nextHint !== undefined && prevHint !== nextHint;
+        const sameDriveWithoutReauth =
+          isDrive &&
+          !accountHintChanged &&
+          !state.pendingLineageReset &&
+          typeof state.lastRemoteFingerprint === 'string' &&
+          state.lastRemoteFingerprint.startsWith(`${effectiveSettings.provider.id}:`);
+        const fingerprintChanged =
+          state.lastRemoteFingerprint !== undefined &&
+          state.lastRemoteFingerprint !== null &&
+          state.lastRemoteFingerprint !== nextFingerprint &&
+          !sameDriveWithoutReauth;
+        const needLineageReset = fingerprintChanged || state.pendingLineageReset === true;
+
+        // Phase 1: probe candidate using ephemeral secret without touching persisted secrets or sync_state (SYNC-P1-10)
+        const candidate = await instantiateSyncProvider(effectiveSettings.provider, {
+          secretOverride: secret,
+          ignoreStoredFileId: needLineageReset,
+        });
         const probe = await candidate.probe();
         if (!probe.ok) {
           throw probe.error
             ? MiniPodError.fromShape(probe.error)
             : new MiniPodError('sync-auth', 'Sync provider probe failed');
         }
+
+        // Phase 2: probe succeeded -> drain active cycle, then atomically commit secrets/state/provider
+        syncEngine.setProvider(null);
+        await syncEngine.drainActiveCycle();
+
+        if (safFallbackUri) {
+          driveAuth.consumeSafFallbackUri();
+        }
+        if (secret) {
+          await secretsStore.saveSyncSecret(secret);
+        }
+
+        // Never call `markAllDirty()` on configure; flag lineage reset only when remote identity changed (SYNC-P0-05).
+        const statePatch: Partial<SyncState> = needLineageReset
+          ? ({
+              deviceName: effectiveSettings.deviceName,
+              remoteEtag: null,
+              remoteFileId: null,
+              remoteRev: 0,
+              floors: { subscriptions: 0, queue: 0, progress: 0 },
+              lastPullAt: undefined,
+              lastPushAt: undefined,
+              remoteDevices: {},
+              lastRemoteFingerprint: nextFingerprint,
+              pendingLineageReset: true,
+            } as unknown as Partial<SyncState>)
+          : {
+              deviceName: effectiveSettings.deviceName,
+              ...(state.lastRemoteFingerprint == null
+                ? { lastRemoteFingerprint: nextFingerprint }
+                : {}),
+            };
+        await syncStore.setSyncState(statePatch);
 
         const updated = await writeSettings({ sync: effectiveSettings });
         syncScheduler.setWifiOnly(updated.sync.wifiOnly);
@@ -2430,6 +2535,8 @@ export async function createCapacitorPlatformHost(
         const hint =
           cur.sync.provider?.id === provider ? cur.sync.provider.accountHint : undefined;
         await driveAuth.authorizeInteractive(provider, hint);
+        // Re-authorization may target a different Google account -> flag lineage reset (SYNC-P0-05).
+        await syncStore.setSyncState({ pendingLineageReset: true });
       },
 
       async syncNow(): Promise<SyncStatus> {
@@ -2443,17 +2550,18 @@ export async function createCapacitorPlatformHost(
       async disconnect(): Promise<void> {
         const cur = await readSettings();
         syncEngine.setProvider(null);
+        await syncEngine.drainActiveCycle();
         syncScheduler.rebindProviderWatcher();
         await secretsStore.clearSyncSecrets();
         driveAuth.clearCache();
 
+        // Preserve `lastRemoteFingerprint`, `remoteRev`, `floors`, and `lastPullAt`/`lastPushAt` across disconnect
+        // so reconnecting the SAME remote does not masquerade as a new lineage or resurrect deleted items (SYNC-P0-05).
         await syncStore.setSyncState({
           remoteEtag: null,
-          remoteFileId: null,
-          remoteRev: 0,
           lastError: undefined,
           backoffUntil: 0,
-        } as unknown as Partial<import('@minipod/core').SyncState>);
+        } as unknown as Partial<SyncState>);
 
         const updated = await writeSettings({
           sync: {
@@ -2674,6 +2782,8 @@ export async function createCapacitorPlatformHost(
       lifecycleUnsub?.();
       removeConnectivityListeners?.();
       syncScheduler.dispose();
+      syncEngine.setProvider(null);
+      await syncEngine.drainActiveCycle();
       engine.dispose();
       await Promise.all([
         dlListenerHandle.remove().catch(() => undefined),
