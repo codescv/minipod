@@ -2126,4 +2126,29 @@ describe('CapacitorPlatformHost', () => {
       await bundle.host.dispose();
     });
   });
+
+  describe('UI language native sync', () => {
+    it('syncs persisted uiLanguage on boot and whenever settings.update changes uiLanguage', async () => {
+      const harness = createTestPluginHarness();
+      const setUiLanguage = vi.fn(async () => undefined);
+      const plugin: MiniPodPlugin = { ...harness.plugin, setUiLanguage };
+      const bundle = await createCapacitorPlatformHost({
+        idbFactory: new IDBFactory(),
+        dbName: `host-ui-lang-${Math.random().toString(36).slice(2)}`,
+        preferences: createMemoryPreferences(),
+        plugin,
+      });
+
+      expect(setUiLanguage).toHaveBeenCalledWith({ language: 'system' });
+
+      await bundle.host.settings.update({ uiLanguage: 'ja' });
+      expect(setUiLanguage).toHaveBeenLastCalledWith({ language: 'ja' });
+      expect((await bundle.host.settings.get()).uiLanguage).toBe('ja');
+
+      await bundle.host.settings.update({ uiLanguage: 'zh-CN' });
+      expect(setUiLanguage).toHaveBeenLastCalledWith({ language: 'zh-CN' });
+
+      await bundle.host.dispose();
+    });
+  });
 });

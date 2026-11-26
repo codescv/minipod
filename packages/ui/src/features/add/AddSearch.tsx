@@ -264,7 +264,7 @@ export function AddSearch({ initialInput }: { readonly initialInput?: string | u
             </button>
           )}
 
-          <div className="m-chips" role="tablist" aria-label="Podcast directories">
+          <div className="m-chips" role="tablist" aria-label={t('add.directoriesLabel')}>
             {SOURCE_CHIPS.map((chip) => (
               <Chip
                 key={chip.id}

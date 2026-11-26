@@ -104,7 +104,7 @@ import { idbRecordToProgress, IdbSyncStore } from './storage/IdbSyncStore';
 import { AndroidDriveAuthManager } from './sync/drive-auth';
 import { createSafFileProvider } from './sync/SafFileProvider';
 
-export const CAPACITOR_HOST_VERSION = '0.1.36';
+export const CAPACITOR_HOST_VERSION = '0.1.37';
 
 const PREVIEW_TTL_MS = 15 * 60_000;
 const MAX_CACHED_PREVIEWS = 64;
@@ -233,11 +233,15 @@ export async function createCapacitorPlatformHost(
 
   const bootSyncState = await syncStore.init();
 
+  const sanitizeUiLanguage = (raw: unknown): AppSettings['uiLanguage'] =>
+    raw === 'zh-CN' || raw === 'en' || raw === 'ja' ? raw : 'system';
+
   const readSettings = async (): Promise<AppSettings> => {
     const rec = await db.get('settings', 'app');
     if (!rec?.value) {
       return createDefaultAndroidAppSettings(bootSyncState.deviceName);
     }
+    const uiLanguage = sanitizeUiLanguage(rec.value.uiLanguage);
     // Legacy (`schemaVersion < 2`, pre-v0.1.14) rows may carry a stale `deleteDownloadWhenPlayed: false`
     // that the user can no longer toggle off (the switch was removed): always-on auto-delete wins.
     if ((Number(rec.value.schemaVersion) || 1) < APP_SETTINGS_SCHEMA_VERSION) {
@@ -245,6 +249,7 @@ export async function createCapacitorPlatformHost(
         ...rec.value,
         schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
         deleteDownloadWhenPlayed: true,
+        uiLanguage,
       };
     }
     return {
@@ -253,6 +258,7 @@ export async function createCapacitorPlatformHost(
         rec.value.deleteDownloadWhenPlayed === undefined
           ? true
           : Boolean(rec.value.deleteDownloadWhenPlayed),
+      uiLanguage,
     };
   };
 
@@ -860,6 +866,7 @@ export async function createCapacitorPlatformHost(
   });
 
   const initialSettings = await readSettings();
+  void plugin.setUiLanguage?.({ language: initialSettings.uiLanguage }).catch(() => undefined);
   const syncScheduler = new SyncScheduler({
     engine: syncEngine,
     host: deps.schedulerHost,
@@ -2702,6 +2709,9 @@ export async function createCapacitorPlatformHost(
         }
         if (patch.backgroundRefreshHours !== undefined) {
           configureBgRefresh(updated.backgroundRefreshHours);
+        }
+        if (patch.uiLanguage !== undefined) {
+          await plugin.setUiLanguage?.({ language: updated.uiLanguage }).catch(() => undefined);
         }
         emit({ type: 'settings-changed', settings: updated });
         return updated;

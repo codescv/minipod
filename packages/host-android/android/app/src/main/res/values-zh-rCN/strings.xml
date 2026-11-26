@@ -13,4 +13,5 @@
     </plurals>
     <string name="download_notification_running">%d 个下载中</string>
     <string name="download_notification_queued">%1$d 个下载中 · %2$d 个等待中</string>
+    <string name="feedback_chooser_title">发送反馈</string>
 </resources>

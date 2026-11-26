@@ -475,7 +475,7 @@ const PreviewEpisodeRow = memo(function PreviewEpisodeRow({
   const isCurrent = player.episode?.episodeKey === epKey;
   const isPlaying = isCurrent && player.playing;
   const dateStr = formatShortDate(ep.pubDate, locale);
-  const durStr = formatHumanDuration(ep.durationMs);
+  const durStr = formatHumanDuration(ep.durationMs, locale);
 
   const handlePlay = () => {
     if (isCurrent) {

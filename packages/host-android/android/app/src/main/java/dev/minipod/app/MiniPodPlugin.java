@@ -24,8 +24,10 @@ import android.provider.Settings;
 import android.util.Base64;
 import androidx.activity.result.ActivityResult;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.content.FileProvider;
 import androidx.core.content.pm.PackageInfoCompat;
+import androidx.core.os.LocaleListCompat;
 import androidx.documentfile.provider.DocumentFile;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -379,7 +381,10 @@ public class MiniPodPlugin extends Plugin {
             Intent send = buildFeedbackSendIntent(context, spec, to, subject, body, contentUri);
             Intent toStart = send;
             if (spec.strategy == FeedbackEmailIntentBuilder.Strategy.CHOOSER) {
-                toStart = Intent.createChooser(send, subject.isEmpty() ? "Send feedback" : subject);
+                toStart = Intent.createChooser(
+                    send,
+                    subject.isEmpty() ? context.getString(R.string.feedback_chooser_title) : subject
+                );
                 toStart.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
             }
             try {
@@ -2361,5 +2366,25 @@ public class MiniPodPlugin extends Plugin {
         }
         return a.scheme().equals(b.scheme())
             || ("http".equals(a.scheme()) && "https".equals(b.scheme()));
+    }
+
+    @PluginMethod
+    public void setUiLanguage(PluginCall call) {
+        String language = call.getString("language", "system");
+        String tags = UiLanguageLocale.toLanguageTags(language);
+        LocaleListCompat desired = tags.isEmpty()
+            ? LocaleListCompat.getEmptyLocaleList()
+            : LocaleListCompat.forLanguageTags(tags);
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                LocaleListCompat current = AppCompatDelegate.getApplicationLocales();
+                if (!desired.toLanguageTags().equals(current.toLanguageTags())) {
+                    AppCompatDelegate.setApplicationLocales(desired);
+                }
+                call.resolve();
+            } catch (Exception e) {
+                call.reject("Failed to apply UI language: " + e.getMessage(), "internal", e);
+            }
+        });
     }
 }

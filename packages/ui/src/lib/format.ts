@@ -23,12 +23,30 @@ export function formatRemainingClock(positionMs: number, durationMs: number | un
   return `-${formatClock(remaining)}`;
 }
 
-/** Formats milliseconds into compact human duration (`48 min` or `3h 12m`). */
-export function formatHumanDuration(ms: number | undefined): string {
+function normalizeFormatLocale(locale: string | undefined): 'zh-CN' | 'ja' | 'en' {
+  const lower = (locale ?? 'en').trim().toLowerCase();
+  if (lower.startsWith('zh')) return 'zh-CN';
+  if (lower.startsWith('ja')) return 'ja';
+  return 'en';
+}
+
+/** Formats milliseconds into compact localized human duration (`48 min` / `1h 20m` / `1 小时 20 分钟` / `1時間20分`). */
+export function formatHumanDuration(ms: number | undefined, locale: string = 'en'): string {
   if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return '';
   const totalMin = Math.max(1, Math.round(ms / 60_000));
   const hours = Math.floor(totalMin / 60);
   const mins = totalMin % 60;
+  const loc = normalizeFormatLocale(locale);
+  if (loc === 'zh-CN') {
+    if (hours > 0 && mins > 0) return `${hours} 小时 ${mins} 分钟`;
+    if (hours > 0) return `${hours} 小时`;
+    return `${totalMin} 分钟`;
+  }
+  if (loc === 'ja') {
+    if (hours > 0 && mins > 0) return `${hours}時間${mins}分`;
+    if (hours > 0) return `${hours}時間`;
+    return `${totalMin}分`;
+  }
   if (hours > 0 && mins > 0) return `${hours}h ${mins}m`;
   if (hours > 0) return `${hours}h`;
   return `${totalMin} min`;
@@ -51,16 +69,35 @@ export function formatShortDate(epochMs: number | undefined, locale = 'en'): str
   }
 }
 
-/** Formats relative elapsed time (`just now`, `2 min ago`, `3 h ago`). */
-export function formatRelativeMinutes(epochMs: number | undefined, nowMs = Date.now()): string {
+/** Formats localized relative elapsed time (`just now` / `2 min ago` / `2 分钟前` / `2分前`). */
+export function formatRelativeMinutes(
+  epochMs: number | undefined,
+  nowMs = Date.now(),
+  locale: string = 'en',
+): string {
   if (epochMs === undefined || !Number.isFinite(epochMs) || epochMs <= 0) return '';
   const diffSec = Math.max(0, Math.floor((nowMs - epochMs) / 1000));
-  if (diffSec < 45) return 'just now';
+  const loc = normalizeFormatLocale(locale);
+  if (diffSec < 45) {
+    if (loc === 'zh-CN') return '刚刚';
+    if (loc === 'ja') return 'たった今';
+    return 'just now';
+  }
   const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin} min ago`;
+  if (diffMin < 60) {
+    if (loc === 'zh-CN') return `${diffMin} 分钟前`;
+    if (loc === 'ja') return `${diffMin}分前`;
+    return `${diffMin} min ago`;
+  }
   const diffHours = Math.floor(diffMin / 60);
-  if (diffHours < 24) return `${diffHours} h ago`;
+  if (diffHours < 24) {
+    if (loc === 'zh-CN') return `${diffHours} 小时前`;
+    if (loc === 'ja') return `${diffHours}時間前`;
+    return `${diffHours} h ago`;
+  }
   const diffDays = Math.floor(diffHours / 24);
+  if (loc === 'zh-CN') return `${diffDays} 天前`;
+  if (loc === 'ja') return `${diffDays}日前`;
   return `${diffDays} d ago`;
 }
 

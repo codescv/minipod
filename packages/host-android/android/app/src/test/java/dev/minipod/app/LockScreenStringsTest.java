@@ -79,7 +79,7 @@ public class LockScreenStringsTest {
                 "app_name", "title_activity_main", "lock_screen_rewind_10",
                 "lock_screen_fast_forward_30", "playback_channel_name",
                 "download_channel_name", "download_notification_running",
-                "download_notification_queued",
+                "download_notification_queued", "feedback_chooser_title",
             }) {
                 assertTrue(key + " in values", en.containsKey(key));
                 assertTrue(key + " in " + locale, loc.containsKey(key));

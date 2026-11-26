@@ -549,7 +549,7 @@ export function QueueList() {
     return acc + Math.max(0, dur - pos);
   }, 0);
 
-  const durationLabel = formatHumanDuration(totalRemainingMs);
+  const durationLabel = formatHumanDuration(totalRemainingMs, locale);
   const headerText =
     rows.length === 0
       ? t('queue.title')
@@ -870,9 +870,9 @@ export function QueueList() {
     const dateStr = formatShortDate(episode.pubDate ?? detailsRow.entry.stub?.pubDate, locale);
     const remStr =
       detailsRemBucket > 0
-        ? t('detail.timeLeft', { time: formatHumanDuration(detailsRemBucket * 60_000) })
+        ? t('detail.timeLeft', { time: formatHumanDuration(detailsRemBucket * 60_000, locale) })
         : detailsRemBucket < 0
-          ? formatHumanDuration(-detailsRemBucket * 60_000)
+          ? formatHumanDuration(-detailsRemBucket * 60_000, locale)
           : '';
     const isAudioOnlyVideo = episode.mediaType === 'VIDEO' && !player.engine.capabilities.video;
     const shownotesHtml = sanitizeShownotesHtml(episode.description);
@@ -1440,6 +1440,7 @@ const QueueRowItem = memo(function QueueRowItem({
   ) => void;
 }) {
   const t = useT();
+  const locale = useLocale();
   const epKey = row.episode.episodeKey;
   const { swipeOffsetX, swipeDirection, swipeArmed, handlers } = useRowGestures({
     onTap: () => onPlay(row, podcastName, feedCoverUrl),
@@ -1452,9 +1453,9 @@ const QueueRowItem = memo(function QueueRowItem({
   const remBucket = usePlayerLiveRemainingBucket(isCurrent, epKey, durationMs, savedPositionMs);
   const remStr =
     remBucket > 0
-      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000) })
+      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000, locale) })
       : remBucket < 0
-        ? formatHumanDuration(-remBucket * 60_000)
+        ? formatHumanDuration(-remBucket * 60_000, locale)
         : '';
 
   const isDragging = draggingIdx === idx;

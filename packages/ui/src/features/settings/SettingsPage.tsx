@@ -1,6 +1,6 @@
 /**
  * Minimalist Settings screen (`DESIGN.md` §4.7):
- * Strictly 8 rows — Cloud sync (4), Subscriptions (3), About (1).
+ * Strictly 9 rows — Cloud sync (4), Subscriptions (3), General (1), About (1).
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppSettings, SyncProviderConfig, SyncStatus } from '@minipod/core';
@@ -21,7 +21,7 @@ import { Button, Dialog, IconButton, Switch } from '../../components/m3';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
 import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
-import { useT } from '../../i18n';
+import { useLocale, useT } from '../../i18n';
 import { formatBytes, formatRelativeMinutes } from '../../lib/format';
 import { useSettingsStore } from '../../stores/settings';
 import { showSnackbar } from '../../stores/snackbar';
@@ -29,10 +29,24 @@ import { getHostViewCache } from '../../stores/view-cache';
 import { useUpdateStore } from '../updater/updater';
 
 const REFRESH_OPTIONS: readonly AppSettings['backgroundRefreshHours'][] = [0, 1, 3, 6, 12, 24];
+const LANGUAGE_OPTIONS: readonly {
+  readonly value: AppSettings['uiLanguage'];
+  readonly labelKey:
+    | 'settings.languageSystem'
+    | 'settings.languageZhCN'
+    | 'settings.languageEn'
+    | 'settings.languageJa';
+}[] = [
+  { value: 'system', labelKey: 'settings.languageSystem' },
+  { value: 'zh-CN', labelKey: 'settings.languageZhCN' },
+  { value: 'en', labelKey: 'settings.languageEn' },
+  { value: 'ja', labelKey: 'settings.languageJa' },
+];
 
 export function SettingsPage() {
   const host = useHost();
   const t = useT();
+  const locale = useLocale();
   const isDesktop = useIsDesktop();
 
   const settings = useSettingsStore((s) => s.settings);
@@ -122,7 +136,7 @@ export function SettingsPage() {
     const stamp = Math.max(syncStatus.lastPushAt ?? 0, syncStatus.lastPullAt ?? 0);
     if (stamp > 0) {
       return t('settings.syncStatusOk', {
-        when: formatRelativeMinutes(stamp),
+        when: formatRelativeMinutes(stamp, Date.now(), locale),
         rev: syncStatus.remoteRev ?? 0,
       });
     }
@@ -396,13 +410,41 @@ export function SettingsPage() {
         </div>
       </section>
 
-      {/* Section 3: About (Row 8) */}
+      {/* Section 3: General (Row 8) */}
+      <section className="m-settings-section">
+        <h2 className="m-settings-heading">{t('settings.sectionGeneral')}</h2>
+
+        <div className="m-settings-row" data-settings-row="8" data-testid="settings-row-language">
+          <div className="m-settings-row__text">
+            <span className="m-settings-row__title">{t('settings.language')}</span>
+          </div>
+          <select
+            className="m-field__input"
+            style={{ minHeight: 38, padding: '4px 10px' }}
+            aria-label={t('settings.language')}
+            data-testid="settings-language-select"
+            value={settings.uiLanguage}
+            onChange={(e) => {
+              const uiLanguage = e.target.value as AppSettings['uiLanguage'];
+              void updateSettings(host, { uiLanguage });
+            }}
+          >
+            {LANGUAGE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {t(opt.labelKey)}
+              </option>
+            ))}
+          </select>
+        </div>
+      </section>
+
+      {/* Section 4: About (Row 9) */}
       <section className="m-settings-section">
         <h2 className="m-settings-heading">{t('settings.sectionAbout')}</h2>
 
         <div
           className="m-settings-row m-settings-row--clickable m-settings-row--about"
-          data-settings-row="8"
+          data-settings-row="9"
           data-testid="settings-row-about"
           onClick={() => setAboutOpen(true)}
         >
@@ -575,9 +617,9 @@ export function SettingsPage() {
       >
         <p style={{ margin: 0 }}>{t('settings.aboutDescription')}</p>
         <div style={{ font: 'var(--md-sys-typescale-body-small)', color: 'var(--md-sys-color-on-surface-variant)' }}>
-          <div>Platform: {host.info.platform} ({host.info.os})</div>
-          <div>Device ID: {host.info.deviceId}</div>
-          {host.info.dataDir && <div>Data directory: {host.info.dataDir}</div>}
+          <div>{t('settings.aboutPlatform', { platform: host.info.platform, os: host.info.os })}</div>
+          <div>{t('settings.aboutDeviceId', { id: host.info.deviceId })}</div>
+          {host.info.dataDir && <div>{t('settings.aboutDataDir', { dir: host.info.dataDir })}</div>}
         </div>
       </Dialog>
 

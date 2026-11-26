@@ -340,9 +340,9 @@ export const EpisodeRow = memo(function EpisodeRow({
   const dateStr = formatShortDate(episode.pubDate, locale);
   const remStr =
     remBucket > 0
-      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000) })
+      ? t('detail.timeLeft', { time: formatHumanDuration(remBucket * 60_000, locale) })
       : remBucket < 0
-        ? formatHumanDuration(-remBucket * 60_000)
+        ? formatHumanDuration(-remBucket * 60_000, locale)
         : '';
   const shownotesHtml = detailsOpen ? sanitizeShownotesHtml(episode.description) : '';
 

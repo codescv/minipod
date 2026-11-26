@@ -175,7 +175,7 @@ export function Shell() {
     >
       <div className="m-shell__workspace">
         {isDesktop && (
-          <nav className="m-nav-rail" aria-label="Main navigation" data-testid="desktop-nav-rail">
+          <nav className="m-nav-rail" aria-label={t('nav.mainNavigation')} data-testid="desktop-nav-rail">
             <div className="m-nav-rail__fab">
               <FAB
                 icon="add"
@@ -267,7 +267,7 @@ export function Shell() {
       ) : (
         <>
           <MiniPlayer />
-          <nav className="m-nav-bar" aria-label="Main navigation" data-testid="mobile-nav-bar">
+          <nav className="m-nav-bar" aria-label={t('nav.mainNavigation')} data-testid="mobile-nav-bar">
             <button
               type="button"
               className={cx('m-nav-item', isNavActive('subscriptions') && 'is-active')}

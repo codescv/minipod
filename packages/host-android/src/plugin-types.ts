@@ -9,6 +9,7 @@
  */
 import { registerPlugin, type PluginListenerHandle } from '@capacitor/core';
 import type {
+  AppSettings,
   EpisodeKey,
   EpochMs,
   HttpBasicCredentials,
@@ -324,6 +325,8 @@ export interface MiniPodPlugin {
   openExternal(opts: { readonly url: string }): Promise<void>;
   /** v0.1.23: `ACTION_SEND` Agent Feedback email with optional FileProvider image attachment. */
   sendFeedbackEmail?(opts: NativeFeedbackEmailOptions): Promise<void>;
+  /** Sync Web UI language selection (`system` | `zh-CN` | `en` | `ja`) to native alerts/notifications. */
+  setUiLanguage?(opts: { readonly language: AppSettings['uiLanguage'] }): Promise<void>;
   getLaunchIntent(): Promise<DeepLinkPayload | null>;
 
   downloadAndInstallApk?(opts: {
@@ -380,6 +383,7 @@ export interface MiniPodNativeBridge {
 
   openExternal(opts: { url: string }): Promise<void>;
   sendFeedbackEmail(opts: NativeFeedbackEmailOptions): Promise<void>;
+  setUiLanguage(opts: { language: AppSettings['uiLanguage'] }): Promise<void>;
   getLaunchIntent(): Promise<{ hasIntent: boolean; action?: 'view' | 'send'; uri?: string; mimeType?: string; text?: string }>;
   downloadAndInstallApk(opts: { url: string; version: string }): Promise<ApkInstallResult>;
   installApkFile(opts: { filePath: string }): Promise<ApkInstallResult>;
@@ -454,6 +458,7 @@ export function wrapNativeBridge(bridge: MiniPodNativeBridge): MiniPodPlugin {
 
     openExternal: (opts) => bridge.openExternal(opts),
     sendFeedbackEmail: (opts) => bridge.sendFeedbackEmail(opts),
+    setUiLanguage: (opts) => bridge.setUiLanguage(opts),
     downloadAndInstallApk: (opts) => bridge.downloadAndInstallApk(opts),
     installApkFile: (opts) => bridge.installApkFile(opts),
     async getLaunchIntent() {

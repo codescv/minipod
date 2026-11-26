@@ -13,4 +13,5 @@
     </plurals>
     <string name="download_notification_running">%d 件ダウンロード中</string>
     <string name="download_notification_queued">%1$d 件ダウンロード中 · %2$d 件待機中</string>
+    <string name="feedback_chooser_title">フィードバックを送信</string>
 </resources>

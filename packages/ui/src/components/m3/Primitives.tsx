@@ -24,6 +24,7 @@ import {
   rememberResolvedCandidate,
 } from '../../lib/artwork-cache';
 import { clearTextSelection, suppressNativeContextMenu } from '../../lib/text-selection';
+import { useT } from '../../i18n';
 import { useSnackbarStore } from '../../stores/snackbar';
 import { Icon, type IconName } from './Icon';
 
@@ -783,6 +784,7 @@ export function ArtworkImage({
 }
 
 export function SnackbarHost() {
+  const t = useT();
   const head = useSnackbarStore((s) => s.queue[0]);
   const dismiss = useSnackbarStore((s) => s.dismiss);
 
@@ -812,7 +814,7 @@ export function SnackbarHost() {
       )}
       <IconButton
         icon="close"
-        label="Dismiss"
+        label={t('common.dismiss')}
         onClick={() => dismiss(head.id)}
         style={{ width: 36, height: 36, color: 'var(--md-sys-color-inverse-on-surface)' }}
       />

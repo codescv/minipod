@@ -437,7 +437,7 @@ export function PodcastDetail({ feedKey }: { readonly feedKey: FeedKey }) {
         </section>
       )}
 
-      <div className="m-chips" role="tablist" aria-label="Episode filter">
+      <div className="m-chips" role="tablist" aria-label={t('detail.episodeFilterLabel')}>
         <Chip
           selected={filter === 'all'}
           testId="filter-chip-all"

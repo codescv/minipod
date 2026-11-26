@@ -11,6 +11,7 @@ import { SnackbarHost } from '../components/m3';
 import { HostProvider, useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
 import { STARTUP_UPDATE_THROTTLE_MS, useUpdateStore } from '../features/updater/updater';
+import { useDocumentLanguage } from '../i18n';
 import { PlayerProvider } from '../player/usePlayer';
 import { useSettingsStore } from '../stores/settings';
 import { showSnackbar } from '../stores/snackbar';
@@ -24,6 +25,7 @@ function shouldAutoCheckByDefault(): boolean {
 function AppRuntime({ autoCheckUpdates }: { readonly autoCheckUpdates?: boolean | undefined }) {
   const host = useHost();
   useTheme();
+  useDocumentLanguage();
 
   useEffect(() => {
     void useSettingsStore.getState().load(host).catch(() => undefined);
