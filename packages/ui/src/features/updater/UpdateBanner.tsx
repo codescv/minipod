@@ -38,6 +38,7 @@ export function UpdateBanner() {
   const installDownloadedApk = useUpdateStore((s) => s.installDownloadedApk);
   const dismiss = useUpdateStore((s) => s.dismiss);
 
+  if (isIosCapacitorRuntime()) return null;
   if (!release) return null;
 
   const isActionable =

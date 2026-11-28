@@ -23,6 +23,7 @@ import { useHost } from '../../host/HostContext';
 import { useHostEvents } from '../../host/useHostEvents';
 import { useLocale, useT } from '../../i18n';
 import { formatBytes, formatRelativeMinutes } from '../../lib/format';
+import { isIosCapacitorRuntime } from '../../lib/platform-runtime';
 import { useSettingsStore } from '../../stores/settings';
 import { showSnackbar } from '../../stores/snackbar';
 import { getHostViewCache } from '../../stores/view-cache';
@@ -48,6 +49,7 @@ export function SettingsPage() {
   const t = useT();
   const locale = useLocale();
   const isDesktop = useIsDesktop();
+  const hideInAppUpdater = isIosCapacitorRuntime();
 
   const settings = useSettingsStore((s) => s.settings);
   const updateSettings = useSettingsStore((s) => s.update);
@@ -461,7 +463,7 @@ export function SettingsPage() {
             <span className="m-settings-row__subtitle">
               {t('settings.aboutSummary', { version: host.info.appVersion })}
             </span>
-            {updateStatus !== 'idle' && (
+            {!hideInAppUpdater && updateStatus !== 'idle' && (
               <span className="m-settings-row__subtitle" data-testid="settings-update-status">
                 {updateStatus === 'checking'
                   ? t('update.checking')
@@ -492,7 +494,7 @@ export function SettingsPage() {
                               : null}
               </span>
             )}
-            {updateStatus === 'downloading' && (
+            {!hideInAppUpdater && updateStatus === 'downloading' && (
               <div className="m-update-banner__progress-track" data-testid="settings-update-progress">
                 <div
                   className={`m-update-banner__progress-fill${updateProgress < 0 ? ' is-indeterminate' : ''}`}
@@ -518,46 +520,47 @@ export function SettingsPage() {
             >
               {t('feedback.openButton')}
             </Button>
-            {updateStatus === 'available' && updateRelease ? (
-              <Button
-                variant="filled"
-                icon="download"
-                data-testid="settings-update-btn"
-                onClick={() => {
-                  void downloadUpdate(host);
-                }}
-              >
-                {t('update.updateTo', { version: updateRelease.version })}
-              </Button>
-            ) : updateStatus === 'ready-to-install' ? (
-              <Button
-                variant="filled"
-                icon="download"
-                data-testid="settings-update-btn"
-                onClick={() => {
-                  void installDownloadedApk(host);
-                }}
-              >
-                {updateNeedsPermission ? t('update.grantAndInstall') : t('update.installApk')}
-              </Button>
-            ) : (
-              <Button
-                variant="tonal"
-                disabled={updateStatus === 'checking' || updateStatus === 'downloading'}
-                data-testid="settings-update-btn"
-                onClick={() => {
-                  void checkForUpdate(host, { silent: false });
-                }}
-              >
-                {updateStatus === 'checking'
-                  ? t('update.checkingShort')
-                  : updateStatus === 'downloading'
-                    ? updateProgress >= 0
-                      ? `${Math.round(updateProgress)}%`
-                      : t('update.checkingShort')
-                    : t('update.checkForUpdates')}
-              </Button>
-            )}
+            {!hideInAppUpdater &&
+              (updateStatus === 'available' && updateRelease ? (
+                <Button
+                  variant="filled"
+                  icon="download"
+                  data-testid="settings-update-btn"
+                  onClick={() => {
+                    void downloadUpdate(host);
+                  }}
+                >
+                  {t('update.updateTo', { version: updateRelease.version })}
+                </Button>
+              ) : updateStatus === 'ready-to-install' ? (
+                <Button
+                  variant="filled"
+                  icon="download"
+                  data-testid="settings-update-btn"
+                  onClick={() => {
+                    void installDownloadedApk(host);
+                  }}
+                >
+                  {updateNeedsPermission ? t('update.grantAndInstall') : t('update.installApk')}
+                </Button>
+              ) : (
+                <Button
+                  variant="tonal"
+                  disabled={updateStatus === 'checking' || updateStatus === 'downloading'}
+                  data-testid="settings-update-btn"
+                  onClick={() => {
+                    void checkForUpdate(host, { silent: false });
+                  }}
+                >
+                  {updateStatus === 'checking'
+                    ? t('update.checkingShort')
+                    : updateStatus === 'downloading'
+                      ? updateProgress >= 0
+                        ? `${Math.round(updateProgress)}%`
+                        : t('update.checkingShort')
+                      : t('update.checkForUpdates')}
+                </Button>
+              ))}
           </div>
         </div>
       </section>

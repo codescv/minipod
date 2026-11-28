@@ -196,6 +196,9 @@ export const useUpdateStore = create<UpdateStoreState>((set, get) => ({
   lastCheckedAt: undefined,
 
   async checkForUpdate(host, options) {
+    if (isIosCapacitorRuntime()) {
+      return undefined;
+    }
     const state = get();
     if (state.status === 'checking' || state.status === 'downloading') {
       return state.release;

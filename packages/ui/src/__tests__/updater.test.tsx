@@ -350,4 +350,67 @@ describe('In-App Auto-Updater UI (Banner, Android Native APK, PC Self-Update & 9
       expect(host.openedExternalUrls).toContain('https://github.com/codescv/minipod');
     });
   });
+
+  it('disables update checks and hides UpdateBanner and Settings update controls on iOS Capacitor runtime', async () => {
+    const fetchSpy = vi.fn(async () => new Response('Should not be called', { status: 500 }));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'ios',
+    };
+
+    const { host } = renderMiniPod({
+      width: 390,
+      hostOptions: { platform: 'android', appVersion: '0.1.39' },
+      autoCheckUpdates: true,
+    });
+
+    await screen.findByText('Syntax & Signal');
+
+    // Wait past the 50ms startup timer and confirm no GitHub Releases check was triggered
+    await new Promise((r) => setTimeout(r, 80));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(useUpdateStore.getState().status).toBe('idle');
+
+    // Direct checkForUpdate call also short-circuits cleanly on iOS
+    const directResult = await useUpdateStore.getState().checkForUpdate(host, { silent: false });
+    expect(directResult).toBeUndefined();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(useUpdateStore.getState().status).toBe('idle');
+
+    // Even if update state is populated, UpdateBanner returns null on iOS
+    act(() => {
+      useUpdateStore.setState({
+        status: 'available',
+        release: {
+          tagName: 'v0.1.40',
+          version: '0.1.40',
+          title: 'MiniPod v0.1.40',
+          notes: 'New release',
+          publishedAt: '2026-11-28T00:00:00Z',
+          htmlUrl: 'https://github.com/codescv/minipod/releases/tag/v0.1.40',
+        },
+      });
+    });
+    expect(screen.queryByTestId('update-banner')).not.toBeInTheDocument();
+
+    // Open Settings on mobile and verify 9-row invariant + About/Version/Feedback intact, updater hidden
+    fireEvent.click(screen.getByTestId('subs-settings-btn'));
+    const settingsScreen = await screen.findByTestId('settings-screen');
+    expect(settingsScreen.querySelectorAll('[data-settings-row]')).toHaveLength(9);
+    expect(screen.getByTestId('settings-row-about')).toBeInTheDocument();
+    expect(screen.getByTestId('settings-version-badge')).toHaveTextContent('v0.1.39');
+    expect(screen.getByTestId('settings-feedback-btn')).toBeInTheDocument();
+    expect(screen.queryByTestId('settings-update-btn')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('settings-update-status')).not.toBeInTheDocument();
+
+    // Progress bar is also hidden on iOS even if status is downloading
+    act(() => {
+      useUpdateStore.setState({ status: 'downloading', progressPercent: 42 });
+    });
+    expect(screen.queryByTestId('settings-update-progress')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('settings-update-status')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('settings-update-btn')).not.toBeInTheDocument();
+  });
 });

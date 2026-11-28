@@ -12,12 +12,14 @@ import { HostProvider, useHost } from '../host/HostContext';
 import { useHostEvents } from '../host/useHostEvents';
 import { STARTUP_UPDATE_THROTTLE_MS, useUpdateStore } from '../features/updater/updater';
 import { useDocumentLanguage } from '../i18n';
+import { isIosCapacitorRuntime } from '../lib/platform-runtime';
 import { PlayerProvider } from '../player/usePlayer';
 import { useSettingsStore } from '../stores/settings';
 import { showSnackbar } from '../stores/snackbar';
 import { useTheme } from '../theme/useTheme';
 
 function shouldAutoCheckByDefault(): boolean {
+  if (isIosCapacitorRuntime()) return false;
   if (typeof navigator === 'undefined') return false;
   return !/jsdom/i.test(navigator.userAgent || '');
 }
@@ -33,6 +35,7 @@ function AppRuntime({ autoCheckUpdates }: { readonly autoCheckUpdates?: boolean 
 
   // Automatic, throttled, non-blocking startup update check against GitHub Releases
   useEffect(() => {
+    if (isIosCapacitorRuntime()) return;
     const enabled = autoCheckUpdates ?? shouldAutoCheckByDefault();
     if (!enabled) return;
     const timer = setTimeout(() => {

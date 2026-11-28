@@ -1,7 +1,7 @@
 /**
  * Detects the iOS Capacitor 8 `WKWebView` host (`//experimental/users/chii/ios/minipod`), which
  * runs this exact bundle with `host.info.platform === 'android'` (same `CapacitorPlatformHost`)
- * but cannot sideload APKs: update actions open the GitHub release page instead.
+ * but cannot sideload APKs and distributes updates externally (in-app updater is disabled/hidden).
  */
 interface CapacitorPlatformLike {
   getPlatform?: () => string;
